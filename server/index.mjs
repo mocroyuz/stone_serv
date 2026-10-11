@@ -21,6 +21,11 @@
 //                    - posts photos forcés en brouillon (MEDIA_UPLOAD)
 //                  TIKTOK_FORCE_DRAFT=1 force TOUT en brouillons, même
 //                  après audit (pratique pour tester sans publier).
+//   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
+//                  Les scopes par défaut incluent youtube.upload (nécessaire
+//                  pour publier). Tant que le projet Google n'a pas passé
+//                  l'audit « YouTube API Services », YouTube force les
+//                  vidéos envoyées par l'API en PRIVÉ.
 //   Optionnel    : ALLOWED_ORIGINS, TRUST_PROXY, TRUST_PROXY_HOPS,
 //                  MAX_VIDEO_UPLOADS, TIKTOK_VERIFICATION_FILE,
 //                  TIKTOK_SKIP_PHOTO_PROBE=1, STRIPE_*, TIKTOK_*,
@@ -108,6 +113,8 @@ const normalizeEmail = (value) => String(value ?? "").trim().toLowerCase();
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const toBool = (v) => v === true || v === "true" || v === "1";
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Mutualise les appels concurrents identiques (refresh de token,
 // création de client Stripe...) : un seul vol, tout le monde attend
@@ -448,6 +455,21 @@ const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 const YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3";
 
 const youtubeEnabled = Boolean(YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET);
+
+// ---- Publication YouTube ------------------------------------------------
+const YOUTUBE_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos";
+// Les chunks doivent être un multiple de 256 Kio (sauf le dernier).
+const YOUTUBE_CHUNK_SIZE = 8 * 1024 * 1024;
+const YOUTUBE_PRIVACY_LEVELS = new Set(["public", "unlisted", "private"]);
+const YOUTUBE_TITLE_MAX = 100;
+const YOUTUBE_DESCRIPTION_MAX_BYTES = 5000;
+const YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload";
+
+if (youtubeEnabled && !YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE)) {
+  console.warn(
+    "⚠️  YOUTUBE_SCOPES ne contient pas youtube.upload — la publication YouTube sera impossible."
+  );
+}
 
 // ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
@@ -1411,7 +1433,7 @@ function isOwnedAvatarPath(storagePath, userId) {
 // LIMITE DE CONCURRENCE DES UPLOADS VIDÉO (anti OOM)
 // ============================================================
 //
-// Chaque upload TikTok bufferise jusqu'à 100 Mo en RAM. Le slot
+// Chaque upload TikTok / YouTube bufferise jusqu'à 100 Mo en RAM. Le slot
 // est acquis AVANT de lire le corps de la requête : au plus
 // MAX_VIDEO_UPLOADS vidéos en mémoire simultanément.
 
@@ -2041,7 +2063,7 @@ async function putChunk(uploadUrl, part, mimeType, start, end, total) {
     }
 
     if (attempt < MAX_ATTEMPTS) {
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+      await delay(attempt * 1000);
     }
   }
 
@@ -2663,6 +2685,319 @@ async function getValidYouTubeToken(userId) {
       throw error;
     }
   });
+}
+
+// ============================================================
+// YOUTUBE — PUBLICATION (upload resumable)
+// ============================================================
+
+const YOUTUBE_FRIENDLY_ERRORS = {
+  quotaExceeded:
+    "YouTube daily quota reached for this app. Please try again tomorrow.",
+  dailyLimitExceeded:
+    "YouTube daily quota reached for this app. Please try again tomorrow.",
+  uploadLimitExceeded:
+    "This YouTube channel has reached its daily upload limit. Please try again later.",
+  youtubeSignupRequired:
+    "This Google account has no YouTube channel. Create one on youtube.com, then reconnect.",
+  forbidden: "YouTube refused this upload for this channel.",
+  invalidTitle: "Invalid YouTube title.",
+  invalidDescription: "Invalid YouTube description.",
+  invalidTags: "Invalid YouTube tags.",
+  invalidPublishAt: "Invalid scheduled date. Pick a date in the future.",
+  invalidVideoMetadata: "YouTube rejected the video metadata.",
+  mediaBodyRequired: "The video file is empty.",
+  videoTooLong:
+    "This video is too long for your YouTube account. Verify your channel to upload longer videos.",
+};
+
+// Transforme une réponse d'erreur Google en HttpError lisible.
+// Ne renvoie JAMAIS un 401 brut (le front le confondrait avec la session Stone).
+function youtubeApiError(status, data) {
+  const reason =
+    data?.error?.errors?.[0]?.reason ||
+    (typeof data?.error === "string" ? data.error : undefined) ||
+    data?.error?.status;
+
+  console.error(
+    "[youtube]",
+    JSON.stringify({ status, reason, message: data?.error?.message })
+  );
+
+  if (status === 401 || reason === "authError" || reason === "invalid_grant") {
+    return reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
+  }
+
+  if (reason === "insufficientPermissions") {
+    return new HttpError(
+      409,
+      "YouTube permission missing, please reconnect your YouTube account.",
+      "YOUTUBE_SCOPE_MISSING"
+    );
+  }
+
+  if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+    return new HttpError(429, YOUTUBE_FRIENDLY_ERRORS[reason], reason);
+  }
+
+  return new HttpError(
+    upstreamStatus(status),
+    YOUTUBE_FRIENDLY_ERRORS[reason] ||
+      data?.error?.message ||
+      `YouTube error (HTTP ${status})`,
+    reason
+  );
+}
+
+function parseYouTubeTags(raw) {
+  const text = String(raw || "").trim();
+  let list = [];
+
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      list = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      list = text.split(",");
+    }
+  }
+
+  // Limite YouTube : 500 caractères au total (guillemets autour des tags
+  // contenant un espace + séparateur compris).
+  const tags = [];
+  let total = 0;
+
+  for (const item of list) {
+    const tag = String(item).replace(/[<>,"]/g, "").trim().slice(0, 100);
+    if (!tag || tags.includes(tag)) continue;
+
+    const cost = tag.length + (tag.includes(" ") ? 2 : 0) + 1;
+    if (total + cost > 500) break;
+
+    tags.push(tag);
+    total += cost;
+  }
+
+  return tags;
+}
+
+// Valide les champs AVANT tout appel à YouTube.
+function buildYouTubeMetadata(fields) {
+  const title = String(fields.title || "").replace(/[<>]/g, "").trim();
+
+  if (!title) {
+    throw new HttpError(
+      400,
+      "A title is required for YouTube videos.",
+      "YOUTUBE_TITLE_REQUIRED"
+    );
+  }
+
+  if (title.length > YOUTUBE_TITLE_MAX) {
+    throw new HttpError(
+      400,
+      `The YouTube title must be at most ${YOUTUBE_TITLE_MAX} characters.`,
+      "YOUTUBE_TITLE_TOO_LONG"
+    );
+  }
+
+  const description = String(fields.description || "").replace(/[<>]/g, "").trim();
+
+  if (Buffer.byteLength(description, "utf8") > YOUTUBE_DESCRIPTION_MAX_BYTES) {
+    throw new HttpError(
+      400,
+      "The YouTube description is too long (max 5,000 characters).",
+      "YOUTUBE_DESCRIPTION_TOO_LONG"
+    );
+  }
+
+  // Déclaration « conçue pour les enfants » : choix explicite obligatoire.
+  if (fields.made_for_kids !== "true" && fields.made_for_kids !== "false") {
+    throw new HttpError(
+      400,
+      "Tell YouTube if this video is made for kids.",
+      "YOUTUBE_MADE_FOR_KIDS_REQUIRED"
+    );
+  }
+
+  let privacy = YOUTUBE_PRIVACY_LEVELS.has(fields.privacy_level)
+    ? fields.privacy_level
+    : "private";
+
+  // Programmation : YouTube exige privacyStatus = private + publishAt futur ;
+  // la vidéo devient publique à l'heure choisie.
+  let publishAt = null;
+
+  if (fields.publish_at) {
+    const date = new Date(fields.publish_at);
+
+    if (Number.isNaN(date.getTime()) || date.getTime() < Date.now() + 60_000) {
+      throw new HttpError(
+        400,
+        "Pick a date and time in the future.",
+        "YOUTUBE_PUBLISH_AT_INVALID"
+      );
+    }
+
+    publishAt = date.toISOString();
+    privacy = "private";
+  }
+
+  const tags = parseYouTubeTags(fields.tags);
+  const categoryId = /^\d{1,3}$/.test(String(fields.category_id || ""))
+    ? String(fields.category_id)
+    : "22"; // People & Blogs
+
+  return {
+    privacy,
+    publishAt,
+    metadata: {
+      snippet: {
+        title,
+        description,
+        categoryId,
+        ...(tags.length > 0 ? { tags } : {}),
+      },
+      status: {
+        privacyStatus: privacy,
+        selfDeclaredMadeForKids: fields.made_for_kids === "true",
+        embeddable: true,
+        ...(publishAt ? { publishAt } : {}),
+      },
+    },
+  };
+}
+
+// 1. Ouvre une session d'upload resumable : Google répond avec l'URL
+//    d'upload dans l'en-tête Location.
+async function initYouTubeUpload(accessToken, metadata, size, mimeType) {
+  let result;
+
+  try {
+    result = await fetchJson(
+      `${YOUTUBE_UPLOAD_URL}?uploadType=resumable&part=snippet,status`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json; charset=UTF-8",
+          "X-Upload-Content-Length": String(size),
+          "X-Upload-Content-Type": mimeType,
+        },
+        body: JSON.stringify(metadata),
+      },
+      30_000
+    );
+  } catch (error) {
+    throw upstreamError("YouTube", error);
+  }
+
+  const { response, data } = result;
+
+  if (!response.ok) throw youtubeApiError(response.status, data);
+
+  const location = response.headers.get("location");
+
+  if (!location || !location.startsWith("https://www.googleapis.com/")) {
+    throw new HttpError(
+      502,
+      "YouTube did not return a valid upload URL",
+      "YOUTUBE_NO_UPLOAD_URL"
+    );
+  }
+
+  return location;
+}
+
+// Un PUT sur l'URL resumable.
+//   200 / 201 → terminé (corps = ressource vidéo)
+//   308       → incomplet (en-tête Range = octets reçus)
+async function youtubePut(uploadUrl, headers, body) {
+  const { response, data } = await fetchJson(
+    uploadUrl,
+    { method: "PUT", headers, body, redirect: "manual" },
+    120_000
+  );
+
+  if (response.status === 200 || response.status === 201) {
+    return { done: true, video: data };
+  }
+
+  if (response.status === 308) {
+    const match = /bytes=0-(\d+)/.exec(response.headers.get("range") || "");
+    return { done: false, next: match ? Number(match[1]) + 1 : 0 };
+  }
+
+  const error = new Error(`HTTP ${response.status}`);
+  error.status = response.status;
+  error.data = data;
+  throw error;
+}
+
+// 2. Envoie le fichier par chunks, avec reprise après erreur réseau / 5xx
+//    (on interroge YouTube pour savoir combien d'octets il a reçus).
+async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
+  const total = buffer.length;
+  let offset = 0;
+  let failures = 0;
+
+  while (true) {
+    try {
+      const end = Math.min(offset + YOUTUBE_CHUNK_SIZE, total) - 1;
+
+      const result = await youtubePut(
+        uploadUrl,
+        {
+          "Content-Type": mimeType,
+          "Content-Range": `bytes ${offset}-${end}/${total}`,
+        },
+        buffer.subarray(offset, end + 1)
+      );
+
+      if (result.done) return result.video;
+
+      if (result.next <= offset) {
+        // Aucun progrès : on compte comme un échec pour éviter une boucle infinie.
+        throw Object.assign(new Error("No progress"), { status: 500 });
+      }
+
+      offset = result.next;
+    } catch (error) {
+      const status = error?.status;
+
+      // Erreur client définitive (hors 429) : inutile de réessayer.
+      if (status && status < 500 && status !== 429) {
+        throw youtubeApiError(status, error.data);
+      }
+
+      failures++;
+
+      if (failures > 5) {
+        console.error("YouTube upload failed:", error?.message);
+        throw new HttpError(
+          502,
+          "YouTube upload failed, please retry",
+          "YOUTUBE_UPLOAD_FAILED"
+        );
+      }
+
+      await delay(failures * 1000);
+
+      // Reprise : combien d'octets YouTube a-t-il réellement reçus ?
+      try {
+        const query = await youtubePut(
+          uploadUrl,
+          { "Content-Range": `bytes */${total}` },
+          undefined
+        );
+
+        if (query.done) return query.video;
+        offset = query.next;
+      } catch {
+        // on retentera au prochain tour
+      }
+    }
+  }
 }
 
 // ============================================================
@@ -4370,6 +4705,106 @@ route(
   { auth: true }
 );
 
+// ---- Publication d'une vidéo YouTube ------------------------------------
+//
+// multipart/form-data :
+//   video (fichier) · title · description · tags (JSON ou "a,b")
+//   privacy_level (public|unlisted|private) · made_for_kids ("true"|"false")
+//   publish_at (ISO 8601, optionnel → programmation) · category_id (optionnel)
+//
+// Même ordre que TikTok pour la mémoire : vérifications bon marché,
+// slot de concurrence, puis seulement lecture du corps.
+route(
+  "POST",
+  "/api/youtube/publish",
+  async ({ req, res, user }) => {
+    enforce(limiterPublish, `youtube:${user.id}`);
+
+    const declared = Number(req.headers["content-length"] || 0);
+
+    if (declared > MAX_VIDEO_SIZE + 1024 * 1024) {
+      throw tooLargeError(
+        `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`
+      );
+    }
+
+    // Échoue vite si la chaîne n'est pas connectée / expirée.
+    const accessToken = await getValidYouTubeToken(user.id);
+
+    await acquireVideoSlot();
+
+    try {
+      let upload;
+
+      try {
+        upload = await parseMultipart(req, {
+          fileField: "video",
+          maxSize: MAX_VIDEO_SIZE,
+        });
+      } catch (error) {
+        if (error?.code === "FILE_TOO_LARGE") {
+          throw new HttpError(
+            400,
+            `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`
+          );
+        }
+        if (error?.code === "NO_FILE") {
+          throw new HttpError(400, "No 'video' file was provided.");
+        }
+        throw error instanceof HttpError
+          ? error
+          : new HttpError(400, "Could not read the uploaded file.");
+      }
+
+      const mimeType = sniffVideoType(upload.buffer);
+
+      if (!mimeType) {
+        throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
+      }
+
+      // Validé AVANT tout appel à YouTube.
+      const { privacy, publishAt, metadata } = buildYouTubeMetadata(upload.fields);
+
+      const uploadUrl = await initYouTubeUpload(
+        accessToken,
+        metadata,
+        upload.buffer.length,
+        mimeType
+      );
+
+      const video = await uploadVideoToYouTube(uploadUrl, upload.buffer, mimeType);
+
+      if (!video?.id) {
+        throw new HttpError(
+          502,
+          "YouTube did not confirm the upload",
+          "YOUTUBE_NO_VIDEO_ID"
+        );
+      }
+
+      const actualPrivacy = video.status?.privacyStatus || null;
+
+      // Projet Google API non vérifié : YouTube force les vidéos en privé.
+      const privacyLocked =
+        !publishAt && privacy !== "private" && actualPrivacy === "private";
+
+      sendJson(res, 200, {
+        success: true,
+        video_id: video.id,
+        url: `https://www.youtube.com/watch?v=${video.id}`,
+        privacy_status: actualPrivacy,
+        requested_privacy: privacy,
+        publish_at: publishAt,
+        upload_status: video.status?.uploadStatus || null,
+        privacy_locked: privacyLocked,
+      });
+    } finally {
+      releaseVideoSlot();
+    }
+  },
+  { auth: true }
+);
+
 route(
   "GET",
   "/api/youtube/status",
@@ -4385,6 +4820,10 @@ route(
             avatar_url: account.avatar_url,
             custom_url: account.custom_url,
             scope: account.scope,
+            // false → l'utilisateur doit reconnecter YouTube (scope upload absent)
+            can_publish: String(account.scope || "")
+              .split(/[\s,]+/)
+              .includes(YOUTUBE_UPLOAD_SCOPE),
           }
         : null,
     });
@@ -4613,6 +5052,15 @@ server.listen(PORT, () => {
       PUBLIC_API_URL
         ? `${PUBLIC_API_URL} (via ${PUBLIC_API_URL_SOURCE})`
         : "désactivé (PUBLIC_API_URL / VITE_API_BASE_URL manquant)"
+    }`
+  );
+  console.log(
+    `  YouTube publish : ${
+      youtubeEnabled
+        ? YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE)
+          ? "activée (scope youtube.upload présent)"
+          : "impossible (scope youtube.upload manquant)"
+        : "désactivée (YouTube non configuré)"
     }`
   );
 
