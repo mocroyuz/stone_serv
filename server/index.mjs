@@ -2003,6 +2003,72 @@ async function getValidTikTokToken(userId) {
 }
 
 // ============================================================
+// TIKTOK — RAFRAÎCHISSEMENT DU PROFIL (avatar)
+// ============================================================
+//
+// Les URLs d'avatar renvoyées par TikTok sont signées et expirent au
+// bout de quelques heures. On re-télécharge donc le profil
+// périodiquement (throttle en mémoire : 30 min par utilisateur).
+
+const TIKTOK_PROFILE_REFRESH_MS = 30 * 60 * 1000;
+const tiktokProfileRefreshedAt = new Map();
+
+async function refreshTikTokProfile(userId, account, { force = false } = {}) {
+  const last = tiktokProfileRefreshedAt.get(userId) || 0;
+
+  if (!force && Date.now() - last < TIKTOK_PROFILE_REFRESH_MS) {
+    return account;
+  }
+
+  // Marqué avant l'appel : en cas d'échec on ne martèle pas TikTok.
+  tiktokProfileRefreshedAt.set(userId, Date.now());
+
+  // Borne mémoire du throttle.
+  if (tiktokProfileRefreshedAt.size > 10_000) {
+    tiktokProfileRefreshedAt.delete(tiktokProfileRefreshedAt.keys().next().value);
+  }
+
+  try {
+    const accessToken = await getValidTikTokToken(userId);
+
+    const info = await tiktokApi(
+      "/v2/user/info/?fields=open_id,avatar_url,display_name",
+      { method: "GET", token: accessToken }
+    );
+
+    const profile = info.data?.user;
+
+    if (!profile?.avatar_url) return account;
+
+    const displayName = profile.display_name || account.display_name;
+
+    // On ne touche PAS à updated_at : il sert au webhook
+    // authorization.removed pour ne pas supprimer une connexion
+    // rétablie après la révocation.
+    const { error } = await supabaseAdmin
+      .from("tiktok_accounts")
+      .update({
+        avatar_url: profile.avatar_url,
+        display_name: displayName,
+      })
+      .eq("user_id", userId);
+
+    if (error) {
+      console.warn("TikTok profile save failed:", error.message);
+    }
+
+    return {
+      ...account,
+      avatar_url: profile.avatar_url,
+      display_name: displayName,
+    };
+  } catch (error) {
+    console.warn("TikTok profile refresh failed:", error.message);
+    return account;
+  }
+}
+
+// ============================================================
 // TIKTOK — UPLOAD VIDÉO
 // ============================================================
 
@@ -3819,8 +3885,15 @@ route(
 route(
   "GET",
   "/api/tiktok/status",
-  async ({ res, user }) => {
-    const account = await getTikTokAccount(user.id);
+  async ({ res, url, user }) => {
+    let account = await getTikTokAccount(user.id);
+
+    // ?refresh=1 : le front a détecté une image cassée → on ignore le throttle.
+    const force = url.searchParams.get("refresh") === "1";
+
+    if (account) {
+      account = await refreshTikTokProfile(user.id, account, { force });
+    }
 
     sendJson(res, 200, {
       success: true,
