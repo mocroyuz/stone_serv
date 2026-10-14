@@ -1783,12 +1783,16 @@ function createOAuthState(provider, userId) {
   return Buffer.from(`${payload}.${hmac(payload)}`).toString("base64url");
 }
 
-function verifyOAuthState(provider, state, userId) {
+// Renvoie null si le state est valide, sinon la raison précise de l'échec.
+// Les raisons ne sont écrites que dans les logs serveur (jamais renvoyées au client).
+function checkOAuthState(provider, state, userId) {
+  if (!state) return "missing_state";
+
   try {
     const decoded = Buffer.from(String(state), "base64url").toString("utf-8");
     const lastDot = decoded.lastIndexOf(".");
 
-    if (lastDot === -1) return false;
+    if (lastDot === -1) return "malformed_state";
 
     const payload = decoded.slice(0, lastDot);
     const signature = decoded.slice(lastDot + 1);
@@ -1796,29 +1800,56 @@ function verifyOAuthState(provider, state, userId) {
     const a = Buffer.from(signature);
     const b = Buffer.from(hmac(payload));
 
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+    // Signature différente : autre OAUTH_STATE_SECRET (serveur local vs prod,
+    // secret éphémère après un redémarrage...) ou state modifié.
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return "bad_signature";
+    }
 
     const [stateProvider, stateUserId, expiresAt] = payload.split(".");
 
-    return (
-      stateProvider === provider &&
-      stateUserId === userId &&
-      Number(expiresAt) > Date.now()
-    );
+    if (stateProvider !== provider) return "wrong_provider";
+    if (stateUserId !== userId) return "wrong_user";
+    if (!(Number(expiresAt) > Date.now())) return "expired";
+
+    return null;
   } catch {
-    return false;
+    return "malformed_state";
   }
 }
+
+function verifyOAuthState(provider, state, userId) {
+  return checkOAuthState(provider, state, userId) === null;
+}
+
+const OAUTH_REJECT_HINTS = {
+  missing_code:
+    "le frontend n'a pas envoyé de `code` (refus de l'utilisateur, ou paramètres mal lus dans l'URL)",
+  code_too_long: "`code` anormalement long",
+  missing_state:
+    "le frontend n'a pas envoyé de `state` (paramètres perdus par le routeur / le hash)",
+  malformed_state: "`state` illisible ou tronqué",
+  bad_signature:
+    "le state n'a pas été signé avec le même OAUTH_STATE_SECRET (serveur redémarré avec un secret éphémère, ou URL de départ et de retour sur deux environnements différents)",
+  wrong_provider: "le state a été créé pour un autre réseau",
+  wrong_user:
+    "le state appartient à un autre utilisateur (changement de compte pendant l'autorisation)",
+  expired: "le state a plus de 10 minutes : relance la connexion",
+};
 
 function assertValidOAuthCallback(provider, body, userId) {
   const code = String(body.code || "");
 
-  if (
-    !code ||
-    code.length > 2048 ||
-    !verifyOAuthState(provider, body.state, userId)
-  ) {
-    throw new HttpError(400, "Invalid or expired state");
+  let reason = null;
+  if (!code) reason = "missing_code";
+  else if (code.length > 2048) reason = "code_too_long";
+  else reason = checkOAuthState(provider, body.state, userId);
+
+  if (reason) {
+    console.warn(
+      `[oauth:${provider}] callback rejeté (${reason}) : ${OAUTH_REJECT_HINTS[reason] || ""}`
+    );
+    throw new HttpError(400, "Invalid or expired state", "OAUTH_STATE_INVALID");
   }
 
   return code;
