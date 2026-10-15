@@ -21,6 +21,18 @@
 //                    - posts photos forcés en brouillon (MEDIA_UPLOAD)
 //                  TIKTOK_FORCE_DRAFT=1 force TOUT en brouillons, même
 //                  après audit (pratique pour tester sans publier).
+//   Pinterest    : PINTEREST_APP_ID, PINTEREST_APP_SECRET.
+//                  Par défaut : SANDBOX (PINTEREST_API_BASE =
+//                  https://api-sandbox.pinterest.com/v5) et l'endpoint OAuth
+//                  est dérivé de l'environnement de l'API.
+//                  Production : PINTEREST_API_BASE=https://api.pinterest.com/v5
+//                  (PINTEREST_OAUTH_BASE est alors dérivé automatiquement ;
+//                  s'il est défini, il doit être du MÊME environnement, sinon
+//                  les routes Pinterest répondent 500 plutôt que de mélanger
+//                  sandbox et production). PINTEREST_AUTH_URL est surchargeable.
+//                  Chaque compte relié mémorise son environnement (colonne
+//                  pinterest_accounts.api_env) : un jeton d'un autre
+//                  environnement n'est jamais utilisé (reconnexion demandée).
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
 //                  Les scopes par défaut incluent youtube.upload (nécessaire
 //                  pour publier). Tant que le projet Google n'a pas passé
@@ -119,6 +131,8 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Mutualise les appels concurrents identiques (refresh de token,
 // création de client Stripe...) : un seul vol, tout le monde attend
 // le même résultat. Évite les courses entre refresh tokens.
+// ATTENTION : les appelants partagent le MÊME résultat. Ne pas l'utiliser
+// pour des écritures différentes sur la même clé (voir runSerial).
 const inflight = new Map();
 
 function withLock(key, fn) {
@@ -131,6 +145,51 @@ function withLock(key, fn) {
 
   inflight.set(key, promise);
   return promise;
+}
+
+// File d'attente par clé : les tâches s'exécutent UNE PAR UNE, chacune avec
+// son propre résultat (contrairement à withLock). Sert aux écritures
+// « lire → modifier → écrire » qui ne doivent pas s'écraser entre elles
+// (ex. app_metadata d'un utilisateur).
+const serialChains = new Map();
+
+function runSerial(key, fn) {
+  const previous = serialChains.get(key) || Promise.resolve();
+  const result = previous.catch(() => {}).then(fn);
+  const tail = result.catch(() => {});
+
+  serialChains.set(key, tail);
+  tail.then(() => {
+    if (serialChains.get(key) === tail) serialChains.delete(key);
+  });
+
+  return result;
+}
+
+// Cache de déduplication à durée de vie limitée (événements webhook).
+function createSeenCache(maxEntries, ttlMs) {
+  const entries = new Map();
+
+  return {
+    has(key) {
+      const expires = entries.get(key);
+      if (!expires) return false;
+
+      if (expires <= Date.now()) {
+        entries.delete(key);
+        return false;
+      }
+
+      return true;
+    },
+    add(key) {
+      if (entries.size >= maxEntries) {
+        entries.delete(entries.keys().next().value);
+      }
+
+      entries.set(key, Date.now() + ttlMs);
+    },
+  };
 }
 
 // Les callbacks OAuth peuvent être appelés deux fois (React StrictMode,
@@ -192,6 +251,13 @@ function upstreamStatus(status) {
 
 const reconnectError = (name, code) =>
   new HttpError(409, `${name} session expired, please reconnect`, code);
+
+// Erreur de base de données : le détail reste dans les logs serveur, le
+// client reçoit un message générique (jamais de secret ni de requête).
+function dbError(context, error) {
+  console.error(`[db] ${context}:`, error?.message || error);
+  return new HttpError(500, "Database error", "DB_ERROR");
+}
 
 // ============================================================
 // CONFIGURATION
@@ -412,6 +478,13 @@ if (tiktokEnabled && TIKTOK_FORCE_DRAFT) {
 // ============================================================
 // CONFIGURATION PINTEREST
 // ============================================================
+//
+// L'environnement (sandbox / production) est déduit de PINTEREST_API_BASE
+// (défaut : SANDBOX). L'endpoint OAuth (échange de code + refresh) est
+// dérivé du MÊME environnement, sauf si PINTEREST_OAUTH_BASE est défini
+// explicitement. Si les deux ne sont pas du même environnement, la
+// configuration est jugée incohérente : les routes Pinterest répondent 500
+// (PINTEREST_CONFIG_INVALID) au lieu de mélanger les environnements.
 
 const PINTEREST_APP_ID = env("PINTEREST_APP_ID");
 const PINTEREST_APP_SECRET = env("PINTEREST_APP_SECRET");
@@ -422,15 +495,57 @@ const PINTEREST_SCOPES =
   env("PINTEREST_SCOPES") ||
   "user_accounts:read,boards:read,boards:write,pins:read,pins:write";
 
-const PINTEREST_AUTH_URL = "https://www.pinterest.com/oauth/";
-const PINTEREST_OAUTH_BASE = (
-  env("PINTEREST_OAUTH_BASE") || "https://api.pinterest.com/v5"
-).replace(/\/+$/, "");
-const PINTEREST_API_BASE = (
-  env("PINTEREST_API_BASE") || "https://api-sandbox.pinterest.com/v5"
-).replace(/\/+$/, "");
+const PINTEREST_PROD_API_BASE = "https://api.pinterest.com/v5";
+const PINTEREST_SANDBOX_API_BASE = "https://api-sandbox.pinterest.com/v5";
+
+const trimSlashes = (value) => String(value).trim().replace(/\/+$/, "");
+const isSandboxUrl = (value) => /sandbox/i.test(String(value));
+
+const PINTEREST_AUTH_URL =
+  env("PINTEREST_AUTH_URL") || "https://www.pinterest.com/oauth/";
+
+const PINTEREST_API_BASE = trimSlashes(
+  env("PINTEREST_API_BASE") || PINTEREST_SANDBOX_API_BASE
+);
+
+const PINTEREST_ENVIRONMENT = isSandboxUrl(PINTEREST_API_BASE)
+  ? "sandbox"
+  : "production";
+
+const PINTEREST_OAUTH_BASE = trimSlashes(
+  env("PINTEREST_OAUTH_BASE") ||
+    (PINTEREST_ENVIRONMENT === "sandbox"
+      ? PINTEREST_SANDBOX_API_BASE
+      : PINTEREST_PROD_API_BASE)
+);
 
 const pinterestEnabled = Boolean(PINTEREST_APP_ID && PINTEREST_APP_SECRET);
+
+const pinterestConfigError = (() => {
+  for (const [label, value] of [
+    ["PINTEREST_API_BASE", PINTEREST_API_BASE],
+    ["PINTEREST_OAUTH_BASE", PINTEREST_OAUTH_BASE],
+    ["PINTEREST_AUTH_URL", PINTEREST_AUTH_URL],
+  ]) {
+    try {
+      const parsed = new URL(value);
+
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        return `${label} invalide`;
+      }
+    } catch {
+      return `${label} invalide`;
+    }
+  }
+
+  if (isSandboxUrl(PINTEREST_OAUTH_BASE) !== isSandboxUrl(PINTEREST_API_BASE)) {
+    return "PINTEREST_API_BASE et PINTEREST_OAUTH_BASE ne sont pas du même environnement (sandbox / production)";
+  }
+
+  return null;
+})();
+
+const pinterestUsable = pinterestEnabled && !pinterestConfigError;
 
 // ============================================================
 // CONFIGURATION YOUTUBE
@@ -616,6 +731,8 @@ if (env("DEBUG_ENV") === "1") {
   console.log("[env] TIKTOK_FORCE_DRAFT:", TIKTOK_FORCE_DRAFT);
   console.log("[env] PINTEREST_REDIRECT:", JSON.stringify(PINTEREST_REDIRECT_URI));
   console.log("[env] PINTEREST_API_BASE:", JSON.stringify(PINTEREST_API_BASE));
+  console.log("[env] PINTEREST_OAUTH   :", JSON.stringify(PINTEREST_OAUTH_BASE));
+  console.log("[env] PINTEREST_ENV     :", PINTEREST_ENVIRONMENT);
   console.log("[env] YOUTUBE_REDIRECT  :", JSON.stringify(YOUTUBE_REDIRECT_URI));
   console.log("[env] YOUTUBE_SCOPES    :", JSON.stringify(YOUTUBE_SCOPES));
   console.log("[env] TOKEN ENCRYPTION  :", Boolean(TOKEN_ENCRYPTION_KEY));
@@ -708,9 +825,17 @@ for (const [label, value] of [
   }
 }
 
-if (pinterestEnabled && PINTEREST_API_BASE.includes("sandbox")) {
+if (pinterestEnabled && pinterestConfigError) {
+  console.error(
+    `❌ Pinterest : configuration incohérente (${pinterestConfigError}). Les routes Pinterest répondront 500 tant que ce n'est pas corrigé (API = ${PINTEREST_API_BASE}, OAuth = ${PINTEREST_OAUTH_BASE}).`
+  );
+}
+
+if (pinterestEnabled && !pinterestConfigError) {
   console.warn(
-    `ℹ️  Pinterest en mode SANDBOX (PINTEREST_API_BASE = ${PINTEREST_API_BASE}).`
+    PINTEREST_ENVIRONMENT === "sandbox"
+      ? `ℹ️  Pinterest en mode SANDBOX (API = ${PINTEREST_API_BASE}, OAuth = ${PINTEREST_OAUTH_BASE}).`
+      : `ℹ️  Pinterest en mode PRODUCTION (API = ${PINTEREST_API_BASE}, OAuth = ${PINTEREST_OAUTH_BASE}).`
   );
 }
 
@@ -832,7 +957,8 @@ const limiterApi = createRateLimiter({ windowMs: 60 * 1000, max: 240, label: "ap
 const limiterAccount = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "account" });
 const limiterPublish = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, label: "publish" });
 
-// Les serveurs TikTok téléchargent jusqu'à 35 images par publication.
+// Les serveurs TikTok téléchargent jusqu'à 35 images par publication
+// (et ce serveur en sonde autant avant publication).
 const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "media" });
 // Webhook TikTok (serveur -> serveur, signature vérifiée). Limite dédiée par IP :
 // large pour absorber les rafales/retries légitimes de TikTok, mais bornée.
@@ -1655,6 +1781,51 @@ const sessionPayload = (session) =>
     : null;
 
 // ============================================================
+// APP_METADATA — LECTURE / ÉCRITURE FIABLES
+// ============================================================
+//
+// app_metadata contient l'abonnement et l'id client Stripe : une erreur
+// ignorée ici crée une incohérence Stripe ↔ Supabase. Toute lecture ou
+// écriture passe par ces fonctions, qui lèvent une erreur explicite.
+
+async function getAppMetadata(userId) {
+  const { data, error } = await supabaseAdmin.auth.admin.getUserById(userId);
+
+  if (error) {
+    if (error.status === 404 || /not found/i.test(error.message || "")) {
+      throw new HttpError(404, "User not found", "USER_NOT_FOUND");
+    }
+
+    throw dbError("auth.admin.getUserById", error);
+  }
+
+  if (!data?.user) {
+    throw new HttpError(404, "User not found", "USER_NOT_FOUND");
+  }
+
+  return data.user.app_metadata || {};
+}
+
+// Lit → modifie → écrit, en série par utilisateur (pas de perte de mise à
+// jour entre deux événements Stripe / deux requêtes concurrentes de CE
+// processus). `mutate(current)` renvoie le nouvel objet app_metadata, ou
+// null pour ne rien écrire. Renvoie l'état final.
+function updateAppMetadata(userId, mutate) {
+  return runSerial(`app-metadata:${userId}`, async () => {
+    const current = await getAppMetadata(userId);
+    const next = mutate(current);
+
+    if (next === null || next === undefined) return current;
+
+    const { error } = await adminUpdateUser(userId, { app_metadata: next });
+
+    if (error) throw dbError("auth.admin.updateUserById(app_metadata)", error);
+
+    return next;
+  });
+}
+
+// ============================================================
 // STRIPE — HELPERS
 // ============================================================
 
@@ -1662,16 +1833,16 @@ function requireStripe() {
   if (!stripe) throw new HttpError(500, "Stripe is not configured");
 }
 
-async function getAppMetadata(userId) {
-  const { data } = await supabaseAdmin.auth.admin.getUserById(userId);
-  return data?.user?.app_metadata || {};
-}
+const isStripeMissing = (error) => error?.code === "resource_missing";
 
 // Retourne l'identifiant de client Stripe de l'utilisateur.
 // - source de vérité : app_metadata (serveur uniquement)
 // - migration : un ancien id stocké dans user_metadata n'est accepté
 //   que si le client Stripe correspondant appartient bien à cet
 //   utilisateur (user_metadata est modifiable par le client).
+// - création : sous verrou, après relecture d'app_metadata, et en
+//   réutilisant un client Stripe déjà créé pour cet utilisateur (cas d'une
+//   écriture Supabase échouée lors d'une tentative précédente).
 async function getStripeCustomerId(user, { create = false } = {}) {
   const trusted = user.app_metadata?.stripe_customer_id;
   if (trusted) return trusted;
@@ -1687,12 +1858,20 @@ async function getStripeCustomerId(user, { create = false } = {}) {
         !customer.deleted &&
         customer.metadata?.supabase_user_id === user.id
       ) {
-        await adminUpdateUser(user.id, {
-          app_metadata: {
-            ...(user.app_metadata || {}),
+        try {
+          await updateAppMetadata(user.id, (current) => ({
+            ...current,
             stripe_customer_id: legacy,
-          },
-        });
+          }));
+        } catch (saveError) {
+          // L'id reste valide (vérifié) : on continue, la migration sera
+          // retentée au prochain appel.
+          console.error(
+            "Legacy Stripe customer migration not saved:",
+            saveError.message
+          );
+        }
+
         return legacy;
       }
     } catch (error) {
@@ -1703,22 +1882,52 @@ async function getStripeCustomerId(user, { create = false } = {}) {
   if (!create) return null;
 
   return withLock(`stripe-customer:${user.id}`, async () => {
-    const customer = await stripe.customers.create({
-      email: user.email,
-      metadata: { supabase_user_id: user.id },
-    });
+    // Un autre appel a pu créer / enregistrer le client entre-temps.
+    const fresh = await getAppMetadata(user.id);
+    if (fresh.stripe_customer_id) return fresh.stripe_customer_id;
 
-    await adminUpdateUser(user.id, {
-      app_metadata: {
-        ...(user.app_metadata || {}),
-        stripe_customer_id: customer.id,
-      },
-    });
+    let customerId = null;
 
-    return customer.id;
+    try {
+      const found = await stripe.customers.search({
+        query: `metadata['supabase_user_id']:'${user.id}'`,
+        limit: 1,
+      });
+
+      customerId = found.data[0]?.id || null;
+    } catch (searchError) {
+      console.warn("Stripe customer search failed:", searchError.message);
+    }
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: { supabase_user_id: user.id },
+      });
+
+      customerId = customer.id;
+    }
+
+    try {
+      await updateAppMetadata(user.id, (current) => ({
+        ...current,
+        stripe_customer_id: customerId,
+      }));
+    } catch (saveError) {
+      console.error(
+        `Stripe customer ${customerId} exists but could not be saved for user ${user.id}:`,
+        saveError.message
+      );
+      throw saveError;
+    }
+
+    return customerId;
   });
 }
 
+// null UNIQUEMENT si le client est supprimé / inconnu / sans lien utilisateur.
+// Une erreur réseau ou API est propagée : le webhook répond 500 et Stripe
+// réessaie, au lieu d'ignorer silencieusement l'événement.
 async function resolveUserIdFromCustomer(customerId) {
   if (!customerId) return null;
 
@@ -1726,14 +1935,16 @@ async function resolveUserIdFromCustomer(customerId) {
 
   try {
     const customer = await stripe.customers.retrieve(id);
+
     if (customer && !customer.deleted) {
       return customer.metadata?.supabase_user_id || null;
     }
-  } catch (error) {
-    console.error("resolveUserIdFromCustomer error:", error.message);
-  }
 
-  return null;
+    return null;
+  } catch (error) {
+    if (isStripeMissing(error)) return null;
+    throw error;
+  }
 }
 
 function subscriptionSnapshot(subscription) {
@@ -1753,15 +1964,153 @@ function subscriptionSnapshot(subscription) {
   };
 }
 
-async function syncSubscriptionToUser(userId, subscription) {
-  const current = await getAppMetadata(userId);
+const TERMINAL_SUBSCRIPTION_STATUSES = new Set([
+  "canceled",
+  "incomplete_expired",
+]);
 
-  await adminUpdateUser(userId, {
-    app_metadata: {
+// Écrit l'état d'abonnement (issu de Stripe) dans app_metadata.
+//  - eventCreated : horodatage Stripe (s) de l'événement à l'origine de
+//    l'écriture. Un événement plus ancien que le dernier appliqué est ignoré
+//    (livraison dans le désordre).
+//  - Un événement terminal (canceled...) d'un ANCIEN abonnement n'écrase pas
+//    un abonnement différent encore actif (annulation puis réabonnement).
+//  - overrides : champs forcés dans le snapshot (ex. status "past_due"
+//    prouvé par une facture Stripe impayée).
+// Renvoie true si l'état a été écrit.
+async function syncSubscriptionToUser(
+  userId,
+  subscription,
+  { eventCreated = 0, overrides = {} } = {}
+) {
+  const snapshot = { ...subscriptionSnapshot(subscription), ...overrides };
+  let written = false;
+
+  await updateAppMetadata(userId, (current) => {
+    const lastEventAt = Number(current.subscription_event_at || 0);
+
+    if (eventCreated && eventCreated < lastEventAt) return null;
+
+    const stored = current.subscription;
+
+    if (
+      stored?.id &&
+      stored.id !== snapshot.id &&
+      !TERMINAL_SUBSCRIPTION_STATUSES.has(stored.status) &&
+      TERMINAL_SUBSCRIPTION_STATUSES.has(snapshot.status)
+    ) {
+      return null;
+    }
+
+    written = true;
+
+    return {
       ...current,
-      subscription: subscriptionSnapshot(subscription),
-    },
+      subscription: snapshot,
+      subscription_event_at: Math.max(lastEventAt, eventCreated || 0),
+    };
   });
+
+  return written;
+}
+
+async function retrieveSubscription(subscriptionId, fallback) {
+  try {
+    return await stripe.subscriptions.retrieve(subscriptionId);
+  } catch (error) {
+    if (isStripeMissing(error) && fallback) return fallback;
+    throw error;
+  }
+}
+
+const idOf = (value) =>
+  typeof value === "string" ? value : value?.id || null;
+
+// Traite UN événement Stripe (déjà authentifié par sa signature).
+// Toute erreur remonte → 500 → Stripe réessaie. Les handlers sont
+// idempotents : l'état est toujours relu depuis Stripe, jamais déduit du
+// seul contenu de l'événement.
+async function processStripeEvent(event) {
+  const eventCreated = Number(event.created) || 0;
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        const subscriptionId = idOf(session.subscription);
+
+        if (session.mode !== "subscription" || !subscriptionId) break;
+
+        const userId =
+          session.client_reference_id ||
+          (await resolveUserIdFromCustomer(session.customer));
+
+        if (userId) {
+          const subscription = await retrieveSubscription(subscriptionId);
+          await syncSubscriptionToUser(userId, subscription, { eventCreated });
+        }
+        break;
+      }
+
+      case "customer.subscription.created":
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        const payload = event.data.object;
+        const userId = await resolveUserIdFromCustomer(payload.customer);
+
+        if (userId) {
+          // Données fraîches de Stripe : un événement en retard ne peut pas
+          // réinjecter un ancien état.
+          const subscription = await retrieveSubscription(payload.id, payload);
+          await syncSubscriptionToUser(userId, subscription, { eventCreated });
+        }
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        const subscriptionId = idOf(invoice.subscription);
+
+        if (!subscriptionId) break; // facture hors abonnement
+
+        const userId = await resolveUserIdFromCustomer(invoice.customer);
+        if (!userId) break;
+
+        // Preuve côté Stripe : la facture est-elle TOUJOURS impayée ?
+        // (un paiement réussi entre-temps ne doit pas être écrasé.)
+        const [freshInvoice, subscription] = await Promise.all([
+          stripe.invoices.retrieve(invoice.id),
+          stripe.subscriptions.retrieve(subscriptionId),
+        ]);
+
+        const stillUnpaid = freshInvoice.status === "open";
+        const liveStatus = subscription.status;
+
+        await syncSubscriptionToUser(userId, subscription, {
+          eventCreated,
+          overrides:
+            stillUnpaid && (liveStatus === "active" || liveStatus === "trialing")
+              ? { status: "past_due" }
+              : {},
+        });
+        break;
+      }
+
+      default:
+        // Événement ignoré
+        break;
+    }
+  } catch (error) {
+    if (error instanceof HttpError && error.code === "USER_NOT_FOUND") {
+      // Utilisateur supprimé côté Supabase : inutile que Stripe réessaie.
+      console.warn(
+        `[stripe:webhook] ${event.id} (${event.type}) ignoré : utilisateur introuvable`
+      );
+      return;
+    }
+
+    throw error;
+  }
 }
 
 // ============================================================
@@ -1854,6 +2203,54 @@ function assertValidOAuthCallback(provider, body, userId) {
 
   return code;
 }
+
+// ============================================================
+// TOKENS OAUTH — LECTURE / ÉCRITURE COMMUNES (TikTok, Pinterest, YouTube)
+// ============================================================
+
+// Une erreur de base de données n'est JAMAIS traitée comme « compte absent ».
+async function selectTokenRow(table, userId) {
+  const { data, error } = await supabaseAdmin
+    .from(table)
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) throw dbError(`${table} select`, error);
+
+  return decryptTokenRow(data);
+}
+
+// Le jeton d'accès est utilisable s'il expire dans plus de 60 s.
+function isTokenFresh(account) {
+  return Boolean(
+    account?.access_token &&
+      new Date(account.access_expires_at).getTime() > Date.now() + 60_000
+  );
+}
+
+const isPast = (value) => new Date(value).getTime() <= Date.now();
+
+// Mise à jour « compare-and-swap » : la ligne n'est modifiée que si
+// updated_at est celui que l'on a lu. Si un autre traitement (autre
+// instance, reconnexion, déconnexion) est passé entre-temps, rien n'est
+// écrit et on renvoie false : un ancien jeton ne réécrase jamais un plus
+// récent, et une ligne supprimée n'est jamais recréée.
+async function updateTokensIfUnchanged(table, userId, account, row) {
+  let query = supabaseAdmin.from(table).update(row).eq("user_id", userId);
+
+  query = account.updated_at
+    ? query.eq("updated_at", account.updated_at)
+    : query.is("updated_at", null);
+
+  const { data, error } = await query.select("user_id");
+
+  if (error) throw dbError(`${table} update`, error);
+
+  return Array.isArray(data) && data.length > 0;
+}
+
+const iso = (ms) => new Date(ms).toISOString();
 
 // ============================================================
 // TIKTOK — APPEL API
@@ -1952,21 +2349,37 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
 // TIKTOK — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
 
-async function saveTikTokTokens(userId, t, extra = {}) {
+// Champs à écrire pour un jeu de jetons TikTok. Un champ absent de la
+// réponse du provider n'est PAS écrasé (ex. refresh_token non renvoyé).
+function buildTikTokTokenRow(t) {
   const now = Date.now();
+  const accessTtl = Number(t.expires_in) || 24 * 60 * 60;
 
+  const row = {
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: iso(now + accessTtl * 1000),
+    updated_at: new Date().toISOString(),
+  };
+
+  if (t.open_id) row.open_id = t.open_id;
+  if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
+
+  const refreshTtl = Number(t.refresh_expires_in);
+  if (Number.isFinite(refreshTtl) && refreshTtl > 0) {
+    row.refresh_expires_at = iso(now + refreshTtl * 1000);
+  }
+
+  if (t.scope) row.scope = t.scope;
+
+  return row;
+}
+
+// Connexion initiale : crée ou remplace la ligne.
+async function saveTikTokTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("tiktok_accounts").upsert(
     {
       user_id: userId,
-      open_id: t.open_id,
-      access_token: encryptSecret(t.access_token),
-      refresh_token: encryptSecret(t.refresh_token),
-      access_expires_at: new Date(now + t.expires_in * 1000).toISOString(),
-      refresh_expires_at: new Date(
-        now + t.refresh_expires_in * 1000
-      ).toISOString(),
-      scope: t.scope,
-      updated_at: new Date().toISOString(),
+      ...buildTikTokTokenRow(t),
       ...extra,
     },
     { onConflict: "user_id" }
@@ -1976,60 +2389,73 @@ async function saveTikTokTokens(userId, t, extra = {}) {
 }
 
 async function getTikTokAccount(userId) {
-  const { data } = await supabaseAdmin
-    .from("tiktok_accounts")
-    .select("*")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  return decryptTokenRow(data);
+  return selectTokenRow("tiktok_accounts", userId);
 }
 
 async function getValidTikTokToken(userId) {
-  const account = await getTikTokAccount(userId);
+  const notConnected = () =>
+    new HttpError(400, "TikTok account not connected", "TIKTOK_NOT_CONNECTED");
 
-  if (!account) {
-    throw new HttpError(
-      400,
-      "TikTok account not connected",
-      "TIKTOK_NOT_CONNECTED"
-    );
-  }
-
-  if (
-    account.access_token &&
-    new Date(account.access_expires_at).getTime() > Date.now() + 60_000
-  ) {
-    return account.access_token;
-  }
-
-  const refreshExpired =
-    !account.refresh_token ||
-    new Date(account.refresh_expires_at).getTime() <= Date.now();
-
-  if (refreshExpired) {
-    throw reconnectError("TikTok", "TIKTOK_REFRESH_EXPIRED");
-  }
+  const first = await getTikTokAccount(userId);
+  if (!first) throw notConnected();
+  if (isTokenFresh(first)) return first.access_token;
 
   return withLock(`tiktok-refresh:${userId}`, async () => {
-    try {
-      const refreshed = await tiktokApi("/v2/oauth/token/", {
-        form: {
-          client_key: TIKTOK_CLIENT_KEY,
-          client_secret: TIKTOK_CLIENT_SECRET,
-          grant_type: "refresh_token",
-          refresh_token: account.refresh_token,
-        },
-      });
+    // Deux tentatives : la seconde n'a lieu que si la ligne a changé
+    // pendant le refresh (autre instance, reconnexion...).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Relecture APRÈS verrou : un autre traitement a peut-être déjà
+      // renouvelé le jeton (et TikTok fait tourner les refresh tokens).
+      const account = await getTikTokAccount(userId);
 
-      await saveTikTokTokens(userId, refreshed);
-      return refreshed.access_token;
-    } catch (error) {
-      if (error instanceof HttpError && error.code === "invalid_grant") {
+      if (!account) throw notConnected();
+      if (isTokenFresh(account)) return account.access_token;
+
+      if (!account.refresh_token || isPast(account.refresh_expires_at)) {
         throw reconnectError("TikTok", "TIKTOK_REFRESH_EXPIRED");
       }
-      throw error;
+
+      let refreshed;
+
+      try {
+        refreshed = await tiktokApi("/v2/oauth/token/", {
+          form: {
+            client_key: TIKTOK_CLIENT_KEY,
+            client_secret: TIKTOK_CLIENT_SECRET,
+            grant_type: "refresh_token",
+            refresh_token: account.refresh_token,
+          },
+        });
+      } catch (error) {
+        if (error instanceof HttpError && error.code === "invalid_grant") {
+          throw reconnectError("TikTok", "TIKTOK_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(
+          502,
+          "TikTok returned an invalid token response",
+          "TIKTOK_BAD_TOKEN_RESPONSE"
+        );
+      }
+
+      const applied = await updateTokensIfUnchanged(
+        "tiktok_accounts",
+        userId,
+        account,
+        buildTikTokTokenRow(refreshed)
+      );
+
+      if (applied) return refreshed.access_token;
     }
+
+    throw new HttpError(
+      409,
+      "TikTok account changed during token refresh, please retry",
+      "TIKTOK_REFRESH_CONFLICT"
+    );
   });
 }
 
@@ -2075,7 +2501,7 @@ async function refreshTikTokProfile(userId, account, { force = false } = {}) {
 
     // On ne touche PAS à updated_at : il sert au webhook
     // authorization.removed pour ne pas supprimer une connexion
-    // rétablie après la révocation.
+    // rétablie après la révocation (et au compare-and-swap du refresh).
     const { error } = await supabaseAdmin
       .from("tiktok_accounts")
       .update({
@@ -2256,6 +2682,20 @@ async function initTikTokPublish(accessToken, mode, postInfoFields, sourceInfo) 
       });
 }
 
+// publish_id TikTok : lettres, chiffres, _ . : ~ -  (le « ~ » est utilisé
+// par TikTok), 64 caractères maximum.
+const TIKTOK_PUBLISH_ID_PATTERN = /^[\w.:~-]+$/;
+const TIKTOK_PUBLISH_ID_MAX = 64;
+
+function isValidTikTokPublishId(value) {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= TIKTOK_PUBLISH_ID_MAX &&
+    TIKTOK_PUBLISH_ID_PATTERN.test(value)
+  );
+}
+
 // ============================================================
 // TIKTOK — PHOTOS (carrousel)
 // ============================================================
@@ -2373,13 +2813,13 @@ async function serveTikTokMedia(req, res, fileName) {
   res.end(req.method === "HEAD" ? undefined : buffer);
 }
 
-// Vérifie, AVANT d'appeler TikTok, que la première image est bien
-// joignable depuis Internet avec le bon Content-Type. Évite l'erreur
-// opaque « The request source info is empty or incorrect » : on remonte
-// la vraie cause (mauvais PUBLIC_API_URL, proxy, 404...).
-// Désactivable avec TIKTOK_SKIP_PHOTO_PROBE=1.
-async function probePublicPhoto(imageUrl) {
-  if (env("TIKTOK_SKIP_PHOTO_PROBE") === "1") return;
+// Vérifie, AVANT d'appeler TikTok, qu'une image est bien joignable depuis
+// Internet avec le bon Content-Type. Évite l'erreur opaque « The request
+// source info is empty or incorrect » : on remonte la vraie cause (mauvais
+// PUBLIC_API_URL, proxy, 404...). `index` / `total` (1-based) précisent
+// quelle photo pose problème.
+async function probePublicPhoto(imageUrl, index = 1, total = 1) {
+  const label = total > 1 ? ` (photo ${index}/${total})` : "";
 
   let status = null;
   let contentType = null;
@@ -2409,7 +2849,7 @@ async function probePublicPhoto(imageUrl) {
 
     throw new HttpError(
       502,
-      "The photo URL is not reachable from the internet. Check PUBLIC_API_URL (it must be the public domain of this API server).",
+      `The photo URL is not reachable from the internet${label}. Check PUBLIC_API_URL (it must be the public domain of this API server).`,
       "PHOTO_URL_UNREACHABLE"
     );
   }
@@ -2421,8 +2861,27 @@ async function probePublicPhoto(imageUrl) {
   if (status !== 200 || !okType) {
     throw new HttpError(
       502,
-      `The photo URL did not return a valid image (HTTP ${status}, ${contentType || "no content-type"}). PUBLIC_API_URL probably points to the wrong host.`,
+      `The photo URL did not return a valid image${label} (HTTP ${status}, ${contentType || "no content-type"}). PUBLIC_API_URL probably points to the wrong host.`,
       "PHOTO_URL_INVALID"
+    );
+  }
+}
+
+// Sonde TOUTES les images du carrousel (pas seulement la première), par
+// lots pour ne pas saturer le serveur. Désactivable avec
+// TIKTOK_SKIP_PHOTO_PROBE=1.
+async function probePublicPhotos(imageUrls) {
+  if (env("TIKTOK_SKIP_PHOTO_PROBE") === "1") return;
+
+  const BATCH = 6;
+
+  for (let i = 0; i < imageUrls.length; i += BATCH) {
+    await Promise.all(
+      imageUrls
+        .slice(i, i + BATCH)
+        .map((imageUrl, offset) =>
+          probePublicPhoto(imageUrl, i + offset + 1, imageUrls.length)
+        )
     );
   }
 }
@@ -2530,7 +2989,7 @@ async function pinterestApi(
   if (!response.ok) {
     // On ne renvoie JAMAIS le 401 de Pinterest tel quel : le frontend
     // le confondrait avec l'expiration de la session Stone.
-    throw new HttpError(
+    const error = new HttpError(
       upstreamStatus(response.status),
       data.message ||
         data.error_description ||
@@ -2538,6 +2997,11 @@ async function pinterestApi(
         `Pinterest error (HTTP ${response.status})`,
       data.code !== undefined ? String(data.code) : undefined
     );
+
+    // Statut réel du provider (le refresh s'en sert pour distinguer un
+    // jeton révoqué / expiré d'une panne temporaire).
+    error.upstreamStatus = response.status;
+    throw error;
   }
 
   return data;
@@ -2546,83 +3010,149 @@ async function pinterestApi(
 // ============================================================
 // PINTEREST — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
+//
+// Chaque compte mémorise l'environnement dans lequel ses jetons ont été
+// émis (colonne api_env). Un jeton sandbox n'est jamais envoyé à
+// l'API de production, ni l'inverse : la reconnexion est demandée.
 
-async function savePinterestTokens(userId, t, extra = {}) {
+// replaceRefresh = true (connexion initiale) : les champs absents sont
+// remis à zéro. false (refresh) : un refresh_token / une expiration non
+// renvoyés par Pinterest ne sont PAS écrasés.
+function buildPinterestTokenRow(t, { replaceRefresh = false } = {}) {
   const now = Date.now();
-
   const accessTtl = Number(t.expires_in) || 30 * 24 * 60 * 60;
-  const refreshTtl = Number(t.refresh_token_expires_in) || 365 * 24 * 60 * 60;
 
+  const row = {
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: iso(now + accessTtl * 1000),
+    updated_at: new Date().toISOString(),
+  };
+
+  if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
+  else if (replaceRefresh) row.refresh_token = null;
+
+  const refreshTtl = Number(t.refresh_token_expires_in);
+
+  if (Number.isFinite(refreshTtl) && refreshTtl > 0) {
+    row.refresh_expires_at = iso(now + refreshTtl * 1000);
+  } else if (replaceRefresh) {
+    row.refresh_expires_at = iso(now + 365 * 24 * 60 * 60 * 1000);
+  }
+
+  if (t.scope) row.scope = t.scope;
+  else if (replaceRefresh) row.scope = null;
+
+  return row;
+}
+
+// Connexion initiale : crée ou remplace la ligne, et fixe l'environnement.
+async function savePinterestTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("pinterest_accounts").upsert(
     {
       user_id: userId,
-      access_token: encryptSecret(t.access_token),
-      refresh_token: encryptSecret(t.refresh_token),
-      access_expires_at: new Date(now + accessTtl * 1000).toISOString(),
-      refresh_expires_at: new Date(now + refreshTtl * 1000).toISOString(),
-      scope: t.scope || null,
-      updated_at: new Date().toISOString(),
+      ...buildPinterestTokenRow(t, { replaceRefresh: true }),
+      api_env: PINTEREST_ENVIRONMENT,
       ...extra,
     },
     { onConflict: "user_id" }
   );
 
-  if (error) throw new Error(error.message);
+  if (error) throw dbError("pinterest_accounts upsert", error);
 }
 
 async function getPinterestAccount(userId) {
-  const { data } = await supabaseAdmin
-    .from("pinterest_accounts")
-    .select("*")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  return decryptTokenRow(data);
+  return selectTokenRow("pinterest_accounts", userId);
 }
 
+const pinterestAccountMatchesEnv = (account) =>
+  Boolean(account) && account.api_env === PINTEREST_ENVIRONMENT;
+
+// Renvoyé par Pinterest quand le refresh token est révoqué / expiré.
+const isPinterestInvalidGrant = (error) =>
+  error instanceof HttpError &&
+  (error.upstreamStatus === 400 ||
+    error.upstreamStatus === 401 ||
+    error.code === "invalid_grant");
+
 async function getValidPinterestToken(userId) {
-  const account = await getPinterestAccount(userId);
+  const load = async () => {
+    const account = await getPinterestAccount(userId);
 
-  if (!account) {
-    throw new HttpError(
-      400,
-      "Pinterest account not connected",
-      "PINTEREST_NOT_CONNECTED"
-    );
-  }
+    if (!account) {
+      throw new HttpError(
+        400,
+        "Pinterest account not connected",
+        "PINTEREST_NOT_CONNECTED"
+      );
+    }
 
-  if (
-    account.access_token &&
-    new Date(account.access_expires_at).getTime() > Date.now() + 60_000
-  ) {
-    return account.access_token;
-  }
+    // Jetons émis pour un autre environnement (ou ligne d'avant la
+    // migration api_env) : jamais utilisés.
+    if (!pinterestAccountMatchesEnv(account)) {
+      throw reconnectError("Pinterest", "PINTEREST_ENV_MISMATCH");
+    }
 
-  const refreshExpired =
-    !account.refresh_token ||
-    new Date(account.refresh_expires_at).getTime() <= Date.now();
+    return account;
+  };
 
-  if (refreshExpired) {
-    throw reconnectError("Pinterest", "PINTEREST_REFRESH_EXPIRED");
-  }
+  const first = await load();
+  if (isTokenFresh(first)) return first.access_token;
 
   return withLock(`pinterest-refresh:${userId}`, async () => {
-    const refreshed = await pinterestApi("/oauth/token", {
-      method: "POST",
-      base: PINTEREST_OAUTH_BASE,
-      basic: true,
-      form: {
-        grant_type: "refresh_token",
-        refresh_token: account.refresh_token,
-      },
-    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Relecture APRÈS verrou : un autre traitement a pu renouveler.
+      const account = await load();
 
-    await savePinterestTokens(userId, {
-      ...refreshed,
-      refresh_token: refreshed.refresh_token || account.refresh_token,
-    });
+      if (isTokenFresh(account)) return account.access_token;
 
-    return refreshed.access_token;
+      if (!account.refresh_token || isPast(account.refresh_expires_at)) {
+        throw reconnectError("Pinterest", "PINTEREST_REFRESH_EXPIRED");
+      }
+
+      let refreshed;
+
+      try {
+        refreshed = await pinterestApi("/oauth/token", {
+          method: "POST",
+          base: PINTEREST_OAUTH_BASE,
+          basic: true,
+          form: {
+            grant_type: "refresh_token",
+            refresh_token: account.refresh_token,
+          },
+        });
+      } catch (error) {
+        if (isPinterestInvalidGrant(error)) {
+          throw reconnectError("Pinterest", "PINTEREST_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(
+          502,
+          "Pinterest returned an invalid token response",
+          "PINTEREST_BAD_TOKEN_RESPONSE"
+        );
+      }
+
+      // Pinterest ne renvoie pas toujours un nouveau refresh_token : dans
+      // ce cas l'ancien est conservé (buildPinterestTokenRow ne l'écrase pas).
+      const applied = await updateTokensIfUnchanged(
+        "pinterest_accounts",
+        userId,
+        account,
+        buildPinterestTokenRow(refreshed)
+      );
+
+      if (applied) return refreshed.access_token;
+    }
+
+    throw new HttpError(
+      409,
+      "Pinterest account changed during token refresh, please retry",
+      "PINTEREST_REFRESH_CONFLICT"
+    );
   });
 }
 
@@ -2696,17 +3226,19 @@ async function fetchYouTubeChannel(accessToken) {
 // ============================================================
 // YOUTUBE — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
+//
+// Particularité Google : le refresh token est durable et n'est PAS renvoyé
+// lors d'un refresh → on ne l'écrase jamais s'il est absent de la réponse.
+// invalid_grant = autorisation révoquée / expirée → reconnexion.
 
-async function saveYouTubeTokens(userId, t, extra = {}) {
+function buildYouTubeTokenRow(t) {
   const now = Date.now();
   const accessTtl = Number(t.expires_in) || 3600;
 
   const row = {
-    user_id: userId,
     access_token: encryptSecret(t.access_token),
-    access_expires_at: new Date(now + accessTtl * 1000).toISOString(),
+    access_expires_at: iso(now + accessTtl * 1000),
     updated_at: new Date().toISOString(),
-    ...extra,
   };
 
   if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
@@ -2714,73 +3246,104 @@ async function saveYouTubeTokens(userId, t, extra = {}) {
 
   if (t.refresh_token_expires_in !== undefined) {
     row.refresh_expires_at = t.refresh_token_expires_in
-      ? new Date(now + Number(t.refresh_token_expires_in) * 1000).toISOString()
+      ? iso(now + Number(t.refresh_token_expires_in) * 1000)
       : null;
   }
 
+  return row;
+}
+
+// Connexion initiale : crée ou remplace la ligne.
+async function saveYouTubeTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("youtube_accounts")
-    .upsert(row, { onConflict: "user_id" });
+    .upsert(
+      { user_id: userId, ...buildYouTubeTokenRow(t), ...extra },
+      { onConflict: "user_id" }
+    );
 
-  if (error) throw new Error(error.message);
+  if (error) throw dbError("youtube_accounts upsert", error);
 }
 
 async function getYouTubeAccount(userId) {
-  const { data } = await supabaseAdmin
-    .from("youtube_accounts")
-    .select("*")
-    .eq("user_id", userId)
-    .maybeSingle();
-
-  return decryptTokenRow(data);
+  return selectTokenRow("youtube_accounts", userId);
 }
 
+const youtubeRefreshExpired = (account) =>
+  !account.refresh_token ||
+  Boolean(account.refresh_expires_at) && isPast(account.refresh_expires_at);
+
 async function getValidYouTubeToken(userId) {
-  const account = await getYouTubeAccount(userId);
+  const load = async () => {
+    const account = await getYouTubeAccount(userId);
 
-  if (!account) {
-    throw new HttpError(
-      400,
-      "YouTube account not connected",
-      "YOUTUBE_NOT_CONNECTED"
-    );
-  }
+    if (!account) {
+      throw new HttpError(
+        400,
+        "YouTube account not connected",
+        "YOUTUBE_NOT_CONNECTED"
+      );
+    }
 
-  if (
-    account.access_token &&
-    new Date(account.access_expires_at).getTime() > Date.now() + 60_000
-  ) {
-    return account.access_token;
-  }
+    return account;
+  };
 
-  const refreshExpired =
-    account.refresh_expires_at &&
-    new Date(account.refresh_expires_at).getTime() <= Date.now();
-
-  if (!account.refresh_token || refreshExpired) {
-    throw reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
-  }
+  const first = await load();
+  if (isTokenFresh(first)) return first.access_token;
 
   return withLock(`youtube-refresh:${userId}`, async () => {
-    try {
-      const refreshed = await googleRequest(GOOGLE_TOKEN_URL, {
-        method: "POST",
-        form: {
-          client_id: YOUTUBE_CLIENT_ID,
-          client_secret: YOUTUBE_CLIENT_SECRET,
-          grant_type: "refresh_token",
-          refresh_token: account.refresh_token,
-        },
-      });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Relecture APRÈS verrou : un autre traitement a pu renouveler.
+      const account = await load();
 
-      await saveYouTubeTokens(userId, refreshed);
-      return refreshed.access_token;
-    } catch (error) {
-      if (error instanceof HttpError && error.code === "invalid_grant") {
+      if (isTokenFresh(account)) return account.access_token;
+
+      if (youtubeRefreshExpired(account)) {
         throw reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
       }
-      throw error;
+
+      let refreshed;
+
+      try {
+        refreshed = await googleRequest(GOOGLE_TOKEN_URL, {
+          method: "POST",
+          form: {
+            client_id: YOUTUBE_CLIENT_ID,
+            client_secret: YOUTUBE_CLIENT_SECRET,
+            grant_type: "refresh_token",
+            refresh_token: account.refresh_token,
+          },
+        });
+      } catch (error) {
+        if (error instanceof HttpError && error.code === "invalid_grant") {
+          throw reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(
+          502,
+          "Google returned an invalid token response",
+          "YOUTUBE_BAD_TOKEN_RESPONSE"
+        );
+      }
+
+      const applied = await updateTokensIfUnchanged(
+        "youtube_accounts",
+        userId,
+        account,
+        buildYouTubeTokenRow(refreshed)
+      );
+
+      if (applied) return refreshed.access_token;
     }
+
+    throw new HttpError(
+      409,
+      "YouTube account changed during token refresh, please retry",
+      "YOUTUBE_REFRESH_CONFLICT"
+    );
   });
 }
 
@@ -3122,7 +3685,7 @@ route("GET", "/api/health", ({ res }) => {
     tiktok: tiktokEnabled
       ? { enabled: true, ...tiktokCapabilities() }
       : { enabled: false },
-    pinterest: pinterestEnabled,
+    pinterest: pinterestUsable,
     youtube: youtubeEnabled,
   });
 });
@@ -3666,7 +4229,8 @@ route(
 
 // Interroge Stripe en direct puis resynchronise le compte si besoin :
 // l'abonnement apparaît immédiatement après le checkout, même si le
-// webhook est en retard.
+// webhook est en retard. Un échec de resynchronisation est journalisé
+// (la réponse reste celle de Stripe, source de vérité).
 route(
   "GET",
   "/api/stripe/subscription",
@@ -3704,7 +4268,7 @@ route(
         try {
           await syncSubscriptionToUser(user.id, sub);
         } catch (syncError) {
-          console.warn("Subscription self-heal failed:", syncError.message);
+          console.error("Subscription self-heal failed:", syncError.message);
         }
       }
     }
@@ -3725,6 +4289,12 @@ route(
   { auth: true }
 );
 
+// Idempotence : un événement déjà traité (même id) n'est pas rejoué ; deux
+// livraisons simultanées du même événement sont fusionnées. L'état est
+// ensuite toujours relu depuis Stripe et les événements plus anciens que
+// le dernier appliqué sont ignorés (voir processStripeEvent).
+const processedStripeEvents = createSeenCache(10_000, 24 * 60 * 60 * 1000);
+
 route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) {
     throw new HttpError(500, "Stripe webhook not configured");
@@ -3736,10 +4306,13 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
     throw new HttpError(400, "Missing stripe-signature");
   }
 
+  // Corps BRUT (octets exacts reçus) : indispensable à la signature.
+  // Une erreur de lecture (413, requête interrompue) garde son vrai statut.
+  const rawBody = await getRawBody(req);
+
   let event;
 
   try {
-    const rawBody = await getRawBody(req);
     event = stripe.webhooks.constructEvent(
       rawBody,
       signature,
@@ -3753,60 +4326,16 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
     throw new HttpError(400, "Webhook signature verification failed");
   }
 
-  // En cas d'erreur, l'exception remonte → 500 → Stripe retentera
-  // l'événement. Les handlers sont idempotents (un rejeu est sans risque).
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const session = event.data.object;
-      const userId =
-        session.client_reference_id ||
-        (await resolveUserIdFromCustomer(session.customer));
-
-      if (userId && session.subscription) {
-        const subscription = await stripe.subscriptions.retrieve(
-          session.subscription
-        );
-        await syncSubscriptionToUser(userId, subscription);
-      }
-      break;
-    }
-
-    case "customer.subscription.created":
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted": {
-      const subscription = event.data.object;
-      const userId = await resolveUserIdFromCustomer(subscription.customer);
-
-      if (userId) {
-        await syncSubscriptionToUser(userId, subscription);
-      }
-      break;
-    }
-
-    case "invoice.payment_failed": {
-      const invoice = event.data.object;
-      const userId = await resolveUserIdFromCustomer(invoice.customer);
-
-      if (userId) {
-        const current = await getAppMetadata(userId);
-
-        await adminUpdateUser(userId, {
-          app_metadata: {
-            ...current,
-            subscription: {
-              ...(current.subscription || {}),
-              status: "past_due",
-            },
-          },
-        });
-      }
-      break;
-    }
-
-    default:
-      // Événement ignoré
-      break;
+  if (processedStripeEvents.has(event.id)) {
+    sendJson(res, 200, { received: true, duplicate: true });
+    return;
   }
+
+  // En cas d'erreur, l'exception remonte → 500 → Stripe retentera
+  // l'événement (il n'est marqué « traité » qu'après succès).
+  await withLock(`stripe-event:${event.id}`, () => processStripeEvent(event));
+
+  processedStripeEvents.add(event.id);
 
   sendJson(res, 200, { received: true });
 });
@@ -4256,8 +4785,8 @@ route(
         (name) => `${PUBLIC_API_URL}/api/media/tiktok/${name}`
       );
 
-      // Vérifie que TikTok pourra réellement télécharger les images.
-      await probePublicPhoto(imageUrls[0]);
+      // Vérifie que TikTok pourra réellement télécharger TOUTES les images.
+      await probePublicPhotos(imageUrls);
 
       const init = await initTikTokPhotoPublish(
         accessToken,
@@ -4295,7 +4824,8 @@ route(
   async ({ res, url, user }) => {
     const publishId = url.searchParams.get("publish_id");
 
-    if (!publishId || publishId.length > 128 || !/^[\w.:-]+$/.test(publishId)) {
+    // Les publish_id TikTok contiennent parfois « ~ » ; 64 caractères max.
+    if (!isValidTikTokPublishId(publishId)) {
       throw new HttpError(400, "Missing or invalid publish_id");
     }
 
@@ -4330,27 +4860,10 @@ const TIKTOK_WEBHOOK_DEDUPE_MAX = 5_000;
 // connexion rétablie APRÈS la révocation.
 const TIKTOK_REVOKE_SKEW_SEC = 5;
 
-const processedTikTokWebhooks = new Map();
-
-function tiktokWebhookSeen(key) {
-  const expires = processedTikTokWebhooks.get(key);
-  if (!expires) return false;
-
-  if (expires <= Date.now()) {
-    processedTikTokWebhooks.delete(key);
-    return false;
-  }
-
-  return true;
-}
-
-function tiktokWebhookRemember(key) {
-  if (processedTikTokWebhooks.size >= TIKTOK_WEBHOOK_DEDUPE_MAX) {
-    processedTikTokWebhooks.delete(processedTikTokWebhooks.keys().next().value);
-  }
-
-  processedTikTokWebhooks.set(key, Date.now() + TIKTOK_WEBHOOK_DEDUPE_TTL_MS);
-}
+const processedTikTokWebhooks = createSeenCache(
+  TIKTOK_WEBHOOK_DEDUPE_MAX,
+  TIKTOK_WEBHOOK_DEDUPE_TTL_MS
+);
 
 // "t=1633174587,s=<64 hex>" -> { timestamp, signature } ou null.
 function parseTikTokSignatureHeader(header) {
@@ -4523,7 +5036,7 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
   // 4. Événement déjà traité (livraison "au moins une fois").
   const dedupeKey = sha256(rawBody.toString("utf8"));
 
-  if (tiktokWebhookSeen(dedupeKey)) {
+  if (processedTikTokWebhooks.has(dedupeKey)) {
     sendJson(res, 200, { received: true, duplicate: true });
     return;
   }
@@ -4537,7 +5050,7 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
     console.warn("[" + requestId + "] [tiktok:webhook] événement inconnu ignoré : " + eventName.slice(0, 60));
   }
 
-  tiktokWebhookRemember(dedupeKey);
+  processedTikTokWebhooks.add(dedupeKey);
   sendJson(res, 200, { received: true });
 });
 
@@ -4565,6 +5078,9 @@ route(
   { auth: true }
 );
 
+// L'échange du code utilise l'endpoint OAuth de l'environnement choisi
+// (PINTEREST_OAUTH_BASE) ; le compte est enregistré avec cet environnement
+// (api_env) pour ne jamais mélanger jetons sandbox et production.
 route(
   "POST",
   "/api/pinterest/auth/callback",
@@ -4585,6 +5101,14 @@ route(
             redirect_uri: PINTEREST_REDIRECT_URI,
           },
         });
+
+        if (!tokens?.access_token) {
+          throw new HttpError(
+            502,
+            "Pinterest returned an invalid token response",
+            "PINTEREST_BAD_TOKEN_RESPONSE"
+          );
+        }
 
         let profile = {};
 
@@ -4616,6 +5140,8 @@ route(
 );
 
 // Connexion par token manuel (DEV / SANDBOX uniquement).
+// Le jeton est validé contre l'API de l'environnement ACTIF : il est donc
+// enregistré avec le bon api_env.
 route(
   "POST",
   "/api/pinterest/auth/token",
@@ -4670,16 +5196,19 @@ route(
   { auth: true }
 );
 
+// Un compte relié dans un AUTRE environnement (ou avant la migration
+// api_env) n'est pas présenté comme connecté : needs_reconnect = true.
 route(
   "GET",
   "/api/pinterest/status",
   async ({ res, user }) => {
     const account = await getPinterestAccount(user.id);
+    const usable = pinterestAccountMatchesEnv(account);
 
     sendJson(res, 200, {
       success: true,
-      connected: Boolean(account),
-      account: account
+      connected: usable,
+      account: usable
         ? {
             display_name: account.username,
             avatar_url: account.avatar_url,
@@ -4687,6 +5216,7 @@ route(
             scope: account.scope,
           }
         : null,
+      ...(account && !usable ? { needs_reconnect: true } : {}),
     });
   },
   { auth: true }
@@ -5070,6 +5600,16 @@ const server = createServer(async (req, res) => {
       }
     }
 
+    // Pinterest : sandbox et production ne se mélangent jamais.
+    if (pathname.startsWith("/api/pinterest/") && pinterestConfigError) {
+      console.error(`[${requestId}] Pinterest config: ${pinterestConfigError}`);
+      throw new HttpError(
+        500,
+        "Pinterest configuration is inconsistent (sandbox / production mismatch)",
+        "PINTEREST_CONFIG_INVALID"
+      );
+    }
+
     // ----------------------------------------------------------
     // Résolution de la route
     // ----------------------------------------------------------
@@ -5159,6 +5699,15 @@ server.listen(PORT, () => {
     }`
   );
   console.log(
+    `  Pinterest       : ${
+      !pinterestEnabled
+        ? "désactivé (Pinterest non configuré)"
+        : pinterestConfigError
+          ? `CONFIG INCOHÉRENTE (${pinterestConfigError})`
+          : `${PINTEREST_ENVIRONMENT.toUpperCase()} · API ${PINTEREST_API_BASE} · OAuth ${PINTEREST_OAUTH_BASE}`
+    }`
+  );
+  console.log(
     `  YouTube publish : ${
       youtubeEnabled
         ? YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE)
@@ -5181,8 +5730,31 @@ server.listen(PORT, () => {
     console.log(
       `  TikTok verif    : ${PUBLIC_API_URL}/api/media/tiktok/${TIKTOK_VERIFICATION_NAME}.txt`
     );
-    ensureTikTokMediaBucket().then(sweepTikTokMedia);
+    ensureTikTokMediaBucket()
+      .then(sweepTikTokMedia)
+      .catch((error) =>
+        console.warn("TikTok media init failed:", error?.message || error)
+      );
     setInterval(sweepTikTokMedia, 15 * 60 * 1000).unref?.();
+  }
+
+  // La colonne api_env (migration) est indispensable pour relier Pinterest.
+  if (pinterestUsable) {
+    supabaseAdmin
+      .from("pinterest_accounts")
+      .select("api_env")
+      .limit(1)
+      .then(({ error }) => {
+        if (error) {
+          console.error(
+            "❌ pinterest_accounts.api_env inaccessible — applique la migration SQL (colonne api_env) :",
+            error.message
+          );
+        }
+      })
+      .catch((error) =>
+        console.warn("Pinterest api_env check failed:", error?.message || error)
+      );
   }
 });
 
