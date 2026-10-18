@@ -7,8 +7,9 @@
 //   Production   : NODE_ENV=production, APP_URL, OAUTH_REDIRECT_URL,
 //                  OAUTH_STATE_SECRET (32+ caractères aléatoires)
 //   Recommandé   : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
-//                  chiffre les tokens TikTok / Pinterest / YouTube en base
-//                  (AES-256-GCM). Les anciens tokens en clair restent lisibles.
+//                  chiffre les tokens TikTok / Pinterest / YouTube / Canva en
+//                  base (AES-256-GCM). Les anciens tokens en clair restent
+//                  lisibles.
 //   Photos TikTok: URL publique de CE serveur (domaine de l'API, PAS le
 //                  frontend), lue dans l'ordre :
 //                  PUBLIC_API_URL → VITE_API_BASE_URL → RAILWAY_PUBLIC_DOMAIN
@@ -38,10 +39,18 @@
 //                  pour publier). Tant que le projet Google n'a pas passé
 //                  l'audit « YouTube API Services », YouTube force les
 //                  vidéos envoyées par l'API en PRIVÉ.
+//   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
+//                  CANVA_REDIRECT_URI (optionnel, défaut : ${APP_URL}/canva/callback)
+//                  CANVA_SCOPES (optionnel, défaut :
+//                    design:content:read design:content:write design:meta:read
+//                    profile:read)
+//                  Dans le portail Canva (canva.dev → Your integrations) :
+//                    - Authorized redirects : la même URL que CANVA_REDIRECT_URI
+//                    - Scopes : les mêmes que CANVA_SCOPES
 //   Optionnel    : ALLOWED_ORIGINS, TRUST_PROXY, TRUST_PROXY_HOPS,
 //                  MAX_VIDEO_UPLOADS, TIKTOK_VERIFICATION_FILE,
 //                  TIKTOK_SKIP_PHOTO_PROBE=1, STRIPE_*, TIKTOK_*,
-//                  PINTEREST_*, YOUTUBE_*
+//                  PINTEREST_*, YOUTUBE_*, CANVA_*
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -587,6 +596,48 @@ if (youtubeEnabled && !YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE))
 }
 
 // ============================================================
+// CONFIGURATION CANVA
+// ============================================================
+//
+// Canva Connect API (https://www.canva.dev/docs/connect/). L'échange de
+// code utilise PKCE (code_challenge / code_verifier) : le verifier reste
+// côté serveur, indexé par le hash du state. Mono-instance (comme les
+// rate limiters) ; en multi-instance, stocke le verifier en base.
+//
+// Le flux est piloté par le frontend :
+//   1. POST /api/canva/auth/url            → URL d'autorisation + PKCE
+//   2. (redirection Canva) → /canva/callback (frontend)
+//   3. POST /api/canva/auth/callback       → échange code + verifier
+//   4. POST /api/canva/designs             → crée un design vide
+//   5. POST /api/canva/export              → exporte en PNG (base64)
+
+const CANVA_CLIENT_ID = env("CANVA_CLIENT_ID");
+const CANVA_CLIENT_SECRET = env("CANVA_CLIENT_SECRET");
+const CANVA_REDIRECT_URI =
+  env("CANVA_REDIRECT_URI") || `${APP_URL}/canva/callback`;
+
+const CANVA_SCOPES =
+  env("CANVA_SCOPES") ||
+  "design:content:read design:content:write design:meta:read profile:read";
+
+const CANVA_API_BASE = "https://api.canva.com/rest/v1";
+const CANVA_AUTH_URL = "https://www.canva.com/api/oauth/authorize";
+
+const canvaEnabled = Boolean(CANVA_CLIENT_ID && CANVA_CLIENT_SECRET);
+
+if (!canvaEnabled) {
+  console.warn(
+    "⚠️  Canva non configuré (CANVA_CLIENT_ID / CANVA_CLIENT_SECRET manquant)."
+  );
+}
+
+if (canvaEnabled && CANVA_REDIRECT_URI.includes("#")) {
+  console.warn(
+    `⚠️  CANVA_REDIRECT_URI contient un "#" (${CANVA_REDIRECT_URI}) — c'est invalide.`
+  );
+}
+
+// ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
 
@@ -594,7 +645,8 @@ let OAUTH_STATE_SECRET =
   env("OAUTH_STATE_SECRET") ||
   TIKTOK_CLIENT_SECRET ||
   PINTEREST_APP_SECRET ||
-  YOUTUBE_CLIENT_SECRET;
+  YOUTUBE_CLIENT_SECRET ||
+  CANVA_CLIENT_SECRET;
 
 if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
   // Dev uniquement : secret éphémère (les states ne survivent pas au redémarrage).
@@ -618,7 +670,7 @@ const ENC_PREFIX = "enc:v1:";
 
 if (!TOKEN_ENCRYPTION_KEY) {
   console.warn(
-    "⚠️  TOKEN_ENCRYPTION_KEY manquant — les tokens TikTok / Pinterest / YouTube sont stockés en clair."
+    "⚠️  TOKEN_ENCRYPTION_KEY manquant — les tokens TikTok / Pinterest / YouTube / Canva sont stockés en clair."
   );
 }
 
@@ -735,6 +787,8 @@ if (env("DEBUG_ENV") === "1") {
   console.log("[env] PINTEREST_ENV     :", PINTEREST_ENVIRONMENT);
   console.log("[env] YOUTUBE_REDIRECT  :", JSON.stringify(YOUTUBE_REDIRECT_URI));
   console.log("[env] YOUTUBE_SCOPES    :", JSON.stringify(YOUTUBE_SCOPES));
+  console.log("[env] CANVA_REDIRECT    :", JSON.stringify(CANVA_REDIRECT_URI));
+  console.log("[env] CANVA_SCOPES      :", JSON.stringify(CANVA_SCOPES));
   console.log("[env] TOKEN ENCRYPTION  :", Boolean(TOKEN_ENCRYPTION_KEY));
 }
 
@@ -817,6 +871,7 @@ for (const [label, value] of [
   ["TIKTOK_REDIRECT_URI", TIKTOK_REDIRECT_URI],
   ["PINTEREST_REDIRECT_URI", PINTEREST_REDIRECT_URI],
   ["YOUTUBE_REDIRECT_URI", YOUTUBE_REDIRECT_URI],
+  ["CANVA_REDIRECT_URI", CANVA_REDIRECT_URI],
 ]) {
   if (value.includes("#")) {
     console.warn(
@@ -964,6 +1019,9 @@ const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "
 // large pour absorber les rafales/retries légitimes de TikTok, mais bornée.
 const limiterTiktokWebhook = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "tiktok-webhook" });
 
+// Canva : création de design + export, par utilisateur.
+const limiterCanva = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 40, label: "canva" });
+
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
 
@@ -983,7 +1041,7 @@ const STRICT_PATHS = new Set([
   "/api/auth/signup",
 ]);
 
-const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube)\/auth\//;
+const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva)\/auth\//;
 
 function pickLimiter(pathname) {
   if (STRICT_PATHS.has(pathname)) return limiterStrict;
@@ -2205,7 +2263,7 @@ function assertValidOAuthCallback(provider, body, userId) {
 }
 
 // ============================================================
-// TOKENS OAUTH — LECTURE / ÉCRITURE COMMUNES (TikTok, Pinterest, YouTube)
+// TOKENS OAUTH — LECTURE / ÉCRITURE COMMUNES (TikTok, Pinterest, YouTube, Canva)
 // ============================================================
 
 // Une erreur de base de données n'est JAMAIS traitée comme « compte absent ».
@@ -3661,6 +3719,188 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 }
 
 // ============================================================
+// CANVA — HELPERS (PKCE + APPELS API)
+// ============================================================
+//
+// PKCE : Canva l'exige. Le code_verifier reste côté serveur (en mémoire,
+// 10 min), indexé par le hash du state. Mono-instance (comme les rate
+// limiters) ; en multi-instance, stocke-le en base à la place.
+
+const canvaPkce = new Map();
+const CANVA_PKCE_TTL_MS = 10 * 60 * 1000;
+
+function createCanvaPkce(state) {
+  const now = Date.now();
+
+  for (const [key, entry] of canvaPkce) {
+    if (entry.expires <= now) canvaPkce.delete(key);
+  }
+
+  if (canvaPkce.size > 5_000) canvaPkce.delete(canvaPkce.keys().next().value);
+
+  const verifier = crypto.randomBytes(48).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+
+  canvaPkce.set(sha256(state), { verifier, expires: now + CANVA_PKCE_TTL_MS });
+
+  return challenge;
+}
+
+function takeCanvaVerifier(state) {
+  const key = sha256(state);
+  const entry = canvaPkce.get(key);
+
+  canvaPkce.delete(key);
+
+  return entry && entry.expires > Date.now() ? entry.verifier : null;
+}
+
+async function canvaApi(
+  pathname,
+  { method = "GET", token, basic = false, form, json } = {}
+) {
+  const headers = { Accept: "application/json" };
+  let body;
+
+  if (basic) {
+    headers.Authorization =
+      "Basic " +
+      Buffer.from(`${CANVA_CLIENT_ID}:${CANVA_CLIENT_SECRET}`).toString("base64");
+  } else if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  if (form) {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    body = new URLSearchParams(form).toString();
+  } else if (json) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(json);
+  }
+
+  let result;
+
+  try {
+    result = await fetchJson(`${CANVA_API_BASE}${pathname}`, { method, headers, body }, 20_000);
+  } catch (error) {
+    throw upstreamError("Canva", error);
+  }
+
+  const { response, data } = result;
+
+  if (!response.ok) {
+    // Jamais de 401 brut : le front le confondrait avec la session Stone.
+    const error = new HttpError(
+      upstreamStatus(response.status),
+      data.message ||
+        data.error_description ||
+        (typeof data.error === "string" ? data.error : "") ||
+        `Canva error (HTTP ${response.status})`,
+      data.code || (typeof data.error === "string" ? data.error : undefined)
+    );
+
+    error.upstreamStatus = response.status;
+    throw error;
+  }
+
+  return data;
+}
+
+function buildCanvaTokenRow(t) {
+  const accessTtl = Number(t.expires_in) || 4 * 60 * 60;
+
+  const row = {
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: iso(Date.now() + accessTtl * 1000),
+    updated_at: new Date().toISOString(),
+  };
+
+  // Canva fait tourner les refresh tokens : toujours stocker le nouveau.
+  if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
+  if (t.scope) row.scope = t.scope;
+
+  return row;
+}
+
+async function saveCanvaTokens(userId, t, extra = {}) {
+  const { error } = await supabaseAdmin
+    .from("canva_accounts")
+    .upsert(
+      { user_id: userId, ...buildCanvaTokenRow(t), ...extra },
+      { onConflict: "user_id" }
+    );
+
+  if (error) throw dbError("canva_accounts upsert", error);
+}
+
+const getCanvaAccount = (userId) => selectTokenRow("canva_accounts", userId);
+
+async function getValidCanvaToken(userId) {
+  const load = async () => {
+    const account = await getCanvaAccount(userId);
+
+    if (!account) {
+      throw new HttpError(400, "Canva account not connected", "CANVA_NOT_CONNECTED");
+    }
+
+    return account;
+  };
+
+  const first = await load();
+  if (isTokenFresh(first)) return first.access_token;
+
+  return withLock(`canva-refresh:${userId}`, async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const account = await load();
+
+      if (isTokenFresh(account)) return account.access_token;
+
+      if (!account.refresh_token) {
+        throw reconnectError("Canva", "CANVA_REFRESH_EXPIRED");
+      }
+
+      let refreshed;
+
+      try {
+        refreshed = await canvaApi("/oauth/token", {
+          method: "POST",
+          basic: true,
+          form: {
+            grant_type: "refresh_token",
+            refresh_token: account.refresh_token,
+          },
+        });
+      } catch (error) {
+        if (
+          error instanceof HttpError &&
+          (error.upstreamStatus === 400 ||
+            error.upstreamStatus === 401 ||
+            error.code === "invalid_grant")
+        ) {
+          throw reconnectError("Canva", "CANVA_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(502, "Canva returned an invalid token response", "CANVA_BAD_TOKEN_RESPONSE");
+      }
+
+      const applied = await updateTokensIfUnchanged(
+        "canva_accounts",
+        userId,
+        account,
+        buildCanvaTokenRow(refreshed)
+      );
+
+      if (applied) return refreshed.access_token;
+    }
+
+    throw new HttpError(409, "Canva account changed during token refresh, please retry", "CANVA_REFRESH_CONFLICT");
+  });
+}
+
+// ============================================================
 // ROUTEUR
 // ============================================================
 
@@ -3687,6 +3927,7 @@ route("GET", "/api/health", ({ res }) => {
       : { enabled: false },
     pinterest: pinterestUsable,
     youtube: youtubeEnabled,
+    canva: canvaEnabled,
   });
 });
 
@@ -5499,6 +5740,270 @@ route(
 );
 
 // ============================================================
+// ROUTES — CANVA
+// ============================================================
+
+route(
+  "POST",
+  "/api/canva/auth/url",
+  ({ res, user }) => {
+    const state = createOAuthState("canva", user.id);
+
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: CANVA_CLIENT_ID,
+      redirect_uri: CANVA_REDIRECT_URI,
+      scope: CANVA_SCOPES,
+      code_challenge: createCanvaPkce(state),
+      code_challenge_method: "S256",
+      state,
+    });
+
+    sendJson(res, 200, {
+      success: true,
+      url: `${CANVA_AUTH_URL}?${params.toString()}`,
+    });
+  },
+  { auth: true }
+);
+
+route(
+  "POST",
+  "/api/canva/auth/callback",
+  async ({ req, res, user }) => {
+    const body = await getJsonBody(req);
+    const authCode = assertValidOAuthCallback("canva", body, user.id);
+    const state = String(body.state);
+
+    await dedupeCallback(`canva:${user.id}:${sha256(authCode)}`, async () => {
+      const verifier = takeCanvaVerifier(state);
+
+      if (!verifier) {
+        throw new HttpError(400, "Invalid or expired state", "OAUTH_STATE_INVALID");
+      }
+
+      const tokens = await canvaApi("/oauth/token", {
+        method: "POST",
+        basic: true,
+        form: {
+          grant_type: "authorization_code",
+          code: authCode,
+          code_verifier: verifier,
+          redirect_uri: CANVA_REDIRECT_URI,
+        },
+      });
+
+      if (!tokens?.access_token) {
+        throw new HttpError(502, "Canva returned an invalid token response", "CANVA_BAD_TOKEN_RESPONSE");
+      }
+
+      let displayName = null;
+
+      try {
+        const profile = await canvaApi("/users/me/profile", { token: tokens.access_token });
+        displayName = profile.profile?.display_name || null;
+      } catch (profileError) {
+        console.warn("Canva profile error:", profileError.message);
+      }
+
+      await saveCanvaTokens(user.id, tokens, { display_name: displayName });
+
+      return { display_name: displayName };
+    });
+
+    sendJson(res, 200, { success: true, connected: true });
+  },
+  { auth: true }
+);
+
+route(
+  "GET",
+  "/api/canva/status",
+  async ({ res, user }) => {
+    const account = await getCanvaAccount(user.id);
+
+    sendJson(res, 200, {
+      success: true,
+      connected: Boolean(account),
+      account: account ? { display_name: account.display_name } : null,
+    });
+  },
+  { auth: true }
+);
+
+route(
+  "DELETE",
+  "/api/canva/disconnect",
+  async ({ res, user }) => {
+    const account = await getCanvaAccount(user.id);
+
+    if (account) {
+      const tokenToRevoke = account.refresh_token || account.access_token;
+
+      if (tokenToRevoke) {
+        try {
+          await canvaApi("/oauth/revoke", {
+            method: "POST",
+            basic: true,
+            form: { token: tokenToRevoke },
+          });
+        } catch (revokeError) {
+          console.warn("Canva revoke error:", revokeError.message);
+        }
+      }
+
+      const { error } = await supabaseAdmin
+        .from("canva_accounts")
+        .delete()
+        .eq("user_id", user.id);
+
+      if (error) throw error;
+    }
+
+    sendJson(res, 200, { success: true });
+  },
+  { auth: true }
+);
+
+// Crée un design vide aux dimensions choisies (40 à 8000 px) et renvoie l'URL
+// de l'éditeur Canva.
+route(
+  "POST",
+  "/api/canva/designs",
+  async ({ req, res, user }) => {
+    enforce(limiterCanva, `canva:${user.id}`);
+
+    const body = await getJsonBody(req);
+    const width = Number(body.width);
+    const height = Number(body.height);
+
+    const valid = (n) => Number.isInteger(n) && n >= 40 && n <= 8000;
+
+    if (!valid(width) || !valid(height)) {
+      throw new HttpError(400, "Invalid design size (40 to 8000 px).");
+    }
+
+    const title = String(body.title || "Stone post").slice(0, 255);
+    const token = await getValidCanvaToken(user.id);
+
+    const data = await canvaApi("/designs", {
+      method: "POST",
+      token,
+      json: { design_type: { type: "custom", width, height }, title },
+    });
+
+    const design = data.design;
+
+    if (!design?.id || !design.urls?.edit_url) {
+      throw new HttpError(502, "Canva did not return a design", "CANVA_NO_DESIGN");
+    }
+
+    sendJson(res, 200, {
+      success: true,
+      design_id: design.id,
+      edit_url: design.urls.edit_url,
+    });
+  },
+  { auth: true }
+);
+
+// Exporte le design en PNG et renvoie les pages en base64.
+const CANVA_EXPORT_MAX_PAGES = 10;
+const CANVA_EXPORT_MAX_TOTAL = 30 * 1024 * 1024;
+
+route(
+  "POST",
+  "/api/canva/export",
+  async ({ req, res, user }) => {
+    enforce(limiterCanva, `canva:${user.id}`);
+
+    const body = await getJsonBody(req);
+    const designId = String(body.design_id || "");
+
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(designId)) {
+      throw new HttpError(400, "Invalid design_id");
+    }
+
+    const token = await getValidCanvaToken(user.id);
+
+    const created = await canvaApi("/exports", {
+      method: "POST",
+      token,
+      json: { design_id: designId, format: { type: "png" } },
+    });
+
+    const jobId = created.job?.id;
+
+    if (!jobId) throw new HttpError(502, "Canva did not start the export", "CANVA_NO_EXPORT_JOB");
+
+    let urls = null;
+
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await delay(1000);
+
+      const poll = await canvaApi(`/exports/${encodeURIComponent(jobId)}`, { token });
+      const job = poll.job;
+
+      if (job?.status === "success") {
+        urls = Array.isArray(job.urls) ? job.urls : [];
+        break;
+      }
+
+      if (job?.status === "failed") {
+        throw new HttpError(
+          502,
+          job.error?.message || "Canva could not export this design.",
+          "CANVA_EXPORT_FAILED"
+        );
+      }
+    }
+
+    if (!urls) {
+      throw new HttpError(504, "Canva export timed out, please retry", "CANVA_EXPORT_TIMEOUT");
+    }
+
+    const pages = [];
+    let total = 0;
+
+    for (const fileUrl of urls.slice(0, CANVA_EXPORT_MAX_PAGES)) {
+      if (typeof fileUrl !== "string" || !fileUrl.startsWith("https://")) continue;
+
+      let download;
+
+      try {
+        download = await fetch(fileUrl);
+      } catch (error) {
+        throw upstreamError("Canva", error);
+      }
+
+      if (!download.ok) {
+        throw new HttpError(502, "Could not download the exported design", "CANVA_DOWNLOAD_FAILED");
+      }
+
+      const buffer = Buffer.from(await download.arrayBuffer());
+      const mime = sniffImageType(buffer);
+
+      if (mime !== "image/png" && mime !== "image/jpeg") continue;
+
+      total += buffer.length;
+
+      if (total > CANVA_EXPORT_MAX_TOTAL) {
+        throw tooLargeError("The exported design is too large.");
+      }
+
+      pages.push({ mime, data: buffer.toString("base64") });
+    }
+
+    if (pages.length === 0) {
+      throw new HttpError(502, "Canva returned no image", "CANVA_EMPTY_EXPORT");
+    }
+
+    sendJson(res, 200, { success: true, pages });
+  },
+  { auth: true }
+);
+
+// ============================================================
 // SERVER
 // ============================================================
 
@@ -5506,6 +6011,7 @@ const providerGuards = [
   ["/api/tiktok/", tiktokEnabled, "TikTok"],
   ["/api/pinterest/", pinterestEnabled, "Pinterest"],
   ["/api/youtube/", youtubeEnabled, "YouTube"],
+  ["/api/canva/", canvaEnabled, "Canva"],
 ];
 
 const server = createServer(async (req, res) => {
@@ -5716,6 +6222,13 @@ server.listen(PORT, () => {
         : "désactivée (YouTube non configuré)"
     }`
   );
+  console.log(
+    `  Canva           : ${
+      canvaEnabled
+        ? `activé (redirect ${CANVA_REDIRECT_URI})`
+        : "désactivé (Canva non configuré)"
+    }`
+  );
 
   if (tiktokEnabled) {
     console.log(
@@ -5754,6 +6267,25 @@ server.listen(PORT, () => {
       })
       .catch((error) =>
         console.warn("Pinterest api_env check failed:", error?.message || error)
+      );
+  }
+
+  // Canva : vérifie que la table existe (sinon message explicite).
+  if (canvaEnabled) {
+    supabaseAdmin
+      .from("canva_accounts")
+      .select("user_id")
+      .limit(1)
+      .then(({ error }) => {
+        if (error) {
+          console.error(
+            "❌ canva_accounts inaccessible — crée la table (voir bloc SQL du README Canva) :",
+            error.message
+          );
+        }
+      })
+      .catch((error) =>
+        console.warn("Canva accounts check failed:", error?.message || error)
       );
   }
 });
