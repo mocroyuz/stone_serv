@@ -2489,6 +2489,30 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
 // TIKTOK — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
 
+// [FIX] Throttles de rafraîchissement du PROFIL (avatar).
+// Déclarés AVANT buildTikTokTokenRow / saveTikTokTokens pour être
+// utilisables par clearTikTokProfileThrottle().
+//
+//   TIKTOK_PROFILE_REFRESH_MS       : throttle normal (sans ?refresh=1)
+//   TIKTOK_PROFILE_MIN_INTERVAL_MS  : anti-martèlement après un succès
+//   TIKTOK_PROFILE_TRANSIENT_RETRY_MS : nouvel essai rapide après une
+//                                       panne réseau / 5xx
+//   TIKTOK_PROFILE_DEAD_RETRY_MS    : espacement quand le refresh token
+//                                       est mort (l'utilisateur doit
+//                                       reconnecter, inutile de marteler)
+const TIKTOK_PROFILE_REFRESH_MS = 30 * 60 * 1000;
+const TIKTOK_PROFILE_MIN_INTERVAL_MS = 10 * 1000;
+const TIKTOK_PROFILE_TRANSIENT_RETRY_MS = 30 * 1000;
+const TIKTOK_PROFILE_DEAD_RETRY_MS = 5 * 60 * 1000;
+
+const tiktokProfileRefreshedAt = new Map();
+const tiktokProfileRetryAt = new Map();
+
+function clearTikTokProfileThrottle(userId) {
+  tiktokProfileRefreshedAt.delete(userId);
+  tiktokProfileRetryAt.delete(userId);
+}
+
 // Champs à écrire pour un jeu de jetons TikTok. Un champ absent de la
 // réponse du provider n'est PAS écrasé (ex. refresh_token non renvoyé).
 function buildTikTokTokenRow(t) {
@@ -2526,6 +2550,11 @@ async function saveTikTokTokens(userId, t, extra = {}) {
   );
 
   if (error) throw new Error(error.message);
+
+  // [FIX] Réinitialise le throttle : le prochain GET /api/tiktok/status
+  // récupère immédiatement l'avatar (utile si le callback OAuth n'a pas
+  // pu obtenir le profil : l'avatar apparaît sans attendre 30 min).
+  clearTikTokProfileThrottle(userId);
 }
 
 async function getTikTokAccount(userId) {
@@ -2603,66 +2632,131 @@ async function getValidTikTokToken(userId) {
 // TIKTOK — RAFRAÎCHISSEMENT DU PROFIL (avatar)
 // ============================================================
 //
-// Les URLs d'avatar renvoyées par TikTok sont signées et expirent au
-// bout de quelques heures. On re-télécharge donc le profil
-// périodiquement (throttle en mémoire : 30 min par utilisateur).
+// Renvoie toujours { account, needsReconnect } :
+//
+//   account        : la ligne tiktok_accounts (avec la nouvelle URL si le
+//                    refresh a réussi, l'ancienne sinon)
+//   needsReconnect : true  → refresh token mort/absent ; le frontend doit
+//                    effacer son cache et inviter l'utilisateur à
+//                    reconnecter
+//                    false → tout va bien (succès, throttle, absence
+//                    d'avatar, ou panne transitoire : on retentera)
+//
+// Le throttle normal n'est armé QU'EN CAS DE SUCCÈS (ou d'absence
+// d'avatar). Les erreurs transitoires arment un retry court (30 s) ;
+// les jetons morts arment un retry long (5 min) et signalent
+// needsReconnect.
 
-const TIKTOK_PROFILE_REFRESH_MS = 30 * 60 * 1000;
-const tiktokProfileRefreshedAt = new Map();
+async function refreshTikTokProfile(userId, { force = false } = {}) {
+  // Déduplication : les appels concurrents (même mode) partagent le même
+  // vol. force et non-force ont des clés distinctes pour ne pas bloquer
+  // un rafraîchissement forcé derrière un rafraîchissement throttlé.
+  const lockKey = `tiktok-profile:${userId}:${force ? "force" : "normal"}`;
 
-async function refreshTikTokProfile(userId, account, { force = false } = {}) {
-  const last = tiktokProfileRefreshedAt.get(userId) || 0;
+  return withLock(lockKey, async () => {
+    const account = await getTikTokAccount(userId);
+    if (!account) return { account: null, needsReconnect: false };
 
-  if (!force && Date.now() - last < TIKTOK_PROFILE_REFRESH_MS) {
-    return account;
-  }
+    const now = Date.now();
+    const retryAt = tiktokProfileRetryAt.get(userId) || 0;
 
-  // Marqué avant l'appel : en cas d'échec on ne martèle pas TikTok.
-  tiktokProfileRefreshedAt.set(userId, Date.now());
-
-  // Borne mémoire du throttle.
-  if (tiktokProfileRefreshedAt.size > 10_000) {
-    tiktokProfileRefreshedAt.delete(tiktokProfileRefreshedAt.keys().next().value);
-  }
-
-  try {
-    const accessToken = await getValidTikTokToken(userId);
-
-    const info = await tiktokApi(
-      "/v2/user/info/?fields=open_id,avatar_url,display_name",
-      { method: "GET", token: accessToken }
-    );
-
-    const profile = info.data?.user;
-
-    if (!profile?.avatar_url) return account;
-
-    const displayName = profile.display_name || account.display_name;
-
-    // On ne touche PAS à updated_at : il sert au webhook
-    // authorization.removed pour ne pas supprimer une connexion
-    // rétablie après la révocation (et au compare-and-swap du refresh).
-    const { error } = await supabaseAdmin
-      .from("tiktok_accounts")
-      .update({
-        avatar_url: profile.avatar_url,
-        display_name: displayName,
-      })
-      .eq("user_id", userId);
-
-    if (error) {
-      console.warn("TikTok profile save failed:", error.message);
+    // Anti-martèlement (respecté même par force).
+    if (now < retryAt) {
+      return { account, needsReconnect: false };
     }
 
-    return {
-      ...account,
-      avatar_url: profile.avatar_url,
-      display_name: displayName,
-    };
-  } catch (error) {
-    console.warn("TikTok profile refresh failed:", error.message);
-    return account;
-  }
+    const last = tiktokProfileRefreshedAt.get(userId) || 0;
+    if (!force && now - last < TIKTOK_PROFILE_REFRESH_MS) {
+      return { account, needsReconnect: false };
+    }
+
+    // Borne mémoire des deux Maps.
+    if (tiktokProfileRefreshedAt.size > 10_000) {
+      tiktokProfileRefreshedAt.delete(
+        tiktokProfileRefreshedAt.keys().next().value
+      );
+    }
+    if (tiktokProfileRetryAt.size > 10_000) {
+      tiktokProfileRetryAt.delete(
+        tiktokProfileRetryAt.keys().next().value
+      );
+    }
+
+    try {
+      const accessToken = await getValidTikTokToken(userId);
+
+      const info = await tiktokApi(
+        "/v2/user/info/?fields=open_id,avatar_url,display_name",
+        { method: "GET", token: accessToken }
+      );
+
+      const profile = info.data?.user;
+
+      // Pas d'avatar (ou URL non https) : on conserve l'ancien, mais on
+      // considère le profil comme frais pour ne pas marteler TikTok.
+      if (!profile?.avatar_url || !/^https:\/\//i.test(profile.avatar_url)) {
+        tiktokProfileRefreshedAt.set(userId, now);
+        tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_MIN_INTERVAL_MS);
+        return { account, needsReconnect: false };
+      }
+
+      const displayName = profile.display_name || account.display_name;
+
+      // On ne touche PAS à updated_at : il sert au webhook
+      // authorization.removed pour ne pas supprimer une connexion
+      // rétablie après la révocation (et au compare-and-swap du refresh).
+      const { error } = await supabaseAdmin
+        .from("tiktok_accounts")
+        .update({
+          avatar_url: profile.avatar_url,
+          display_name: displayName,
+        })
+        .eq("user_id", userId);
+
+      if (error) {
+        console.warn("TikTok profile save failed:", error.message);
+        tiktokProfileRetryAt.set(
+          userId,
+          now + TIKTOK_PROFILE_TRANSIENT_RETRY_MS
+        );
+        return { account, needsReconnect: false };
+      }
+
+      // Succès : throttle normal + anti-martèlement court.
+      tiktokProfileRefreshedAt.set(userId, now);
+      tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_MIN_INTERVAL_MS);
+
+      return {
+        account: {
+          ...account,
+          avatar_url: profile.avatar_url,
+          display_name: displayName,
+        },
+        needsReconnect: false,
+      };
+    } catch (error) {
+      // Jeton mort → reconnexion indispensable. On le signale EXPLICITEMENT
+      // au lieu de renvoyer silencieusement une URL expirée.
+      if (
+        error instanceof HttpError &&
+        (error.code === "TIKTOK_REFRESH_EXPIRED" ||
+          error.code === "TIKTOK_NOT_CONNECTED")
+      ) {
+        tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_DEAD_RETRY_MS);
+        return { account, needsReconnect: true };
+      }
+
+      // Panne transitoire (réseau, 5xx, timeout) : on garde l'ancien
+      // avatar et on retente dans 30 s. Le cache de l'utilisateur n'est
+      // PAS vidé.
+      console.warn("TikTok profile refresh failed:", error.message);
+      tiktokProfileRetryAt.set(
+        userId,
+        now + TIKTOK_PROFILE_TRANSIENT_RETRY_MS
+      );
+      return { account, needsReconnect: false };
+    }
+  });
 }
 
 // ============================================================
@@ -4940,23 +5034,32 @@ route(
   { auth: true }
 );
 
+// [FIX] Route réécrite : `connected` reflète une connexion UTILISABLE
+// (jeton mort → false + needs_reconnect). Les panes transitoires ne
+// cassent plus le cache frontend.
 route(
   "GET",
   "/api/tiktok/status",
   async ({ res, url, user }) => {
-    let account = await getTikTokAccount(user.id);
-
-    // ?refresh=1 : le front a détecté une image cassée → on ignore le throttle.
+    // ?refresh=1 : le frontend a détecté une image cassée → on ignore
+    // le throttle normal (mais on respecte l'anti-martèlement court).
     const force = url.searchParams.get("refresh") === "1";
 
-    if (account) {
-      account = await refreshTikTokProfile(user.id, account, { force });
-    }
+    const { account, needsReconnect } = await refreshTikTokProfile(user.id, {
+      force,
+    });
+
+    const usable = Boolean(account) && !needsReconnect;
 
     sendJson(res, 200, {
       success: true,
-      connected: Boolean(account),
-      account: account
+      // « connected » = connexion UTILISABLE. Un jeton mort → false :
+      // le frontend existant efface son cache et propose la reconnexion.
+      connected: usable,
+      // Signal explicite pour les frontends qui veulent distinguer
+      // « jamais connecté » de « session expirée ».
+      needs_reconnect: needsReconnect || undefined,
+      account: usable
         ? {
             display_name: account.display_name,
             avatar_url: account.avatar_url,
@@ -4997,6 +5100,9 @@ route(
         .eq("user_id", user.id);
 
       if (error) throw error;
+
+      // [FIX] Nettoie les throttles côté mémoire pour cet utilisateur.
+      clearTikTokProfileThrottle(user.id);
     }
 
     sendJson(res, 200, { success: true });
@@ -5466,6 +5572,13 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
 
   if (error) {
     throw new Error("tiktok_accounts cleanup failed: " + error.message);
+  }
+
+  // [FIX] Nettoie les throttles mémoire pour les utilisateurs concernés.
+  if (Array.isArray(data)) {
+    for (const row of data) {
+      if (row?.user_id) clearTikTokProfileThrottle(row.user_id);
+    }
   }
 
   console.log(
