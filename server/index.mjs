@@ -56,6 +56,13 @@
 //                  Dans le portail Canva (canva.dev → Your integrations) :
 //                    - Authorized redirects : la même URL que CANVA_REDIRECT_URI
 //                    - Scopes : les mêmes que CANVA_SCOPES
+//   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+//                  STRIPE_PRICE_STARTER_MONTHLY, STRIPE_PRICE_STARTER_ANNUAL,
+//                  STRIPE_PRICE_PRO_MONTHLY, STRIPE_PRICE_PRO_ANNUAL,
+//                  STRIPE_PRICE_ENTERPRISE_MONTHLY, STRIPE_PRICE_ENTERPRISE_ANNUAL
+//                  Le serveur vérifie au démarrage que tous les price IDs
+//                  sont définis (sinon le checkout échouera silencieusement
+//                  pour ces plans).
 //   Optionnel    : ALLOWED_ORIGINS, TRUST_PROXY, TRUST_PROXY_HOPS,
 //                  MAX_VIDEO_UPLOADS, TIKTOK_VERIFICATION_FILE,
 //                  TIKTOK_SKIP_PHOTO_PROBE=1, STRIPE_*, TIKTOK_*,
@@ -331,6 +338,24 @@ const STRIPE_PRICES = {
     annual: env("STRIPE_PRICE_ENTERPRISE_ANNUAL"),
   },
 };
+
+// ============================================================
+// URLs DE RETOUR STRIPE
+// ------------------------------------------------------------
+// Le frontend utilise un routage par hash (#/account, #/pricing).
+// Les URLs de retour DOIVENT donc inclure le "#", sinon le hash
+// router ne trouve pas la route et retombe sur "/" (landing),
+// ce qui donne l'impression que le paiement n'a pas fonctionné.
+//
+// Les query params sont placés APRÈS le hash :
+//   https://stone.app/#/account?checkout=success&session_id=cs_...
+// Le frontend les lit dans window.location.hash via
+// readCheckoutReturn() (services/stripe.ts).
+// ============================================================
+
+const STRIPE_SUCCESS_URL = `${APP_URL}/#/account?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+const STRIPE_CANCEL_URL = `${APP_URL}/#/pricing?checkout=cancel`;
+const STRIPE_PORTAL_RETURN_URL = `${APP_URL}/#/account`;
 
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, {
@@ -815,6 +840,9 @@ if (env("DEBUG_ENV") === "1") {
   console.log("[env] CANVA_REDIRECT    :", JSON.stringify(CANVA_REDIRECT_URI));
   console.log("[env] CANVA_SCOPES      :", JSON.stringify(CANVA_SCOPES));
   console.log("[env] TOKEN ENCRYPTION  :", Boolean(TOKEN_ENCRYPTION_KEY));
+  console.log("[env] STRIPE success    :", JSON.stringify(STRIPE_SUCCESS_URL));
+  console.log("[env] STRIPE cancel     :", JSON.stringify(STRIPE_CANCEL_URL));
+  console.log("[env] STRIPE portal     :", JSON.stringify(STRIPE_PORTAL_RETURN_URL));
 }
 
 // ============================================================
@@ -878,6 +906,38 @@ if (!STRIPE_WEBHOOK_SECRET) {
   console.warn(
     "⚠️  STRIPE_WEBHOOK_SECRET manquant — les webhooks seront refusés."
   );
+}
+
+// ------------------------------------------------------------
+// Valide que CHAQUE plan × période a un price ID Stripe.
+// Sans ce contrôle, le serveur démarre sans rien dire et
+// /api/stripe/checkout renvoie 400 « Unknown plan » pour la
+// moitié des plans — message trompeur et difficile à relier à
+// une variable d'env manquante.
+// ------------------------------------------------------------
+if (STRIPE_SECRET_KEY) {
+  const missingPrices = [];
+
+  for (const [plan, periods] of Object.entries(STRIPE_PRICES)) {
+    for (const [period, priceId] of Object.entries(periods)) {
+      if (!priceId) {
+        missingPrices.push(
+          `STRIPE_PRICE_${plan.toUpperCase()}_${period.toUpperCase()}`
+        );
+      }
+    }
+  }
+
+  if (missingPrices.length > 0) {
+    console.error("");
+    console.error("❌ Price IDs Stripe manquants :");
+    for (const name of missingPrices) console.error(` - ${name}`);
+    console.error("");
+    console.error("Récupère-les dans Stripe Dashboard → Products →");
+    console.error("(ton produit) → Pricing, puis ajoute-les aux variables");
+    console.error("d'environnement. Le checkout échouera pour ces plans.");
+    console.error("");
+  }
 }
 
 if (!tiktokEnabled) {
@@ -2233,6 +2293,28 @@ async function processStripeEvent(event) {
               ? { status: "past_due" }
               : {},
         });
+        break;
+      }
+
+      // Récupération après un échec de paiement : Stripe retente parfois
+      // sans changer le statut de la subscription (ex. carte inchangée,
+      // facture `open` payée manuellement depuis le dashboard). On relit
+      // l'état RÉEL de la subscription (pas la facture) puis on synchronise.
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        const subscriptionId = idOf(invoice.subscription);
+
+        if (!subscriptionId) break; // facture hors abonnement
+
+        const userId = await resolveUserIdFromCustomer(invoice.customer);
+        if (!userId) break;
+
+        // retrieveSubscription relit l'état réel : si l'abonnement a été
+        // annulé entre-temps, syncSubscriptionToUser écrira "canceled" et
+        // pas "active" — Stripe reste la source de vérité.
+        const subscription = await retrieveSubscription(subscriptionId);
+
+        await syncSubscriptionToUser(userId, subscription, { eventCreated });
         break;
       }
 
@@ -4752,6 +4834,14 @@ route(
 // ============================================================
 // ROUTES — STRIPE
 // ============================================================
+//
+// Retour Stripe :
+//   - checkout success → ${APP_URL}/#/account?checkout=success&session_id=...
+//   - checkout cancel  → ${APP_URL}/#/pricing?checkout=cancel
+//   - portal return    → ${APP_URL}/#/account
+// Les query params sont dans le HASH : le frontend les lit via
+// readCheckoutReturn() (services/stripe.ts) et nettoie l'URL avec
+// clearCheckoutParams() pour éviter de rejouer la redirection au refresh.
 
 route(
   "POST",
@@ -4768,9 +4858,14 @@ route(
       : undefined;
 
     if (!priceId) {
+      // Message détaillé : impossible de savoir si c'est le plan, la
+      // période ou la variable d'env qui manque — on l'indique.
+      const knownPlan = Object.hasOwn(STRIPE_PRICES, plan);
       throw new HttpError(
         400,
-        `Unknown plan or period (plan="${plan.slice(0, 30)}", period="${period}")`
+        knownPlan
+          ? `Plan "${plan}" (${period}) is not configured — missing STRIPE_PRICE_${plan.toUpperCase()}_${period.toUpperCase()}`
+          : `Unknown plan or period (plan="${plan.slice(0, 30)}", period="${period}")`
       );
     }
 
@@ -4782,8 +4877,8 @@ route(
       line_items: [{ price: priceId, quantity: 1 }],
       allow_promotion_codes: true,
       client_reference_id: user.id,
-      success_url: `${APP_URL}/account?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${APP_URL}/pricing?checkout=cancel`,
+      success_url: STRIPE_SUCCESS_URL,
+      cancel_url: STRIPE_CANCEL_URL,
       subscription_data: {
         metadata: { supabase_user_id: user.id, plan, period },
       },
@@ -4811,7 +4906,7 @@ route(
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${APP_URL}/account`,
+      return_url: STRIPE_PORTAL_RETURN_URL,
     });
 
     sendJson(res, 200, { success: true, url: session.url });
@@ -5035,7 +5130,7 @@ route(
 );
 
 // [FIX] Route réécrite : `connected` reflète une connexion UTILISABLE
-// (jeton mort → false + needs_reconnect). Les panes transitoires ne
+// (jeton mort → false + needs_reconnect). Les pannes transitoires ne
 // cassent plus le cache frontend.
 route(
   "GET",
@@ -6600,6 +6695,10 @@ server.listen(PORT, () => {
         : "désactivé (Canva non configuré)"
     }`
   );
+  console.log(
+    `  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`
+  );
+  console.log(`  Stripe portal   : return ${STRIPE_PORTAL_RETURN_URL}`);
 
   if (tiktokEnabled) {
     console.log(
