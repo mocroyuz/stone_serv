@@ -340,6 +340,43 @@ const STRIPE_PRICES = {
 };
 
 // ============================================================
+// [MODIF 2a] PLANS — correspondance price ID Stripe ↔ plan
+// ============================================================
+//
+// Le frontend (sidebar, pricing) affiche le plan à partir de ces champs :
+// plan, plan_key, plan_name. Source : le price ID de l'abonnement, avec
+// repli sur la metadata `plan` posée au checkout.
+
+const PLAN_NAMES = {
+  starter: "Starter",
+  pro: "Professional",
+  enterprise: "Enterprise",
+};
+
+const PRICE_TO_PLAN = new Map();
+
+for (const [planKey, periods] of Object.entries(STRIPE_PRICES)) {
+  for (const priceId of Object.values(periods)) {
+    if (priceId) PRICE_TO_PLAN.set(priceId, planKey);
+  }
+}
+
+function planDetails(priceId, metadataPlan) {
+  let key = priceId ? PRICE_TO_PLAN.get(priceId) : undefined;
+
+  if (!key) {
+    const fromMetadata = String(metadataPlan || "").toLowerCase();
+    if (Object.hasOwn(PLAN_NAMES, fromMetadata)) key = fromMetadata;
+  }
+
+  return {
+    plan: key || null,
+    plan_key: key || null,
+    plan_name: key ? PLAN_NAMES[key] : null,
+  };
+}
+
+// ============================================================
 // URLs DE RETOUR STRIPE
 // ------------------------------------------------------------
 // Le frontend utilise un routage par hash (#/account, #/pricing).
@@ -2147,6 +2184,9 @@ async function resolveUserIdFromCustomer(customerId) {
   }
 }
 
+// ============================================================
+// [MODIF 2b] subscriptionSnapshot — avec plan_key / plan_name
+// ============================================================
 function subscriptionSnapshot(subscription) {
   const price = subscription.items?.data?.[0]?.price;
 
@@ -2155,6 +2195,7 @@ function subscriptionSnapshot(subscription) {
     status: subscription.status,
     price_id: price?.id || null,
     product_id: price?.product || null,
+    ...planDetails(price?.id, subscription.metadata?.plan),
     current_period_end: subscription.current_period_end,
     cancel_at_period_end: subscription.cancel_at_period_end,
     customer_id:
@@ -4914,6 +4955,10 @@ route(
   { auth: true }
 );
 
+// ============================================================
+// [MODIF 2c] GET /api/stripe/subscription — plan_key + plan_name
+// ============================================================
+//
 // Interroge Stripe en direct puis resynchronise le compte si besoin :
 // l'abonnement apparaît immédiatement après le checkout, même si le
 // webhook est en retard. Un échec de resynchronisation est journalisé
@@ -4948,6 +4993,7 @@ route(
         stored.id !== fresh.id ||
         stored.status !== fresh.status ||
         stored.price_id !== fresh.price_id ||
+        stored.plan_key !== fresh.plan_key ||
         stored.current_period_end !== fresh.current_period_end ||
         stored.cancel_at_period_end !== fresh.cancel_at_period_end;
 
@@ -4960,13 +5006,16 @@ route(
       }
     }
 
+    const priceId = sub?.items?.data?.[0]?.price?.id || null;
+
     sendJson(res, 200, {
       success: true,
       subscription: sub
         ? {
             id: sub.id,
             status: sub.status,
-            price_id: sub.items.data[0]?.price?.id || null,
+            price_id: priceId,
+            ...planDetails(priceId, sub.metadata?.plan),
             current_period_end: sub.current_period_end,
             cancel_at_period_end: sub.cancel_at_period_end,
           }
