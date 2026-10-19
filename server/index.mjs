@@ -10,6 +10,15 @@
 //                  chiffre les tokens TikTok / Pinterest / YouTube / Canva en
 //                  base (AES-256-GCM). Les anciens tokens en clair restent
 //                  lisibles.
+//   Mot de passe oublié :
+//                  PASSWORD_RESET_REDIRECT_URL (optionnel, défaut :
+//                  ${APP_URL}/#/reset-password). C'est la page du FRONTEND
+//                  vers laquelle le lien de l'email renvoie l'utilisateur.
+//                  Cette URL doit être ajoutée dans Supabase → Authentication
+//                  → URL Configuration → Redirect URLs, sinon Supabase
+//                  redirige vers le « Site URL » à la place.
+//                  Le template d'email « Reset Password » de Supabase est
+//                  configuré dans Authentication → Email Templates.
 //   Photos TikTok: URL publique de CE serveur (domaine de l'API, PAS le
 //                  frontend), lue dans l'ordre :
 //                  PUBLIC_API_URL → VITE_API_BASE_URL → RAILWAY_PUBLIC_DOMAIN
@@ -292,6 +301,21 @@ const STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY");
 const STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET");
 
 const APP_URL = (env("APP_URL") || "http://localhost:5173").replace(/\/+$/, "");
+
+// ============================================================
+// CONFIGURATION MOT DE PASSE OUBLIÉ
+// ============================================================
+//
+// Le frontend utilise un routage par hash (#/...). Supabase ajoute les
+// jetons de récupération après cette URL (dans le hash) : la page
+// #/reset-password du frontend doit les lire puis appeler
+// POST /api/auth/reset-password.
+
+const PASSWORD_RESET_REDIRECT_URL =
+  env("PASSWORD_RESET_REDIRECT_URL") || `${APP_URL}/#/reset-password`;
+
+// Âge maximal (en secondes) d'un jeton de récupération accepté.
+const RECOVERY_TOKEN_MAX_AGE_SEC = 60 * 60;
 
 const STRIPE_PRICES = {
   starter: {
@@ -777,6 +801,7 @@ if (env("DEBUG_ENV") === "1") {
   console.log("[env] ANON key length   :", SUPABASE_ANON_KEY.length);
   console.log("[env] SERVICE key length:", SUPABASE_SERVICE_ROLE_KEY.length);
   console.log("[env] APP_URL           :", JSON.stringify(APP_URL));
+  console.log("[env] PASSWORD_RESET    :", JSON.stringify(PASSWORD_RESET_REDIRECT_URL));
   console.log("[env] PUBLIC_API_URL    :", JSON.stringify(PUBLIC_API_URL), `(${PUBLIC_API_URL_SOURCE || "aucune source"})`);
   console.log("[env] TIKTOK_REDIRECT   :", JSON.stringify(TIKTOK_REDIRECT_URI));
   console.log("[env] TIKTOK_AUDITED    :", TIKTOK_AUDITED);
@@ -837,6 +862,12 @@ if (IS_PRODUCTION) {
       "⚠️  OAUTH_REDIRECT_URL manquant — fallback http://localhost:5173/ (dev uniquement)."
     );
   }
+}
+
+if (IS_PRODUCTION && PASSWORD_RESET_REDIRECT_URL.startsWith("http://localhost")) {
+  console.warn(
+    "⚠️  PASSWORD_RESET_REDIRECT_URL pointe vers localhost en production — les liens de réinitialisation seront inutilisables."
+  );
 }
 
 if (!STRIPE_SECRET_KEY) {
@@ -1012,6 +1043,10 @@ const limiterApi = createRateLimiter({ windowMs: 60 * 1000, max: 240, label: "ap
 const limiterAccount = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "account" });
 const limiterPublish = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, label: "publish" });
 
+// Mot de passe oublié : par adresse email (3 demandes / 15 min), pour ne pas
+// transformer le serveur en machine à spammer la boîte d'un utilisateur.
+const limiterPasswordReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 3, label: "password-reset" });
+
 // Les serveurs TikTok téléchargent jusqu'à 35 images par publication
 // (et ce serveur en sonde autant avant publication).
 const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "media" });
@@ -1039,6 +1074,8 @@ const STRICT_PATHS = new Set([
   "/api/auth/login",
   "/api/auth/check-verification",
   "/api/auth/signup",
+  "/api/auth/forgot-password",
+  "/api/auth/reset-password",
 ]);
 
 const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva)\/auth\//;
@@ -1783,6 +1820,51 @@ async function adminUpdateUser(userId, attributes) {
 
   authCacheInvalidateUser(userId);
   return result;
+}
+
+// ============================================================
+// JETON DE RÉCUPÉRATION (mot de passe oublié)
+// ============================================================
+//
+// Le lien de l'email Supabase ouvre une session de « récupération » dont le
+// JWT contient amr = [{ method: "recovery" | "otp" }]. Sans ce contrôle, un
+// access_token ordinaire (session de connexion, vol de token...) permettrait
+// de changer le mot de passe SANS connaître l'ancien. On exige donc :
+//   - une méthode d'authentification « recovery » / « otp »
+//   - un jeton émis il y a moins de RECOVERY_TOKEN_MAX_AGE_SEC secondes
+// (la signature elle-même est vérifiée ensuite par supabase.auth.getUser).
+
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token).split(".");
+    if (parts.length !== 3) return null;
+
+    const payload = JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf8")
+    );
+
+    return payload && typeof payload === "object" ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRecoverySessionToken(token) {
+  const payload = decodeJwtPayload(token);
+  if (!payload) return false;
+
+  const amr = Array.isArray(payload.amr) ? payload.amr : [];
+
+  const viaRecovery = amr.some(
+    (entry) => entry?.method === "recovery" || entry?.method === "otp"
+  );
+
+  if (!viaRecovery) return false;
+
+  const issuedAt = Number(payload.iat);
+  if (!Number.isFinite(issuedAt)) return false;
+
+  return Date.now() / 1000 - issuedAt <= RECOVERY_TOKEN_MAX_AGE_SEC;
 }
 
 // ============================================================
@@ -4066,6 +4148,181 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   });
 });
 
+// ------------------------------------------------------------
+// MOT DE PASSE OUBLIÉ — étape 1 : envoi de l'email
+// ------------------------------------------------------------
+//
+// POST /api/auth/forgot-password   { email }
+//
+// - La réponse est IDENTIQUE que le compte existe ou non (pas d'énumération
+//   des comptes). Seuls le format de l'email et la limite de débit peuvent
+//   produire une erreur.
+// - Limites : 10 requêtes / 15 min par IP (STRICT_PATHS) + 3 demandes /
+//   15 min par adresse email (limiterPasswordReset).
+// - Le lien reçu par email redirige vers PASSWORD_RESET_REDIRECT_URL.
+route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
+  const body = await getJsonBody(req);
+
+  const email = normalizeEmail(body.email);
+
+  if (!email || email.length > 254 || !EMAIL_REGEX.test(email)) {
+    throw new HttpError(400, "Enter a valid email address.", "INVALID_EMAIL");
+  }
+
+  enforce(limiterPasswordReset, `forgot:${email}`);
+
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: PASSWORD_RESET_REDIRECT_URL,
+  });
+
+  if (error) {
+    // Limite d'envoi d'emails atteinte côté Supabase : le client peut
+    // réessayer plus tard (ne révèle rien sur l'existence du compte).
+    if (error.status === 429) {
+      throw new HttpError(
+        429,
+        "Too many requests. Please try again later.",
+        "RATE_LIMITED"
+      );
+    }
+
+    // Toute autre erreur (SMTP, compte inexistant...) est seulement
+    // journalisée : répondre différemment révélerait si l'email existe.
+    console.error(
+      `[${requestId}] forgot-password: ${error.status || ""} ${error.message}`
+    );
+  }
+
+  sendJson(res, 200, {
+    success: true,
+    message:
+      "If an account exists for this email, a password reset link has been sent.",
+  });
+});
+
+// ------------------------------------------------------------
+// MOT DE PASSE OUBLIÉ — étape 2 : nouveau mot de passe
+// ------------------------------------------------------------
+//
+// POST /api/auth/reset-password
+//   { password, access_token }   ← jetons lus dans le hash de l'URL
+//   ou
+//   { password, token_hash }     ← si le template d'email utilise
+//                                   {{ .TokenHash }} (flux « token_hash »)
+//
+// L'access_token DOIT provenir d'une session de récupération (voir
+// isRecoverySessionToken) : un token de connexion ordinaire est refusé.
+// Après le changement, TOUTES les sessions de l'utilisateur sont révoquées
+// (un attaquant éventuellement connecté perd l'accès).
+route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
+  const body = await getJsonBody(req);
+
+  const password = String(
+    body.password ?? body.newPassword ?? body.new_password ?? ""
+  );
+  const accessToken = String(body.accessToken ?? body.access_token ?? "").trim();
+  const tokenHash = String(body.tokenHash ?? body.token_hash ?? "").trim();
+
+  if (!password) {
+    throw new HttpError(400, "A new password is required");
+  }
+
+  if (password.length < 8) {
+    throw new HttpError(400, "Password must contain at least 8 characters");
+  }
+
+  if (password.length > 128) {
+    throw new HttpError(400, "Password must contain at most 128 characters");
+  }
+
+  if (!accessToken && !tokenHash) {
+    throw new HttpError(
+      400,
+      "Missing recovery token",
+      "RECOVERY_TOKEN_MISSING"
+    );
+  }
+
+  const invalidLink = () =>
+    new HttpError(
+      401,
+      "This reset link is invalid or has expired. Request a new one.",
+      "INVALID_RESET_TOKEN"
+    );
+
+  let user = null;
+  let sessionToken = null;
+
+  if (tokenHash) {
+    if (tokenHash.length > 512) throw invalidLink();
+
+    // verifyOtp consomme le token (usage unique) et ouvre la session.
+    const { data, error } = await supabase.auth.verifyOtp({
+      token_hash: tokenHash,
+      type: "recovery",
+    });
+
+    if (error || !data?.user || !data?.session) throw invalidLink();
+
+    user = data.user;
+    sessionToken = data.session.access_token;
+  } else {
+    if (accessToken.length > 4096) throw invalidLink();
+
+    // Un token de connexion ordinaire ne doit pas permettre de changer le
+    // mot de passe sans connaître l'ancien.
+    if (!isRecoverySessionToken(accessToken)) throw invalidLink();
+
+    const {
+      data: { user: found },
+      error,
+    } = await supabase.auth.getUser(accessToken);
+
+    if (error || !found) throw invalidLink();
+
+    user = found;
+    sessionToken = accessToken;
+  }
+
+  enforce(limiterAccount, `reset:${user.id}`);
+
+  const { error: updateError } = await adminUpdateUser(user.id, { password });
+
+  if (updateError) {
+    // Règles de mot de passe de Supabase (même mot de passe, trop faible...) :
+    // le message est destiné à l'utilisateur.
+    if (
+      updateError.code === "same_password" ||
+      updateError.code === "weak_password"
+    ) {
+      throw new HttpError(
+        400,
+        updateError.message || "This password cannot be used.",
+        updateError.code
+      );
+    }
+
+    throw dbError("auth.admin.updateUserById(password)", updateError);
+  }
+
+  // Révoque toutes les sessions existantes (le lien de récupération inclus).
+  try {
+    await supabaseAdmin.auth.admin.signOut(sessionToken, "global");
+  } catch (signOutError) {
+    console.warn(
+      `[${requestId}] reset-password: session revoke failed:`,
+      signOutError?.message || signOutError
+    );
+  }
+
+  authCacheInvalidateUser(user.id);
+
+  sendJson(res, 200, {
+    success: true,
+    message: "Password updated successfully. You can now sign in.",
+  });
+});
+
 // Google / GitHub : URL d'autorisation.
 // redirectTo est validé avec sanitizeRedirectTo() (origine autorisée).
 function registerOAuthLoginRoute(provider, extraOptions) {
@@ -6189,6 +6446,7 @@ server.listen(PORT, () => {
   console.log(`  TRUST_PROXY     : ${TRUST_PROXY ? `1 (${TRUST_PROXY_HOPS} hop)` : "0"}`);
   console.log(`  Token encryption: ${TOKEN_ENCRYPTION_KEY ? "on" : "off"}`);
   console.log(`  Rate limits     : strict 10/15min · oauth 30/10min · api 240/min`);
+  console.log(`  Password reset  : redirect ${PASSWORD_RESET_REDIRECT_URL} · 3 demandes/15min par email`);
   console.log(`  Video uploads   : max ${MAX_VIDEO_UPLOADS} concurrent(s)`);
   console.log(
     `  TikTok mode     : ${
