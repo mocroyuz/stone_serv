@@ -63,6 +63,16 @@
 //                  Le serveur vérifie au démarrage que tous les price IDs
 //                  sont définis (sinon le checkout échouera silencieusement
 //                  pour ces plans).
+//   MFA (2FA)    : Le FRONTEND élève la session en AAL2 via supabase-js
+//                  (enrôlement TOTP / passkeys). Le BACKEND :
+//                    - renvoie mfa_enabled / aal / mfa_required à la connexion
+//                    - expose GET /api/auth/mfa/status (AAL + facteurs)
+//                    - refuse les opérations sensibles (changement de mot de
+//                      passe) si l'utilisateur a activé la MFA mais que sa
+//                      session est encore en AAL1 (403 MFA_REQUIRED).
+//                  Le frontend doit alors afficher le challenge MFA
+//                  (needsMfaChallenge / verifyMfaLogin) puis rejouer
+//                  l'opération.
 //   Optionnel    : ALLOWED_ORIGINS, TRUST_PROXY, TRUST_PROXY_HOPS,
 //                  MAX_VIDEO_UPLOADS, TIKTOK_VERIFICATION_FILE,
 //                  TIKTOK_SKIP_PHOTO_PROBE=1, STRIPE_*, TIKTOK_*,
@@ -342,10 +352,6 @@ const STRIPE_PRICES = {
 // ============================================================
 // [MODIF 2a] PLANS — correspondance price ID Stripe ↔ plan
 // ============================================================
-//
-// Le frontend (sidebar, pricing) affiche le plan à partir de ces champs :
-// plan, plan_key, plan_name. Source : le price ID de l'abonnement, avec
-// repli sur la metadata `plan` posée au checkout.
 
 const PLAN_NAMES = {
   starter: "Starter",
@@ -378,16 +384,6 @@ function planDetails(priceId, metadataPlan) {
 
 // ============================================================
 // URLs DE RETOUR STRIPE
-// ------------------------------------------------------------
-// Le frontend utilise un routage par hash (#/account, #/pricing).
-// Les URLs de retour DOIVENT donc inclure le "#", sinon le hash
-// router ne trouve pas la route et retombe sur "/" (landing),
-// ce qui donne l'impression que le paiement n'a pas fonctionné.
-//
-// Les query params sont placés APRÈS le hash :
-//   https://stone.app/#/account?checkout=success&session_id=cs_...
-// Le frontend les lit dans window.location.hash via
-// readCheckoutReturn() (services/stripe.ts).
 // ============================================================
 
 const STRIPE_SUCCESS_URL = `${APP_URL}/#/account?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
@@ -422,15 +418,6 @@ const TIKTOK_PRIVACY_LEVELS = new Set([
 ]);
 
 // ---- Mode sandbox -------------------------------------------------------
-//
-// TIKTOK_AUDITED=1  → app auditée : comportement normal (DIRECT_POST,
-//                     privacy au choix, photos en direct).
-// sinon             → SANDBOX :
-//                     - DIRECT_POST limité à privacy_level = SELF_ONLY
-//                     - photos forcées en brouillon (MEDIA_UPLOAD)
-//                     - seuls les « Sandbox testers » du portail peuvent
-//                       autoriser l'app (sinon access_denied)
-// TIKTOK_FORCE_DRAFT=1 → tout part en brouillon, même audité.
 
 const TIKTOK_AUDITED = env("TIKTOK_AUDITED") === "1";
 const TIKTOK_SANDBOX = !TIKTOK_AUDITED;
@@ -438,8 +425,6 @@ const TIKTOK_FORCE_DRAFT = env("TIKTOK_FORCE_DRAFT") === "1";
 
 const tiktokEnabled = Boolean(TIKTOK_CLIENT_KEY && TIKTOK_CLIENT_SECRET);
 
-// Résumé des capacités effectives, renvoyé par les routes TikTok :
-// le frontend affiche un bandeau sandbox à partir de là.
 function tiktokCapabilities() {
   return {
     audited: TIKTOK_AUDITED,
@@ -454,28 +439,17 @@ function tiktokCapabilities() {
   };
 }
 
-// Webhook TikTok : écart maximal (en secondes) toléré entre l'horodatage signé
-// par TikTok et l'heure du serveur. 0 = contrôle désactivé. Défaut : 300 s.
 const TIKTOK_WEBHOOK_TOLERANCE_SEC = (() => {
   const raw = env("TIKTOK_WEBHOOK_TOLERANCE_SEC");
   const value = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(value) && value >= 0 ? value : 300;
 })();
 
-// Vérification du préfixe d'URL chez TikTok (URL properties).
-// TikTok fournit un fichier "<nom>.txt" dont le contenu est "<nom>".
-// Il est servi sur /api/media/tiktok/<nom>.txt (voir createServer).
-// Surchargeable via TIKTOK_VERIFICATION_FILE (avec ou sans ".txt").
 const TIKTOK_VERIFICATION_NAME = (
   env("TIKTOK_VERIFICATION_FILE") ||
   "tiktok-developers-site-verification=mRJN1EDyG6GdEuRBeOe9A5VyNF5FZTlU"
 ).replace(/\.txt$/i, "");
 
-// URL publique de CE serveur, utilisée pour que TikTok télécharge les photos.
-// Ordre de lecture : PUBLIC_API_URL → VITE_API_BASE_URL → RAILWAY_PUBLIC_DOMAIN.
-// On retire le slash final ET un éventuel "/api" final (les routes média
-// ajoutent déjà "/api/media/tiktok/..."). Une valeur relative (ex. "/api")
-// ou invalide est ignorée.
 function resolvePublicApiUrl() {
   const candidates = [
     ["PUBLIC_API_URL", env("PUBLIC_API_URL")],
@@ -510,9 +484,6 @@ function resolvePublicApiUrl() {
   return { url: "", source: null };
 }
 
-// Photos / carrousels : TikTok ne les accepte que par PULL_FROM_URL.
-// Les images sont déposées temporairement dans un bucket Supabase privé,
-// puis servies par CE serveur sur PUBLIC_API_URL (préfixe vérifié chez TikTok).
 const { url: PUBLIC_API_URL, source: PUBLIC_API_URL_SOURCE } =
   resolvePublicApiUrl();
 const TIKTOK_MEDIA_BUCKET = "tiktok-media";
@@ -521,8 +492,6 @@ const MAX_TIKTOK_PHOTOS = 35;
 const MAX_PHOTO_SIZE = 10 * 1024 * 1024;
 const MAX_PHOTOS_TOTAL = 80 * 1024 * 1024;
 
-// Un PUBLIC_API_URL qui pointe vers le frontend (Vercel / APP_URL) est la
-// cause n°1 de « The request source info is empty or incorrect ».
 function publicApiLooksLikeFrontend() {
   if (!PUBLIC_API_URL) return false;
 
@@ -573,13 +542,6 @@ if (tiktokEnabled && TIKTOK_FORCE_DRAFT) {
 // ============================================================
 // CONFIGURATION PINTEREST
 // ============================================================
-//
-// L'environnement (sandbox / production) est déduit de PINTEREST_API_BASE
-// (défaut : SANDBOX). L'endpoint OAuth (échange de code + refresh) est
-// dérivé du MÊME environnement, sauf si PINTEREST_OAUTH_BASE est défini
-// explicitement. Si les deux ne sont pas du même environnement, la
-// configuration est jugée incohérente : les routes Pinterest répondent 500
-// (PINTEREST_CONFIG_INVALID) au lieu de mélanger les environnements.
 
 const PINTEREST_APP_ID = env("PINTEREST_APP_ID");
 const PINTEREST_APP_SECRET = env("PINTEREST_APP_SECRET");
@@ -668,7 +630,6 @@ const youtubeEnabled = Boolean(YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET);
 
 // ---- Publication YouTube ------------------------------------------------
 const YOUTUBE_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos";
-// Les chunks doivent être un multiple de 256 Kio (sauf le dernier).
 const YOUTUBE_CHUNK_SIZE = 8 * 1024 * 1024;
 const YOUTUBE_PRIVACY_LEVELS = new Set(["public", "unlisted", "private"]);
 const YOUTUBE_TITLE_MAX = 100;
@@ -684,18 +645,6 @@ if (youtubeEnabled && !YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE))
 // ============================================================
 // CONFIGURATION CANVA
 // ============================================================
-//
-// Canva Connect API (https://www.canva.dev/docs/connect/). L'échange de
-// code utilise PKCE (code_challenge / code_verifier) : le verifier reste
-// côté serveur, indexé par le hash du state. Mono-instance (comme les
-// rate limiters) ; en multi-instance, stocke le verifier en base.
-//
-// Le flux est piloté par le frontend :
-//   1. POST /api/canva/auth/url            → URL d'autorisation + PKCE
-//   2. (redirection Canva) → /canva/callback (frontend)
-//   3. POST /api/canva/auth/callback       → échange code + verifier
-//   4. POST /api/canva/designs             → crée un design vide
-//   5. POST /api/canva/export              → exporte en PNG (base64)
 
 const CANVA_CLIENT_ID = env("CANVA_CLIENT_ID");
 const CANVA_CLIENT_SECRET = env("CANVA_CLIENT_SECRET");
@@ -735,7 +684,6 @@ let OAUTH_STATE_SECRET =
   CANVA_CLIENT_SECRET;
 
 if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
-  // Dev uniquement : secret éphémère (les states ne survivent pas au redémarrage).
   OAUTH_STATE_SECRET = crypto.randomBytes(32).toString("hex");
   console.warn(
     "⚠️  OAUTH_STATE_SECRET manquant — secret éphémère généré (dev uniquement)."
@@ -780,7 +728,7 @@ function encryptSecret(value) {
 
 function decryptSecret(value) {
   if (!value) return value ?? null;
-  if (!String(value).startsWith(ENC_PREFIX)) return value; // ancien token en clair
+  if (!String(value).startsWith(ENC_PREFIX)) return value;
 
   if (!TOKEN_ENCRYPTION_KEY) {
     throw new Error("TOKEN_ENCRYPTION_KEY is required to read encrypted tokens");
@@ -808,7 +756,6 @@ function decryptTokenRow(row) {
     };
   } catch (error) {
     console.error("Token decryption failed:", error.message);
-    // L'utilisateur devra reconnecter son compte.
     return { ...row, access_token: null, refresh_token: null };
   }
 }
@@ -857,7 +804,6 @@ try {
 
 const SUPABASE_BASE_URL = SUPABASE_URL.replace(/\/+$/, "");
 
-// Debug optionnel : DEBUG_ENV=1 (n'affiche jamais les secrets)
 if (env("DEBUG_ENV") === "1") {
   console.log("[env] SUPABASE_URL      :", JSON.stringify(SUPABASE_URL));
   console.log("[env] ANON key length   :", SUPABASE_ANON_KEY.length);
@@ -885,9 +831,6 @@ if (env("DEBUG_ENV") === "1") {
 // ============================================================
 // FAIL-FAST EN PRODUCTION
 // ============================================================
-//
-// Sans APP_URL / OAUTH_REDIRECT_URL en production, les redirections
-// Stripe et OAuth pointeraient silencieusement vers localhost.
 
 if (IS_PRODUCTION) {
   const fatalMissing = [];
@@ -945,13 +888,6 @@ if (!STRIPE_WEBHOOK_SECRET) {
   );
 }
 
-// ------------------------------------------------------------
-// Valide que CHAQUE plan × période a un price ID Stripe.
-// Sans ce contrôle, le serveur démarre sans rien dire et
-// /api/stripe/checkout renvoie 400 « Unknown plan » pour la
-// moitié des plans — message trompeur et difficile à relier à
-// une variable d'env manquante.
-// ------------------------------------------------------------
 if (STRIPE_SECRET_KEY) {
   const missingPrices = [];
 
@@ -1025,10 +961,6 @@ if (pinterestEnabled && !pinterestConfigError) {
 // ============================================================
 // CLIENTS SUPABASE
 // ============================================================
-//
-// Pas de session persistée ni d'auto-refresh : ce serveur est
-// stateless, un client partagé ne doit jamais mémoriser la
-// session d'un utilisateur.
 
 const serverAuthOptions = {
   persistSession: false,
@@ -1051,14 +983,6 @@ const supabaseOAuth = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 // ============================================================
 // RATE LIMITING (en mémoire)
 // ============================================================
-//
-// Sliding window. Suffisant pour un backend Railway mono-instance ;
-// pour du multi-instance, passe à Redis (rate-limiter-flexible).
-//
-// TRUST_PROXY=1 derrière Railway pour utiliser X-Forwarded-For.
-// TRUST_PROXY_HOPS = nombre de proxies de confiance devant l'app
-// (on lit l'entrée située à cette distance de la FIN de la liste,
-// donc une valeur injectée par le client n'est jamais utilisée).
 
 const TRUST_PROXY = env("TRUST_PROXY") === "1" || IS_PRODUCTION;
 const TRUST_PROXY_HOPS = Math.max(1, Number(env("TRUST_PROXY_HOPS") || 1));
@@ -1115,11 +1039,9 @@ function createRateLimiter({ windowMs, max, label, maxKeys = 50_000 }) {
 
       timestamps.push(now);
 
-      // Réinsère en fin de Map (ordre d'insertion = ordre d'activité).
       hits.delete(key);
       hits.set(key, timestamps);
 
-      // Borne mémoire : on évince les clés les plus anciennes.
       if (hits.size > maxKeys) {
         const oldest = hits.keys().next().value;
         hits.delete(oldest);
@@ -1130,28 +1052,19 @@ function createRateLimiter({ windowMs, max, label, maxKeys = 50_000 }) {
   };
 }
 
-// Par IP
 const limiterStrict = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "auth" });
 const limiterRefresh = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30, label: "refresh" });
 const limiterOauth = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30, label: "oauth" });
 const limiterApi = createRateLimiter({ windowMs: 60 * 1000, max: 240, label: "api" });
 
-// Par compte (empêche de contourner la limite IP en changeant d'IP)
 const limiterAccount = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "account" });
 const limiterPublish = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, label: "publish" });
 
-// Mot de passe oublié : par adresse email (3 demandes / 15 min), pour ne pas
-// transformer le serveur en machine à spammer la boîte d'un utilisateur.
 const limiterPasswordReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 3, label: "password-reset" });
 
-// Les serveurs TikTok téléchargent jusqu'à 35 images par publication
-// (et ce serveur en sonde autant avant publication).
 const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "media" });
-// Webhook TikTok (serveur -> serveur, signature vérifiée). Limite dédiée par IP :
-// large pour absorber les rafales/retries légitimes de TikTok, mais bornée.
 const limiterTiktokWebhook = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "tiktok-webhook" });
 
-// Canva : création de design + export, par utilisateur.
 const limiterCanva = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 40, label: "canva" });
 
 function enforce(limiter, key) {
@@ -1271,7 +1184,6 @@ function setCorsHeaders(req, res) {
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-// API JSON pure : on interdit tout (framing, ressources, cache).
 function setSecurityHeaders(res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -1344,9 +1256,6 @@ function sendJson(res, statusCode, data, extraHeaders) {
   res.end(payload);
 }
 
-// En production, le client ne reçoit JAMAIS le message d'erreur
-// interne : seulement un message générique + un requestId
-// corrélable aux logs serveur.
 function internalErrorResponse(res, requestId, error, context) {
   console.error(`[${requestId}] ${context}:`, error);
 
@@ -1371,7 +1280,7 @@ function internalErrorResponse(res, requestId, error, context) {
 // CORPS DES REQUÊTES
 // ============================================================
 
-const MAX_JSON_BODY = 1024 * 1024; // 1 Mo suffit pour toutes nos routes JSON
+const MAX_JSON_BODY = 1024 * 1024;
 
 function tooLargeError(message = "Request body too large") {
   return new HttpError(413, message, "BODY_TOO_LARGE", { Connection: "close" });
@@ -1432,7 +1341,6 @@ async function getJsonBody(req) {
   }
 }
 
-// Corps brut (signature Stripe : les payloads sont petits)
 const getRawBody = (req) => readBody(req, MAX_JSON_BODY);
 
 // ============================================================
@@ -1523,8 +1431,6 @@ function parseMultipart(req, { fileField, maxSize }) {
       settle(reject, new HttpError(400, "Could not read the uploaded file."))
     );
 
-    // Un client qui coupe la connexion ne doit jamais laisser la
-    // promesse (et donc un slot d'upload) pendante.
     req.on("close", () => {
       if (!req.complete) {
         settle(reject, new HttpError(400, "Upload aborted"));
@@ -1538,7 +1444,6 @@ function parseMultipart(req, { fileField, maxSize }) {
   });
 }
 
-// Variante multi-fichiers (carrousel de photos).
 function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
   return new Promise((resolve, reject) => {
     let bb;
@@ -1641,11 +1546,8 @@ function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
 }
 
 // ============================================================
-// VALIDATION DU TYPE DE FICHIER (magic bytes, pas le header client)
+// VALIDATION DU TYPE DE FICHIER (magic bytes)
 // ============================================================
-//
-// SVG volontairement EXCLU pour les avatars (XSS possible via un
-// SVG servi depuis le domaine public du bucket).
 
 const ALLOWED_AVATAR_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
@@ -1659,7 +1561,6 @@ const AVATAR_EXTENSIONS = {
 function sniffImageType(buffer) {
   if (!buffer || buffer.length < 12) return null;
 
-  // PNG : 89 50 4E 47
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
@@ -1669,12 +1570,10 @@ function sniffImageType(buffer) {
     return "image/png";
   }
 
-  // JPEG : FF D8 FF
   if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
     return "image/jpeg";
   }
 
-  // GIF : "GIF8"
   if (
     buffer[0] === 0x47 &&
     buffer[1] === 0x49 &&
@@ -1684,7 +1583,6 @@ function sniffImageType(buffer) {
     return "image/gif";
   }
 
-  // WebP : "RIFF"...."WEBP"
   if (
     buffer.toString("ascii", 0, 4) === "RIFF" &&
     buffer.toString("ascii", 8, 12) === "WEBP"
@@ -1698,14 +1596,12 @@ function sniffImageType(buffer) {
 function sniffVideoType(buffer) {
   if (!buffer || buffer.length < 12) return null;
 
-  // MP4 / MOV : "ftyp" aux octets 4-7 ; la marque "qt  " = QuickTime
   if (buffer.toString("ascii", 4, 8) === "ftyp") {
     return buffer.toString("ascii", 8, 12) === "qt  "
       ? "video/quicktime"
       : "video/mp4";
   }
 
-  // WebM / Matroska : 1A 45 DF A3
   if (
     buffer[0] === 0x1a &&
     buffer[1] === 0x45 &&
@@ -1748,12 +1644,8 @@ function isOwnedAvatarPath(storagePath, userId) {
 }
 
 // ============================================================
-// LIMITE DE CONCURRENCE DES UPLOADS VIDÉO (anti OOM)
+// LIMITE DE CONCURRENCE DES UPLOADS VIDÉO
 // ============================================================
-//
-// Chaque upload TikTok / YouTube bufferise jusqu'à 100 Mo en RAM. Le slot
-// est acquis AVANT de lire le corps de la requête : au plus
-// MAX_VIDEO_UPLOADS vidéos en mémoire simultanément.
 
 const MAX_VIDEO_UPLOADS = Math.max(1, Number(env("MAX_VIDEO_UPLOADS") || 2));
 const MAX_VIDEO_QUEUE = 10;
@@ -1801,7 +1693,6 @@ function releaseVideoSlot() {
   const next = videoUploadWaiters.shift();
 
   if (next) {
-    // Le slot est transféré au suivant : le compteur ne bouge pas.
     next.resolve();
   } else {
     activeVideoUploads = Math.max(0, activeVideoUploads - 1);
@@ -1811,11 +1702,6 @@ function releaseVideoSlot() {
 // ============================================================
 // AUTHENTIFICATION (avec cache court)
 // ============================================================
-//
-// supabase.auth.getUser(token) est un appel réseau : on met le
-// résultat en cache 20 s (clé = hash du token). Le cache est vidé
-// pour un utilisateur dès qu'on modifie son compte ou qu'il se
-// déconnecte.
 
 const AUTH_CACHE_TTL_MS = 20_000;
 const AUTH_CACHE_MAX = 2_000;
@@ -1908,7 +1794,6 @@ async function getAuthenticatedUser(req) {
   return { user, token, error: null, code: null };
 }
 
-// Toute modification admin d'un compte passe par ici (invalide le cache).
 async function adminUpdateUser(userId, attributes) {
   const result = await supabaseAdmin.auth.admin.updateUserById(
     userId,
@@ -1922,14 +1807,6 @@ async function adminUpdateUser(userId, attributes) {
 // ============================================================
 // JETON DE RÉCUPÉRATION (mot de passe oublié)
 // ============================================================
-//
-// Le lien de l'email Supabase ouvre une session de « récupération » dont le
-// JWT contient amr = [{ method: "recovery" | "otp" }]. Sans ce contrôle, un
-// access_token ordinaire (session de connexion, vol de token...) permettrait
-// de changer le mot de passe SANS connaître l'ancien. On exige donc :
-//   - une méthode d'authentification « recovery » / « otp »
-//   - un jeton émis il y a moins de RECOVERY_TOKEN_MAX_AGE_SEC secondes
-// (la signature elle-même est vérifiée ensuite par supabase.auth.getUser).
 
 function decodeJwtPayload(token) {
   try {
@@ -1962,6 +1839,61 @@ function isRecoverySessionToken(token) {
   if (!Number.isFinite(issuedAt)) return false;
 
   return Date.now() / 1000 - issuedAt <= RECOVERY_TOKEN_MAX_AGE_SEC;
+}
+
+// ============================================================
+// MFA — AAL & FACTEURS (backend enforcement)
+// ============================================================
+//
+// Le frontend élève la session en AAL2 via le client Supabase
+// (mfa.challengeAndVerify). Le backend se contente de :
+//   - renvoyer l'AAL courant (JWT `aal`) et les facteurs vérifiés
+//   - refuser les opérations sensibles si MFA activée + AAL1
+//     (code 403 MFA_REQUIRED → le frontend doit afficher le
+//     challenge MFA puis rejouer l'opération).
+
+/**
+ * Lit le claim `aal` du JWT (aal1 / aal2), ou null si absent.
+ * Un JWT sans claim `aal` correspond à une session sans MFA → aal1.
+ */
+function getTokenAal(token) {
+  if (!token) return null;
+  const payload = decodeJwtPayload(token);
+  return typeof payload?.aal === "string" ? payload.aal : null;
+}
+
+/**
+ * true si l'utilisateur a au moins un facteur MFA vérifié
+ * (TOTP ou WebAuthn / passkey).
+ */
+function userHasVerifiedMfa(user) {
+  const factors = Array.isArray(user?.factors) ? user.factors : [];
+  return factors.some(
+    (f) =>
+      f?.status === "verified" &&
+      (f.factor_type === "totp" || f.factor_type === "webauthn")
+  );
+}
+
+/** Liste des facteurs vérifiés (objet Supabase factor). */
+function verifiedFactorsOf(user) {
+  const factors = Array.isArray(user?.factors) ? user.factors : [];
+  return factors.filter((f) => f?.status === "verified");
+}
+
+/**
+ * Refuse l'opération si l'utilisateur a activé la MFA mais n'a pas
+ * encore élevé sa session en AAL2. Sans MFA, no-op.
+ */
+function requireAal2(user, token) {
+  if (!userHasVerifiedMfa(user)) return;
+  if (getTokenAal(token) === "aal2") return;
+
+  throw new HttpError(
+    403,
+    "Two-factor verification required. Complete the MFA challenge, then try again.",
+    "MFA_REQUIRED"
+  );
 }
 
 // ============================================================
@@ -2006,6 +1938,8 @@ function formatUser(user) {
     // app_metadata n'est modifiable QUE par le serveur (service role) :
     // un utilisateur ne peut pas s'auto-attribuer un abonnement.
     subscription: user.app_metadata?.subscription || null,
+    // Indicateur MFA calculé côté serveur (facteurs vérifiés).
+    mfa_enabled: userHasVerifiedMfa(user),
   };
 }
 
@@ -2020,10 +1954,6 @@ const sessionPayload = (session) =>
 // ============================================================
 // APP_METADATA — LECTURE / ÉCRITURE FIABLES
 // ============================================================
-//
-// app_metadata contient l'abonnement et l'id client Stripe : une erreur
-// ignorée ici crée une incohérence Stripe ↔ Supabase. Toute lecture ou
-// écriture passe par ces fonctions, qui lèvent une erreur explicite.
 
 async function getAppMetadata(userId) {
   const { data, error } = await supabaseAdmin.auth.admin.getUserById(userId);
@@ -2043,10 +1973,6 @@ async function getAppMetadata(userId) {
   return data.user.app_metadata || {};
 }
 
-// Lit → modifie → écrit, en série par utilisateur (pas de perte de mise à
-// jour entre deux événements Stripe / deux requêtes concurrentes de CE
-// processus). `mutate(current)` renvoie le nouvel objet app_metadata, ou
-// null pour ne rien écrire. Renvoie l'état final.
 function updateAppMetadata(userId, mutate) {
   return runSerial(`app-metadata:${userId}`, async () => {
     const current = await getAppMetadata(userId);
@@ -2072,14 +1998,6 @@ function requireStripe() {
 
 const isStripeMissing = (error) => error?.code === "resource_missing";
 
-// Retourne l'identifiant de client Stripe de l'utilisateur.
-// - source de vérité : app_metadata (serveur uniquement)
-// - migration : un ancien id stocké dans user_metadata n'est accepté
-//   que si le client Stripe correspondant appartient bien à cet
-//   utilisateur (user_metadata est modifiable par le client).
-// - création : sous verrou, après relecture d'app_metadata, et en
-//   réutilisant un client Stripe déjà créé pour cet utilisateur (cas d'une
-//   écriture Supabase échouée lors d'une tentative précédente).
 async function getStripeCustomerId(user, { create = false } = {}) {
   const trusted = user.app_metadata?.stripe_customer_id;
   if (trusted) return trusted;
@@ -2101,8 +2019,6 @@ async function getStripeCustomerId(user, { create = false } = {}) {
             stripe_customer_id: legacy,
           }));
         } catch (saveError) {
-          // L'id reste valide (vérifié) : on continue, la migration sera
-          // retentée au prochain appel.
           console.error(
             "Legacy Stripe customer migration not saved:",
             saveError.message
@@ -2119,7 +2035,6 @@ async function getStripeCustomerId(user, { create = false } = {}) {
   if (!create) return null;
 
   return withLock(`stripe-customer:${user.id}`, async () => {
-    // Un autre appel a pu créer / enregistrer le client entre-temps.
     const fresh = await getAppMetadata(user.id);
     if (fresh.stripe_customer_id) return fresh.stripe_customer_id;
 
@@ -2162,9 +2077,6 @@ async function getStripeCustomerId(user, { create = false } = {}) {
   });
 }
 
-// null UNIQUEMENT si le client est supprimé / inconnu / sans lien utilisateur.
-// Une erreur réseau ou API est propagée : le webhook répond 500 et Stripe
-// réessaie, au lieu d'ignorer silencieusement l'événement.
 async function resolveUserIdFromCustomer(customerId) {
   if (!customerId) return null;
 
@@ -2184,9 +2096,6 @@ async function resolveUserIdFromCustomer(customerId) {
   }
 }
 
-// ============================================================
-// [MODIF 2b] subscriptionSnapshot — avec plan_key / plan_name
-// ============================================================
 function subscriptionSnapshot(subscription) {
   const price = subscription.items?.data?.[0]?.price;
 
@@ -2210,15 +2119,6 @@ const TERMINAL_SUBSCRIPTION_STATUSES = new Set([
   "incomplete_expired",
 ]);
 
-// Écrit l'état d'abonnement (issu de Stripe) dans app_metadata.
-//  - eventCreated : horodatage Stripe (s) de l'événement à l'origine de
-//    l'écriture. Un événement plus ancien que le dernier appliqué est ignoré
-//    (livraison dans le désordre).
-//  - Un événement terminal (canceled...) d'un ANCIEN abonnement n'écrase pas
-//    un abonnement différent encore actif (annulation puis réabonnement).
-//  - overrides : champs forcés dans le snapshot (ex. status "past_due"
-//    prouvé par une facture Stripe impayée).
-// Renvoie true si l'état a été écrit.
 async function syncSubscriptionToUser(
   userId,
   subscription,
@@ -2267,10 +2167,6 @@ async function retrieveSubscription(subscriptionId, fallback) {
 const idOf = (value) =>
   typeof value === "string" ? value : value?.id || null;
 
-// Traite UN événement Stripe (déjà authentifié par sa signature).
-// Toute erreur remonte → 500 → Stripe réessaie. Les handlers sont
-// idempotents : l'état est toujours relu depuis Stripe, jamais déduit du
-// seul contenu de l'événement.
 async function processStripeEvent(event) {
   const eventCreated = Number(event.created) || 0;
 
@@ -2300,8 +2196,6 @@ async function processStripeEvent(event) {
         const userId = await resolveUserIdFromCustomer(payload.customer);
 
         if (userId) {
-          // Données fraîches de Stripe : un événement en retard ne peut pas
-          // réinjecter un ancien état.
           const subscription = await retrieveSubscription(payload.id, payload);
           await syncSubscriptionToUser(userId, subscription, { eventCreated });
         }
@@ -2312,13 +2206,11 @@ async function processStripeEvent(event) {
         const invoice = event.data.object;
         const subscriptionId = idOf(invoice.subscription);
 
-        if (!subscriptionId) break; // facture hors abonnement
+        if (!subscriptionId) break;
 
         const userId = await resolveUserIdFromCustomer(invoice.customer);
         if (!userId) break;
 
-        // Preuve côté Stripe : la facture est-elle TOUJOURS impayée ?
-        // (un paiement réussi entre-temps ne doit pas être écrasé.)
         const [freshInvoice, subscription] = await Promise.all([
           stripe.invoices.retrieve(invoice.id),
           stripe.subscriptions.retrieve(subscriptionId),
@@ -2337,22 +2229,15 @@ async function processStripeEvent(event) {
         break;
       }
 
-      // Récupération après un échec de paiement : Stripe retente parfois
-      // sans changer le statut de la subscription (ex. carte inchangée,
-      // facture `open` payée manuellement depuis le dashboard). On relit
-      // l'état RÉEL de la subscription (pas la facture) puis on synchronise.
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         const subscriptionId = idOf(invoice.subscription);
 
-        if (!subscriptionId) break; // facture hors abonnement
+        if (!subscriptionId) break;
 
         const userId = await resolveUserIdFromCustomer(invoice.customer);
         if (!userId) break;
 
-        // retrieveSubscription relit l'état réel : si l'abonnement a été
-        // annulé entre-temps, syncSubscriptionToUser écrira "canceled" et
-        // pas "active" — Stripe reste la source de vérité.
         const subscription = await retrieveSubscription(subscriptionId);
 
         await syncSubscriptionToUser(userId, subscription, { eventCreated });
@@ -2360,12 +2245,10 @@ async function processStripeEvent(event) {
       }
 
       default:
-        // Événement ignoré
         break;
     }
   } catch (error) {
     if (error instanceof HttpError && error.code === "USER_NOT_FOUND") {
-      // Utilisateur supprimé côté Supabase : inutile que Stripe réessaie.
       console.warn(
         `[stripe:webhook] ${event.id} (${event.type}) ignoré : utilisateur introuvable`
       );
@@ -2395,8 +2278,6 @@ function createOAuthState(provider, userId) {
   return Buffer.from(`${payload}.${hmac(payload)}`).toString("base64url");
 }
 
-// Renvoie null si le state est valide, sinon la raison précise de l'échec.
-// Les raisons ne sont écrites que dans les logs serveur (jamais renvoyées au client).
 function checkOAuthState(provider, state, userId) {
   if (!state) return "missing_state";
 
@@ -2412,8 +2293,6 @@ function checkOAuthState(provider, state, userId) {
     const a = Buffer.from(signature);
     const b = Buffer.from(hmac(payload));
 
-    // Signature différente : autre OAUTH_STATE_SECRET (serveur local vs prod,
-    // secret éphémère après un redémarrage...) ou state modifié.
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return "bad_signature";
     }
@@ -2468,10 +2347,9 @@ function assertValidOAuthCallback(provider, body, userId) {
 }
 
 // ============================================================
-// TOKENS OAUTH — LECTURE / ÉCRITURE COMMUNES (TikTok, Pinterest, YouTube, Canva)
+// TOKENS OAUTH — LECTURE / ÉCRITURE COMMUNES
 // ============================================================
 
-// Une erreur de base de données n'est JAMAIS traitée comme « compte absent ».
 async function selectTokenRow(table, userId) {
   const { data, error } = await supabaseAdmin
     .from(table)
@@ -2484,7 +2362,6 @@ async function selectTokenRow(table, userId) {
   return decryptTokenRow(data);
 }
 
-// Le jeton d'accès est utilisable s'il expire dans plus de 60 s.
 function isTokenFresh(account) {
   return Boolean(
     account?.access_token &&
@@ -2494,11 +2371,6 @@ function isTokenFresh(account) {
 
 const isPast = (value) => new Date(value).getTime() <= Date.now();
 
-// Mise à jour « compare-and-swap » : la ligne n'est modifiée que si
-// updated_at est celui que l'on a lu. Si un autre traitement (autre
-// instance, reconnexion, déconnexion) est passé entre-temps, rien n'est
-// écrit et on renvoie false : un ancien jeton ne réécrase jamais un plus
-// récent, et une ligne supprimée n'est jamais recréée.
 async function updateTokensIfUnchanged(table, userId, account, row) {
   let query = supabaseAdmin.from(table).update(row).eq("user_id", userId);
 
@@ -2519,8 +2391,6 @@ const iso = (ms) => new Date(ms).toISOString();
 // TIKTOK — APPEL API
 // ============================================================
 
-// Messages lisibles pour les erreurs TikTok les plus fréquentes,
-// enrichis du contexte sandbox.
 const TIKTOK_FRIENDLY_ERRORS = {
   unaudited_client_can_only_post_to_private_accounts:
     "Mode sandbox : TikTok n'accepte que des posts privés (SELF_ONLY) tant que l'app n'est pas auditée. Définis privacy_level=SELF_ONLY ou passe en mode brouillon.",
@@ -2532,12 +2402,8 @@ const TIKTOK_FRIENDLY_ERRORS = {
     "This TikTok account cannot post right now.",
   reached_active_user_cap:
     "TikTok daily user cap reached for this app. Try again later.",
-  // Renvoyée par TikTok pour les brouillons photo (MEDIA_UPLOAD) quand
-  // l'appli TikTok de l'utilisateur est trop ancienne (< 31.8).
   app_version_check_failed:
     "Please update your TikTok app to the latest version to use this feature, then try again.",
-  // En sandbox, seuls les « Sandbox testers » du portail peuvent
-  // autoriser l'app.
   access_denied:
     "Connection refused by TikTok. In sandbox mode, add the TikTok account as a Sandbox tester in the TikTok developer portal, then try again.",
 };
@@ -2570,14 +2436,11 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
 
   const { response, data } = result;
 
-  // Erreurs OAuth (/oauth/token, /oauth/revoke...)
   if (typeof data.error === "string") {
     throw new HttpError(400, data.error_description || data.error, data.error);
   }
 
-  // Erreurs API ("ok" = succès)
   if (data.error?.code && data.error.code !== "ok") {
-    // Log serveur : code + log_id TikTok pour diagnostiquer.
     console.error(
       "[tiktok]",
       pathname,
@@ -2612,17 +2475,6 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
 // TIKTOK — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
 
-// [FIX] Throttles de rafraîchissement du PROFIL (avatar).
-// Déclarés AVANT buildTikTokTokenRow / saveTikTokTokens pour être
-// utilisables par clearTikTokProfileThrottle().
-//
-//   TIKTOK_PROFILE_REFRESH_MS       : throttle normal (sans ?refresh=1)
-//   TIKTOK_PROFILE_MIN_INTERVAL_MS  : anti-martèlement après un succès
-//   TIKTOK_PROFILE_TRANSIENT_RETRY_MS : nouvel essai rapide après une
-//                                       panne réseau / 5xx
-//   TIKTOK_PROFILE_DEAD_RETRY_MS    : espacement quand le refresh token
-//                                       est mort (l'utilisateur doit
-//                                       reconnecter, inutile de marteler)
 const TIKTOK_PROFILE_REFRESH_MS = 30 * 60 * 1000;
 const TIKTOK_PROFILE_MIN_INTERVAL_MS = 10 * 1000;
 const TIKTOK_PROFILE_TRANSIENT_RETRY_MS = 30 * 1000;
@@ -2636,8 +2488,6 @@ function clearTikTokProfileThrottle(userId) {
   tiktokProfileRetryAt.delete(userId);
 }
 
-// Champs à écrire pour un jeu de jetons TikTok. Un champ absent de la
-// réponse du provider n'est PAS écrasé (ex. refresh_token non renvoyé).
 function buildTikTokTokenRow(t) {
   const now = Date.now();
   const accessTtl = Number(t.expires_in) || 24 * 60 * 60;
@@ -2661,7 +2511,6 @@ function buildTikTokTokenRow(t) {
   return row;
 }
 
-// Connexion initiale : crée ou remplace la ligne.
 async function saveTikTokTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("tiktok_accounts").upsert(
     {
@@ -2674,9 +2523,6 @@ async function saveTikTokTokens(userId, t, extra = {}) {
 
   if (error) throw new Error(error.message);
 
-  // [FIX] Réinitialise le throttle : le prochain GET /api/tiktok/status
-  // récupère immédiatement l'avatar (utile si le callback OAuth n'a pas
-  // pu obtenir le profil : l'avatar apparaît sans attendre 30 min).
   clearTikTokProfileThrottle(userId);
 }
 
@@ -2693,11 +2539,7 @@ async function getValidTikTokToken(userId) {
   if (isTokenFresh(first)) return first.access_token;
 
   return withLock(`tiktok-refresh:${userId}`, async () => {
-    // Deux tentatives : la seconde n'a lieu que si la ligne a changé
-    // pendant le refresh (autre instance, reconnexion...).
     for (let attempt = 0; attempt < 2; attempt++) {
-      // Relecture APRÈS verrou : un autre traitement a peut-être déjà
-      // renouvelé le jeton (et TikTok fait tourner les refresh tokens).
       const account = await getTikTokAccount(userId);
 
       if (!account) throw notConnected();
@@ -2754,26 +2596,8 @@ async function getValidTikTokToken(userId) {
 // ============================================================
 // TIKTOK — RAFRAÎCHISSEMENT DU PROFIL (avatar)
 // ============================================================
-//
-// Renvoie toujours { account, needsReconnect } :
-//
-//   account        : la ligne tiktok_accounts (avec la nouvelle URL si le
-//                    refresh a réussi, l'ancienne sinon)
-//   needsReconnect : true  → refresh token mort/absent ; le frontend doit
-//                    effacer son cache et inviter l'utilisateur à
-//                    reconnecter
-//                    false → tout va bien (succès, throttle, absence
-//                    d'avatar, ou panne transitoire : on retentera)
-//
-// Le throttle normal n'est armé QU'EN CAS DE SUCCÈS (ou d'absence
-// d'avatar). Les erreurs transitoires arment un retry court (30 s) ;
-// les jetons morts arment un retry long (5 min) et signalent
-// needsReconnect.
 
 async function refreshTikTokProfile(userId, { force = false } = {}) {
-  // Déduplication : les appels concurrents (même mode) partagent le même
-  // vol. force et non-force ont des clés distinctes pour ne pas bloquer
-  // un rafraîchissement forcé derrière un rafraîchissement throttlé.
   const lockKey = `tiktok-profile:${userId}:${force ? "force" : "normal"}`;
 
   return withLock(lockKey, async () => {
@@ -2783,7 +2607,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
     const now = Date.now();
     const retryAt = tiktokProfileRetryAt.get(userId) || 0;
 
-    // Anti-martèlement (respecté même par force).
     if (now < retryAt) {
       return { account, needsReconnect: false };
     }
@@ -2793,7 +2616,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
       return { account, needsReconnect: false };
     }
 
-    // Borne mémoire des deux Maps.
     if (tiktokProfileRefreshedAt.size > 10_000) {
       tiktokProfileRefreshedAt.delete(
         tiktokProfileRefreshedAt.keys().next().value
@@ -2815,8 +2637,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
 
       const profile = info.data?.user;
 
-      // Pas d'avatar (ou URL non https) : on conserve l'ancien, mais on
-      // considère le profil comme frais pour ne pas marteler TikTok.
       if (!profile?.avatar_url || !/^https:\/\//i.test(profile.avatar_url)) {
         tiktokProfileRefreshedAt.set(userId, now);
         tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_MIN_INTERVAL_MS);
@@ -2825,9 +2645,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
 
       const displayName = profile.display_name || account.display_name;
 
-      // On ne touche PAS à updated_at : il sert au webhook
-      // authorization.removed pour ne pas supprimer une connexion
-      // rétablie après la révocation (et au compare-and-swap du refresh).
       const { error } = await supabaseAdmin
         .from("tiktok_accounts")
         .update({
@@ -2845,7 +2662,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
         return { account, needsReconnect: false };
       }
 
-      // Succès : throttle normal + anti-martèlement court.
       tiktokProfileRefreshedAt.set(userId, now);
       tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_MIN_INTERVAL_MS);
 
@@ -2858,8 +2674,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
         needsReconnect: false,
       };
     } catch (error) {
-      // Jeton mort → reconnexion indispensable. On le signale EXPLICITEMENT
-      // au lieu de renvoyer silencieusement une URL expirée.
       if (
         error instanceof HttpError &&
         (error.code === "TIKTOK_REFRESH_EXPIRED" ||
@@ -2869,9 +2683,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
         return { account, needsReconnect: true };
       }
 
-      // Panne transitoire (réseau, 5xx, timeout) : on garde l'ancien
-      // avatar et on retente dans 30 s. Le cache de l'utilisateur n'est
-      // PAS vidé.
       console.warn("TikTok profile refresh failed:", error.message);
       tiktokProfileRetryAt.set(
         userId,
@@ -2886,9 +2697,6 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
 // TIKTOK — UPLOAD VIDÉO
 // ============================================================
 
-// TikTok : total_chunk_count = floor(taille / chunk_size) ; le dernier
-// chunk absorbe le reste (entre 5 et 128 Mo). Une vidéo ≤ 64 Mo part en
-// un seul chunk.
 function computeChunking(size) {
   const MB = 1024 * 1024;
 
@@ -2921,7 +2729,6 @@ async function putChunk(uploadUrl, part, mimeType, start, end, total) {
 
       if (response.ok || response.status === 206) return;
 
-      // Erreur client (4xx hors 429) : inutile de réessayer.
       if (
         response.status >= 400 &&
         response.status < 500 &&
@@ -2967,11 +2774,6 @@ async function uploadVideoToTikTok(uploadUrl, buffer, mimeType, chunking) {
 // TIKTOK — MODES / PRIVACY (logique sandbox)
 // ============================================================
 
-// Niveau de confidentialité effectif.
-//   - sandbox (non audité) → SELF_ONLY forcé
-//   - TIKTOK_FORCE_DRAFT   → SELF_ONLY (un brouillon reste consultable
-//     uniquement par le créateur, mais on borne quand même)
-//   - sinon                : valeur demandée si valide, sinon SELF_ONLY
 function resolvePrivacy(requested) {
   if (TIKTOK_SANDBOX || TIKTOK_FORCE_DRAFT) return "SELF_ONLY";
 
@@ -2979,20 +2781,11 @@ function resolvePrivacy(requested) {
   return TIKTOK_PRIVACY_LEVELS.has(value) ? value : "SELF_ONLY";
 }
 
-// Mode de publication vidéo :
-//   - "draft" demandé  → brouillon (inbox), toujours OK
-//   - "direct" demandé → brouillon si FORCE_DRAFT, sinon direct
-//     (en sandbox le direct reste possible mais SELF_ONLY)
 function resolveVideoMode(requested) {
   if (TIKTOK_FORCE_DRAFT) return "draft";
   return requested === "draft" ? "draft" : "direct";
 }
 
-// Divulgation de contenu commercial (exigence TikTok) :
-//   brand_organic_toggle = « Your brand »      → « Promotional content »
-//   brand_content_toggle = « Branded content » → « Paid partnership »
-// Le contenu de marque ne peut pas être privé (SELF_ONLY) → en sandbox
-// on le refuse explicitement (il serait de toute façon écrasé en SELF_ONLY).
 function brandFlags(fields, privacy) {
   const content = toBool(fields.brand_content_toggle);
   const organic = toBool(fields.brand_organic_toggle);
@@ -3039,8 +2832,6 @@ async function initTikTokPublish(accessToken, mode, postInfoFields, sourceInfo) 
       });
 }
 
-// publish_id TikTok : lettres, chiffres, _ . : ~ -  (le « ~ » est utilisé
-// par TikTok), 64 caractères maximum.
 const TIKTOK_PUBLISH_ID_PATTERN = /^[\w.:~-]+$/;
 const TIKTOK_PUBLISH_ID_MAX = 64;
 
@@ -3056,14 +2847,6 @@ function isValidTikTokPublishId(value) {
 // ============================================================
 // TIKTOK — PHOTOS (carrousel)
 // ============================================================
-//
-// 1 photo = post photo, 2 à 35 photos = carrousel.
-// Les fichiers vivent dans un bucket privé (nom aléatoire de 128 bits),
-// servis sans authentification sur /api/media/tiktok/<nom> pour que
-// TikTok puisse les télécharger, puis supprimés après TIKTOK_MEDIA_TTL_MS.
-//
-// SANDBOX : TikTok refuse les posts photos DIRECT_POST des apps non
-// auditées → resolvePhotoMode() force le brouillon (MEDIA_UPLOAD).
 
 async function ensureTikTokMediaBucket() {
   const { error } = await supabaseAdmin.storage.createBucket(
@@ -3120,7 +2903,6 @@ async function storeTikTokPhotos(photos) {
   );
 
   try {
-    // Par lots pour ne pas ouvrir 35 connexions d'un coup.
     const BATCH = 6;
 
     for (let i = 0; i < photos.length; i += BATCH) {
@@ -3146,7 +2928,6 @@ async function storeTikTokPhotos(photos) {
   return names;
 }
 
-// Route publique appelée par les serveurs TikTok (GET / HEAD).
 async function serveTikTokMedia(req, res, fileName) {
   const { data, error } = await supabaseAdmin.storage
     .from(TIKTOK_MEDIA_BUCKET)
@@ -3170,11 +2951,6 @@ async function serveTikTokMedia(req, res, fileName) {
   res.end(req.method === "HEAD" ? undefined : buffer);
 }
 
-// Vérifie, AVANT d'appeler TikTok, qu'une image est bien joignable depuis
-// Internet avec le bon Content-Type. Évite l'erreur opaque « The request
-// source info is empty or incorrect » : on remonte la vraie cause (mauvais
-// PUBLIC_API_URL, proxy, 404...). `index` / `total` (1-based) précisent
-// quelle photo pose problème.
 async function probePublicPhoto(imageUrl, index = 1, total = 1) {
   const label = total > 1 ? ` (photo ${index}/${total})` : "";
 
@@ -3224,9 +3000,6 @@ async function probePublicPhoto(imageUrl, index = 1, total = 1) {
   }
 }
 
-// Sonde TOUTES les images du carrousel (pas seulement la première), par
-// lots pour ne pas saturer le serveur. Désactivable avec
-// TIKTOK_SKIP_PHOTO_PROBE=1.
 async function probePublicPhotos(imageUrls) {
   if (env("TIKTOK_SKIP_PHOTO_PROBE") === "1") return;
 
@@ -3243,10 +3016,6 @@ async function probePublicPhotos(imageUrls) {
   }
 }
 
-// Post_info d'un post photo.
-//   - mode "draft" : pas de privacy (TikTok l'ignore en MEDIA_UPLOAD)
-//   - mode "direct" : privacy résolue via resolvePrivacy()
-//     (SELF_ONLY forcé en sandbox)
 function buildPhotoPostInfo(mode, fields) {
   const caption = String(fields.title || "").trim();
 
@@ -3268,9 +3037,6 @@ function buildPhotoPostInfo(mode, fields) {
   return postInfo;
 }
 
-// Mode de publication photo :
-//   - sandbox / FORCE_DRAFT → TOUJOURS "draft" (MEDIA_UPLOAD)
-//   - sinon : "draft" ou "direct" selon la demande
 function resolvePhotoMode(requested) {
   if (TIKTOK_SANDBOX || TIKTOK_FORCE_DRAFT) return "draft";
   return requested === "draft" ? "draft" : "direct";
@@ -3281,7 +3047,7 @@ function initTikTokPhotoPublish(accessToken, mode, postInfo, imageUrls, coverInd
     post_info: postInfo,
     source_info: {
       source: "PULL_FROM_URL",
-      photo_cover_index: coverIndex, // 0 = première photo
+      photo_cover_index: coverIndex,
       photo_images: imageUrls,
     },
     post_mode: mode === "draft" ? "MEDIA_UPLOAD" : "DIRECT_POST",
@@ -3344,8 +3110,6 @@ async function pinterestApi(
   const { response, data } = result;
 
   if (!response.ok) {
-    // On ne renvoie JAMAIS le 401 de Pinterest tel quel : le frontend
-    // le confondrait avec l'expiration de la session Stone.
     const error = new HttpError(
       upstreamStatus(response.status),
       data.message ||
@@ -3355,8 +3119,6 @@ async function pinterestApi(
       data.code !== undefined ? String(data.code) : undefined
     );
 
-    // Statut réel du provider (le refresh s'en sert pour distinguer un
-    // jeton révoqué / expiré d'une panne temporaire).
     error.upstreamStatus = response.status;
     throw error;
   }
@@ -3367,14 +3129,7 @@ async function pinterestApi(
 // ============================================================
 // PINTEREST — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
-//
-// Chaque compte mémorise l'environnement dans lequel ses jetons ont été
-// émis (colonne api_env). Un jeton sandbox n'est jamais envoyé à
-// l'API de production, ni l'inverse : la reconnexion est demandée.
 
-// replaceRefresh = true (connexion initiale) : les champs absents sont
-// remis à zéro. false (refresh) : un refresh_token / une expiration non
-// renvoyés par Pinterest ne sont PAS écrasés.
 function buildPinterestTokenRow(t, { replaceRefresh = false } = {}) {
   const now = Date.now();
   const accessTtl = Number(t.expires_in) || 30 * 24 * 60 * 60;
@@ -3402,7 +3157,6 @@ function buildPinterestTokenRow(t, { replaceRefresh = false } = {}) {
   return row;
 }
 
-// Connexion initiale : crée ou remplace la ligne, et fixe l'environnement.
 async function savePinterestTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("pinterest_accounts").upsert(
     {
@@ -3424,7 +3178,6 @@ async function getPinterestAccount(userId) {
 const pinterestAccountMatchesEnv = (account) =>
   Boolean(account) && account.api_env === PINTEREST_ENVIRONMENT;
 
-// Renvoyé par Pinterest quand le refresh token est révoqué / expiré.
 const isPinterestInvalidGrant = (error) =>
   error instanceof HttpError &&
   (error.upstreamStatus === 400 ||
@@ -3443,8 +3196,6 @@ async function getValidPinterestToken(userId) {
       );
     }
 
-    // Jetons émis pour un autre environnement (ou ligne d'avant la
-    // migration api_env) : jamais utilisés.
     if (!pinterestAccountMatchesEnv(account)) {
       throw reconnectError("Pinterest", "PINTEREST_ENV_MISMATCH");
     }
@@ -3457,7 +3208,6 @@ async function getValidPinterestToken(userId) {
 
   return withLock(`pinterest-refresh:${userId}`, async () => {
     for (let attempt = 0; attempt < 2; attempt++) {
-      // Relecture APRÈS verrou : un autre traitement a pu renouveler.
       const account = await load();
 
       if (isTokenFresh(account)) return account.access_token;
@@ -3493,8 +3243,6 @@ async function getValidPinterestToken(userId) {
         );
       }
 
-      // Pinterest ne renvoie pas toujours un nouveau refresh_token : dans
-      // ce cas l'ancien est conservé (buildPinterestTokenRow ne l'écrase pas).
       const applied = await updateTokensIfUnchanged(
         "pinterest_accounts",
         userId,
@@ -3583,10 +3331,6 @@ async function fetchYouTubeChannel(accessToken) {
 // ============================================================
 // YOUTUBE — STOCKAGE / REFRESH DES TOKENS
 // ============================================================
-//
-// Particularité Google : le refresh token est durable et n'est PAS renvoyé
-// lors d'un refresh → on ne l'écrase jamais s'il est absent de la réponse.
-// invalid_grant = autorisation révoquée / expirée → reconnexion.
 
 function buildYouTubeTokenRow(t) {
   const now = Date.now();
@@ -3610,7 +3354,6 @@ function buildYouTubeTokenRow(t) {
   return row;
 }
 
-// Connexion initiale : crée ou remplace la ligne.
 async function saveYouTubeTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("youtube_accounts")
@@ -3650,7 +3393,6 @@ async function getValidYouTubeToken(userId) {
 
   return withLock(`youtube-refresh:${userId}`, async () => {
     for (let attempt = 0; attempt < 2; attempt++) {
-      // Relecture APRÈS verrou : un autre traitement a pu renouveler.
       const account = await load();
 
       if (isTokenFresh(account)) return account.access_token;
@@ -3728,8 +3470,6 @@ const YOUTUBE_FRIENDLY_ERRORS = {
     "This video is too long for your YouTube account. Verify your channel to upload longer videos.",
 };
 
-// Transforme une réponse d'erreur Google en HttpError lisible.
-// Ne renvoie JAMAIS un 401 brut (le front le confondrait avec la session Stone).
 function youtubeApiError(status, data) {
   const reason =
     data?.error?.errors?.[0]?.reason ||
@@ -3779,8 +3519,6 @@ function parseYouTubeTags(raw) {
     }
   }
 
-  // Limite YouTube : 500 caractères au total (guillemets autour des tags
-  // contenant un espace + séparateur compris).
   const tags = [];
   let total = 0;
 
@@ -3798,7 +3536,6 @@ function parseYouTubeTags(raw) {
   return tags;
 }
 
-// Valide les champs AVANT tout appel à YouTube.
 function buildYouTubeMetadata(fields) {
   const title = String(fields.title || "").replace(/[<>]/g, "").trim();
 
@@ -3828,7 +3565,6 @@ function buildYouTubeMetadata(fields) {
     );
   }
 
-  // Déclaration « conçue pour les enfants » : choix explicite obligatoire.
   if (fields.made_for_kids !== "true" && fields.made_for_kids !== "false") {
     throw new HttpError(
       400,
@@ -3841,8 +3577,6 @@ function buildYouTubeMetadata(fields) {
     ? fields.privacy_level
     : "private";
 
-  // Programmation : YouTube exige privacyStatus = private + publishAt futur ;
-  // la vidéo devient publique à l'heure choisie.
   let publishAt = null;
 
   if (fields.publish_at) {
@@ -3863,7 +3597,7 @@ function buildYouTubeMetadata(fields) {
   const tags = parseYouTubeTags(fields.tags);
   const categoryId = /^\d{1,3}$/.test(String(fields.category_id || ""))
     ? String(fields.category_id)
-    : "22"; // People & Blogs
+    : "22";
 
   return {
     privacy,
@@ -3885,8 +3619,6 @@ function buildYouTubeMetadata(fields) {
   };
 }
 
-// 1. Ouvre une session d'upload resumable : Google répond avec l'URL
-//    d'upload dans l'en-tête Location.
 async function initYouTubeUpload(accessToken, metadata, size, mimeType) {
   let result;
 
@@ -3926,9 +3658,6 @@ async function initYouTubeUpload(accessToken, metadata, size, mimeType) {
   return location;
 }
 
-// Un PUT sur l'URL resumable.
-//   200 / 201 → terminé (corps = ressource vidéo)
-//   308       → incomplet (en-tête Range = octets reçus)
 async function youtubePut(uploadUrl, headers, body) {
   const { response, data } = await fetchJson(
     uploadUrl,
@@ -3951,8 +3680,6 @@ async function youtubePut(uploadUrl, headers, body) {
   throw error;
 }
 
-// 2. Envoie le fichier par chunks, avec reprise après erreur réseau / 5xx
-//    (on interroge YouTube pour savoir combien d'octets il a reçus).
 async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
   const total = buffer.length;
   let offset = 0;
@@ -3974,7 +3701,6 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
       if (result.done) return result.video;
 
       if (result.next <= offset) {
-        // Aucun progrès : on compte comme un échec pour éviter une boucle infinie.
         throw Object.assign(new Error("No progress"), { status: 500 });
       }
 
@@ -3982,7 +3708,6 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
     } catch (error) {
       const status = error?.status;
 
-      // Erreur client définitive (hors 429) : inutile de réessayer.
       if (status && status < 500 && status !== 429) {
         throw youtubeApiError(status, error.data);
       }
@@ -4000,7 +3725,6 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 
       await delay(failures * 1000);
 
-      // Reprise : combien d'octets YouTube a-t-il réellement reçus ?
       try {
         const query = await youtubePut(
           uploadUrl,
@@ -4020,10 +3744,6 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 // ============================================================
 // CANVA — HELPERS (PKCE + APPELS API)
 // ============================================================
-//
-// PKCE : Canva l'exige. Le code_verifier reste côté serveur (en mémoire,
-// 10 min), indexé par le hash du state. Mono-instance (comme les rate
-// limiters) ; en multi-instance, stocke-le en base à la place.
 
 const canvaPkce = new Map();
 const CANVA_PKCE_TTL_MS = 10 * 60 * 1000;
@@ -4088,7 +3808,6 @@ async function canvaApi(
   const { response, data } = result;
 
   if (!response.ok) {
-    // Jamais de 401 brut : le front le confondrait avec la session Stone.
     const error = new HttpError(
       upstreamStatus(response.status),
       data.message ||
@@ -4114,7 +3833,6 @@ function buildCanvaTokenRow(t) {
     updated_at: new Date().toISOString(),
   };
 
-  // Canva fait tourner les refresh tokens : toujours stocker le nouveau.
   if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
   if (t.scope) row.scope = t.scope;
 
@@ -4280,6 +3998,10 @@ route("POST", "/api/auth/signup", async ({ req, res }) => {
     success: true,
     user: data.user ? formatUser(data.user) : null,
     session: sessionPayload(data.session),
+    // Un nouvel utilisateur n'a jamais la MFA.
+    mfa_enabled: false,
+    mfa_required: false,
+    aal: data.session ? getTokenAal(data.session.access_token) : null,
     message: data.session
       ? "Account created successfully"
       : "Account created. Check your email to confirm your account.",
@@ -4296,7 +4018,6 @@ route("POST", "/api/auth/login", async ({ req, res }) => {
     throw new HttpError(400, "Email and password are required");
   }
 
-  // Limite par compte en plus de la limite par IP (anti brute-force distribué).
   enforce(limiterAccount, `login:${email}`);
 
   const { data, error } = await supabase.auth.signInWithPassword({
@@ -4320,14 +4041,26 @@ route("POST", "/api/auth/login", async ({ req, res }) => {
     );
   }
 
+  const hasVerifiedMfa = userHasVerifiedMfa(data.user);
+  const sessionAal = data.session ? getTokenAal(data.session.access_token) : null;
+  const mfaRequired = hasVerifiedMfa && sessionAal === "aal1";
+
   sendJson(res, 200, {
     success: true,
     user: data.user ? formatUser(data.user) : null,
     session: sessionPayload(data.session),
+    // ── MFA ──
+    // mfa_enabled : au moins un facteur vérifié (TOTP / passkey)
+    // mfa_required: MFA activée mais session encore en AAL1 → le frontend
+    //               doit afficher le challenge avant d'accéder aux
+    //               opérations sensibles.
+    // aal         : niveau courant (aal1 / aal2 / null si pas de session)
+    mfa_enabled: hasVerifiedMfa,
+    mfa_required: mfaRequired,
+    aal: sessionAal,
   });
 });
 
-// Cette route est un oracle de credentials : même limites que le login.
 route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   const body = await getJsonBody(req);
 
@@ -4358,25 +4091,23 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
     throw new HttpError(401, "Invalid login credentials", "INVALID_CREDENTIALS");
   }
 
+  const hasVerifiedMfa = userHasVerifiedMfa(data.user);
+  const sessionAal = data.session ? getTokenAal(data.session.access_token) : null;
+
   sendJson(res, 200, {
     success: true,
     verified: Boolean(data.user?.email_confirmed_at),
     session: sessionPayload(data.session),
+    mfa_enabled: hasVerifiedMfa,
+    mfa_required: hasVerifiedMfa && sessionAal === "aal1",
+    aal: sessionAal,
   });
 });
 
 // ------------------------------------------------------------
 // MOT DE PASSE OUBLIÉ — étape 1 : envoi de l'email
 // ------------------------------------------------------------
-//
-// POST /api/auth/forgot-password   { email }
-//
-// - La réponse est IDENTIQUE que le compte existe ou non (pas d'énumération
-//   des comptes). Seuls le format de l'email et la limite de débit peuvent
-//   produire une erreur.
-// - Limites : 10 requêtes / 15 min par IP (STRICT_PATHS) + 3 demandes /
-//   15 min par adresse email (limiterPasswordReset).
-// - Le lien reçu par email redirige vers PASSWORD_RESET_REDIRECT_URL.
+
 route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
   const body = await getJsonBody(req);
 
@@ -4393,8 +4124,6 @@ route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
   });
 
   if (error) {
-    // Limite d'envoi d'emails atteinte côté Supabase : le client peut
-    // réessayer plus tard (ne révèle rien sur l'existence du compte).
     if (error.status === 429) {
       throw new HttpError(
         429,
@@ -4403,8 +4132,6 @@ route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
       );
     }
 
-    // Toute autre erreur (SMTP, compte inexistant...) est seulement
-    // journalisée : répondre différemment révélerait si l'email existe.
     console.error(
       `[${requestId}] forgot-password: ${error.status || ""} ${error.message}`
     );
@@ -4420,17 +4147,7 @@ route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
 // ------------------------------------------------------------
 // MOT DE PASSE OUBLIÉ — étape 2 : nouveau mot de passe
 // ------------------------------------------------------------
-//
-// POST /api/auth/reset-password
-//   { password, access_token }   ← jetons lus dans le hash de l'URL
-//   ou
-//   { password, token_hash }     ← si le template d'email utilise
-//                                   {{ .TokenHash }} (flux « token_hash »)
-//
-// L'access_token DOIT provenir d'une session de récupération (voir
-// isRecoverySessionToken) : un token de connexion ordinaire est refusé.
-// Après le changement, TOUTES les sessions de l'utilisateur sont révoquées
-// (un attaquant éventuellement connecté perd l'accès).
+
 route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   const body = await getJsonBody(req);
 
@@ -4473,7 +4190,6 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   if (tokenHash) {
     if (tokenHash.length > 512) throw invalidLink();
 
-    // verifyOtp consomme le token (usage unique) et ouvre la session.
     const { data, error } = await supabase.auth.verifyOtp({
       token_hash: tokenHash,
       type: "recovery",
@@ -4486,8 +4202,6 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   } else {
     if (accessToken.length > 4096) throw invalidLink();
 
-    // Un token de connexion ordinaire ne doit pas permettre de changer le
-    // mot de passe sans connaître l'ancien.
     if (!isRecoverySessionToken(accessToken)) throw invalidLink();
 
     const {
@@ -4506,8 +4220,6 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   const { error: updateError } = await adminUpdateUser(user.id, { password });
 
   if (updateError) {
-    // Règles de mot de passe de Supabase (même mot de passe, trop faible...) :
-    // le message est destiné à l'utilisateur.
     if (
       updateError.code === "same_password" ||
       updateError.code === "weak_password"
@@ -4522,7 +4234,6 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
     throw dbError("auth.admin.updateUserById(password)", updateError);
   }
 
-  // Révoque toutes les sessions existantes (le lien de récupération inclus).
   try {
     await supabaseAdmin.auth.admin.signOut(sessionToken, "global");
   } catch (signOutError) {
@@ -4541,7 +4252,6 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
 });
 
 // Google / GitHub : URL d'autorisation.
-// redirectTo est validé avec sanitizeRedirectTo() (origine autorisée).
 function registerOAuthLoginRoute(provider, extraOptions) {
   route("POST", `/api/auth/${provider}/url`, async ({ req, res }) => {
     const body = await getJsonBody(req).catch(() => ({}));
@@ -4614,6 +4324,10 @@ route("POST", "/api/auth/refresh", async ({ req, res }) => {
   sendJson(res, 200, {
     success: true,
     session: sessionPayload(data.session),
+    // Le refresh conserve l'AAL de la session d'origine : un client peut
+    // vérifier si son token a été dégradé (ne devrait pas arriver, mais
+    // ceinture + bretelles).
+    aal: getTokenAal(data.session.access_token),
   });
 });
 
@@ -4639,6 +4353,45 @@ route(
     if (error) throw error;
 
     sendJson(res, 200, { success: true, message: "Verification email sent" });
+  },
+  { auth: true }
+);
+
+// ============================================================
+// ROUTES — MFA (statut AAL + facteurs)
+// ============================================================
+//
+// Utilisé par le frontend pour savoir où il en est (facultatif : il peut
+// aussi interroger Supabase directement via needsMfaChallenge()). Utile
+// pour les clients API / mobiles qui n'embarquent pas supabase-js.
+//
+//   aal                 : niveau courant (aal1 / aal2 / null sans JWT)
+//   next_aal            : niveau attendu (aal2 si MFA activée)
+//   mfa_enabled         : au moins un facteur vérifié
+//   requires_challenge  : MFA activée mais session en AAL1
+//   factors             : liste des facteurs VÉRIFIÉS uniquement
+route(
+  "GET",
+  "/api/auth/mfa/status",
+  ({ res, user, token }) => {
+    const factors = verifiedFactorsOf(user);
+    const aal = getTokenAal(token) || "aal1";
+    const hasMfa = factors.length > 0;
+    const requiresChallenge = hasMfa && aal === "aal1";
+
+    sendJson(res, 200, {
+      success: true,
+      aal,
+      next_aal: requiresChallenge ? "aal2" : aal,
+      mfa_enabled: hasMfa,
+      requires_challenge: requiresChallenge,
+      factors: factors.map((f) => ({
+        id: f.id,
+        type: f.factor_type,
+        friendly_name: f.friendly_name || null,
+        created_at: f.created_at || null,
+      })),
+    });
   },
   { auth: true }
 );
@@ -4673,7 +4426,6 @@ route(
 
     const metadata = { ...(user.user_metadata || {}) };
 
-    // Limitation des longueurs : user_metadata est borné côté Supabase.
     const limitedString = (value, max) => String(value ?? "").slice(0, max);
 
     if (body.firstName !== undefined || body.first_name !== undefined) {
@@ -4700,9 +4452,6 @@ route(
         1000
       );
 
-      // Uniquement une image de NOTRE bucket, dans le dossier de
-      // l'utilisateur (ou vide pour retirer l'avatar). Empêche les
-      // URLs arbitraires (pixels de tracking, javascript:, etc.).
       const ownPrefix = `${SUPABASE_BASE_URL}/storage/v1/object/public/${AVATAR_BUCKET}/${user.id}/`;
 
       if (avatarUrl && !avatarUrl.startsWith(ownPrefix)) {
@@ -4723,12 +4472,18 @@ route(
   { auth: true }
 );
 
-// NOTE : signInWithPassword pour vérifier le mot de passe courant
-// crée une session Supabase supplémentaire (impact limité).
+// Changement de mot de passe : nécessite l'AAL2 si la MFA est activée.
+// (Un token AAL1 volé ne suffit pas : le vrai mot de passe actuel est
+// toujours exigé, mais on va plus loin en exigeant que le second facteur
+// ait été vérifié dans CETTE session.)
 route(
   ["PUT", "POST"],
   "/api/user/password",
-  async ({ req, res, user }) => {
+  async ({ req, res, user, token }) => {
+    // → 403 MFA_REQUIRED si MFA activée mais session en AAL1.
+    //   Le frontend doit afficher le challenge MFA puis rejouer.
+    requireAal2(user, token);
+
     const body = await getJsonBody(req);
 
     const currentPassword = String(
@@ -4758,7 +4513,6 @@ route(
       throw new HttpError(400, "No email associated with this account");
     }
 
-    // Un token volé ne doit pas permettre de deviner le mot de passe actuel.
     enforce(limiterAccount, `password:${user.id}`);
 
     const { error: verifyError } = await supabase.auth.signInWithPassword({
@@ -4782,8 +4536,6 @@ route(
   { auth: true }
 );
 
-// Le type est validé par MAGIC BYTES (pas par le Content-Type client).
-// Whitelist : PNG / JPEG / WebP / GIF.
 route(
   "POST",
   "/api/user/avatar",
@@ -4816,7 +4568,6 @@ route(
       );
     }
 
-    // Extension dérivée du type RÉEL, pas du nom de fichier client.
     const storagePath = `${user.id}/${crypto.randomUUID()}.${AVATAR_EXTENSIONS[sniffedType]}`;
 
     const { error: storageError } = await supabaseAdmin.storage
@@ -4875,14 +4626,6 @@ route(
 // ============================================================
 // ROUTES — STRIPE
 // ============================================================
-//
-// Retour Stripe :
-//   - checkout success → ${APP_URL}/#/account?checkout=success&session_id=...
-//   - checkout cancel  → ${APP_URL}/#/pricing?checkout=cancel
-//   - portal return    → ${APP_URL}/#/account
-// Les query params sont dans le HASH : le frontend les lit via
-// readCheckoutReturn() (services/stripe.ts) et nettoie l'URL avec
-// clearCheckoutParams() pour éviter de rejouer la redirection au refresh.
 
 route(
   "POST",
@@ -4899,8 +4642,6 @@ route(
       : undefined;
 
     if (!priceId) {
-      // Message détaillé : impossible de savoir si c'est le plan, la
-      // période ou la variable d'env qui manque — on l'indique.
       const knownPlan = Object.hasOwn(STRIPE_PRICES, plan);
       throw new HttpError(
         400,
@@ -4955,14 +4696,6 @@ route(
   { auth: true }
 );
 
-// ============================================================
-// [MODIF 2c] GET /api/stripe/subscription — plan_key + plan_name
-// ============================================================
-//
-// Interroge Stripe en direct puis resynchronise le compte si besoin :
-// l'abonnement apparaît immédiatement après le checkout, même si le
-// webhook est en retard. Un échec de resynchronisation est journalisé
-// (la réponse reste celle de Stripe, source de vérité).
 route(
   "GET",
   "/api/stripe/subscription",
@@ -5025,10 +4758,6 @@ route(
   { auth: true }
 );
 
-// Idempotence : un événement déjà traité (même id) n'est pas rejoué ; deux
-// livraisons simultanées du même événement sont fusionnées. L'état est
-// ensuite toujours relu depuis Stripe et les événements plus anciens que
-// le dernier appliqué sont ignorés (voir processStripeEvent).
 const processedStripeEvents = createSeenCache(10_000, 24 * 60 * 60 * 1000);
 
 route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
@@ -5042,8 +4771,6 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
     throw new HttpError(400, "Missing stripe-signature");
   }
 
-  // Corps BRUT (octets exacts reçus) : indispensable à la signature.
-  // Une erreur de lecture (413, requête interrompue) garde son vrai statut.
   const rawBody = await getRawBody(req);
 
   let event;
@@ -5067,8 +4794,6 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
     return;
   }
 
-  // En cas d'erreur, l'exception remonte → 500 → Stripe retentera
-  // l'événement (il n'est marqué « traité » qu'après succès).
   await withLock(`stripe-event:${event.id}`, () => processStripeEvent(event));
 
   processedStripeEvents.add(event.id);
@@ -5095,7 +4820,6 @@ route(
     sendJson(res, 200, {
       success: true,
       url: `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`,
-      // Le frontend peut afficher l'avertissement sandbox AVANT la popup.
       capabilities: tiktokCapabilities(),
     });
   },
@@ -5125,9 +4849,6 @@ route(
             },
           });
         } catch (error) {
-          // En sandbox, seuls les « Sandbox testers » déclarés dans le
-          // portail peuvent autoriser l'app : on remonte un message
-          // actionnable plutôt qu'un access_denied brut.
           if (
             error instanceof HttpError &&
             (error.code === "access_denied" ||
@@ -5178,15 +4899,10 @@ route(
   { auth: true }
 );
 
-// [FIX] Route réécrite : `connected` reflète une connexion UTILISABLE
-// (jeton mort → false + needs_reconnect). Les pannes transitoires ne
-// cassent plus le cache frontend.
 route(
   "GET",
   "/api/tiktok/status",
   async ({ res, url, user }) => {
-    // ?refresh=1 : le frontend a détecté une image cassée → on ignore
-    // le throttle normal (mais on respecte l'anti-martèlement court).
     const force = url.searchParams.get("refresh") === "1";
 
     const { account, needsReconnect } = await refreshTikTokProfile(user.id, {
@@ -5197,11 +4913,7 @@ route(
 
     sendJson(res, 200, {
       success: true,
-      // « connected » = connexion UTILISABLE. Un jeton mort → false :
-      // le frontend existant efface son cache et propose la reconnexion.
       connected: usable,
-      // Signal explicite pour les frontends qui veulent distinguer
-      // « jamais connecté » de « session expirée ».
       needs_reconnect: needsReconnect || undefined,
       account: usable
         ? {
@@ -5210,7 +4922,6 @@ route(
             scope: account.scope,
           }
         : null,
-      // Le frontend affiche le bandeau sandbox à partir de là.
       capabilities: tiktokCapabilities(),
     });
   },
@@ -5245,7 +4956,6 @@ route(
 
       if (error) throw error;
 
-      // [FIX] Nettoie les throttles côté mémoire pour cet utilisateur.
       clearTikTokProfileThrottle(user.id);
     }
 
@@ -5254,7 +4964,6 @@ route(
   { auth: true }
 );
 
-// creator_info/query est un POST : un body JSON (même vide) est requis.
 route(
   "GET",
   "/api/tiktok/creator-info",
@@ -5275,10 +4984,6 @@ route(
   { auth: true }
 );
 
-// Upload de fichier. Ordre important pour la mémoire :
-//   1. vérifications bon marché (token TikTok, taille annoncée)
-//   2. acquisition d'un slot de concurrence
-//   3. SEULEMENT ENSUITE lecture du corps (jusqu'à 100 Mo en RAM)
 route(
   "POST",
   "/api/tiktok/publish",
@@ -5293,7 +4998,6 @@ route(
       );
     }
 
-    // Échoue vite si le compte n'est pas connecté / expiré.
     const accessToken = await getValidTikTokToken(user.id);
 
     await acquireVideoSlot();
@@ -5327,8 +5031,6 @@ route(
         throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
       }
 
-      // Sandbox : "direct" reste possible (SELF_ONLY forcé par
-      // resolvePrivacy) ; FORCE_DRAFT bascule tout en brouillon.
       const requestedMode = upload.fields.mode === "draft" ? "draft" : "direct";
       const mode = resolveVideoMode(requestedMode);
       const chunking = computeChunking(upload.buffer.length);
@@ -5357,8 +5059,6 @@ route(
       sendJson(res, 200, {
         success: true,
         mode,
-        // mode_demandé ≠ mode_effectif quand FORCE_DRAFT est actif :
-        // le frontend peut informer l'utilisateur.
         requested_mode: requestedMode,
         forced_privacy_level:
           mode === "direct" ? resolvePrivacy(upload.fields.privacy_level) : null,
@@ -5407,9 +5107,6 @@ route(
   { auth: true }
 );
 
-// Photo(s) : 1 image = post photo, 2 à 35 images = carrousel.
-// EN SANDBOX : mode brouillon forcé (MEDIA_UPLOAD) — TikTok refuse
-// les posts photos DIRECT_POST des apps non auditées.
 route(
   "POST",
   "/api/tiktok/publish/photos",
@@ -5450,7 +5147,6 @@ route(
 
     const accessToken = await getValidTikTokToken(user.id);
 
-    // Même sémaphore que les vidéos : borne la mémoire utilisée.
     await acquireVideoSlot();
 
     let storedNames = [];
@@ -5510,16 +5206,10 @@ route(
 
       const fields = upload.fields;
       const requestedMode = fields.mode === "draft" ? "draft" : "direct";
-      // SANDBOX : resolvePhotoMode() force "draft" tant que l'app
-      // n'est pas auditée (les photos DIRECT_POST sont refusées).
       const mode = resolvePhotoMode(requestedMode);
 
-      // Validé AVANT de stocker les photos (ex. contenu de marque en privé).
       const postInfo = buildPhotoPostInfo(mode, fields);
 
-      // Le frontend envoie cover_index à partir de 1 (1 = première photo).
-      // TikTok attend photo_cover_index à partir de 0 : on convertit et on
-      // borne dans [0, nombre de photos - 1].
       const requestedCover = Number.parseInt(fields.cover_index, 10);
       const coverIndex = Math.min(
         Math.max((Number.isFinite(requestedCover) ? requestedCover : 1) - 1, 0),
@@ -5527,13 +5217,12 @@ route(
       );
 
       storedNames = await storeTikTokPhotos(photos);
-      upload = null; // libère les buffers
+      upload = null;
 
       const imageUrls = storedNames.map(
         (name) => `${PUBLIC_API_URL}/api/media/tiktok/${name}`
       );
 
-      // Vérifie que TikTok pourra réellement télécharger TOUTES les images.
       await probePublicPhotos(imageUrls);
 
       const init = await initTikTokPhotoPublish(
@@ -5544,14 +5233,10 @@ route(
         coverIndex
       );
 
-      // Les fichiers restent disponibles : TikTok les télécharge de
-      // façon asynchrone. Le balayage périodique les supprime ensuite.
       sendJson(res, 200, {
         success: true,
         mode,
         requested_mode: requestedMode,
-        // Le frontend affiche : « Mode sandbox : tes photos partent en
-        // brouillon sur TikTok. »
         sandbox: TIKTOK_SANDBOX,
         publish_id: init.data.publish_id,
         photo_count: photos.length,
@@ -5572,7 +5257,6 @@ route(
   async ({ res, url, user }) => {
     const publishId = url.searchParams.get("publish_id");
 
-    // Les publish_id TikTok contiennent parfois « ~ » ; 64 caractères max.
     if (!isValidTikTokPublishId(publishId)) {
       throw new HttpError(400, "Missing or invalid publish_id");
     }
@@ -5592,20 +5276,10 @@ route(
 // ============================================================
 // ROUTES — TIKTOK WEBHOOK
 // ============================================================
-//
-// POST /api/tiktok/webhook  → URL à déclarer dans le portail TikTok for Developers
-// (≠ TIKTOK_REDIRECT_URI, qui est l'URL de retour OAuth du FRONTEND).
-//
-// - En-tête  : TikTok-Signature: t=<timestamp>,s=<signature>
-// - Signature: HMAC-SHA256(client_secret, "<timestamp>.<corps brut>"), en hexadécimal
-// - TikTok exige une réponse 200 ; sinon il réessaie jusqu'à 72 h (livraison
-//   "au moins une fois" : le traitement doit être idempotent).
 
 const MAX_TIKTOK_WEBHOOK_BODY = 64 * 1024;
 const TIKTOK_WEBHOOK_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const TIKTOK_WEBHOOK_DEDUPE_MAX = 5_000;
-// Marge (s) appliquée à la date de l'événement pour ne pas supprimer une
-// connexion rétablie APRÈS la révocation.
 const TIKTOK_REVOKE_SKEW_SEC = 5;
 
 const processedTikTokWebhooks = createSeenCache(
@@ -5613,7 +5287,6 @@ const processedTikTokWebhooks = createSeenCache(
   TIKTOK_WEBHOOK_DEDUPE_TTL_MS
 );
 
-// "t=1633174587,s=<64 hex>" -> { timestamp, signature } ou null.
 function parseTikTokSignatureHeader(header) {
   if (typeof header !== "string" || header.length > 512) return null;
 
@@ -5675,12 +5348,6 @@ function verifyTikTokWebhookSignature(
   return { ok: true, timestamp: Number(parsed.timestamp) };
 }
 
-// Événement "authorization.removed" : l'utilisateur TikTok a retiré l'accès.
-// Les tokens sont déjà révoqués côté TikTok : on supprime l'association.
-// Sécurité / idempotence :
-//  - le compte est identifié par open_id, jamais par autre chose
-//  - on ne supprime que les lignes dont updated_at est antérieur à l'événement
-//  - rejouer l'événement est sans effet (0 ligne supprimée)
 async function handleTikTokAuthorizationRemoved(payload, requestId) {
   const openId = payload.user_openid;
 
@@ -5718,7 +5385,6 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
     throw new Error("tiktok_accounts cleanup failed: " + error.message);
   }
 
-  // [FIX] Nettoie les throttles mémoire pour les utilisateurs concernés.
   if (Array.isArray(data)) {
     for (const row of data) {
       if (row?.user_id) clearTikTokProfileThrottle(row.user_id);
@@ -5733,8 +5399,6 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
   );
 }
 
-// Événements documentés mais sans action pour cette application
-// (Video Kit / Data Portability) : accusés de réception uniquement.
 const TIKTOK_ACK_ONLY_EVENTS = new Set([
   "video.upload.failed",
   "video.publish.completed",
@@ -5742,10 +5406,8 @@ const TIKTOK_ACK_ONLY_EVENTS = new Set([
 ]);
 
 route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
-  // 1. Corps BRUT : la signature porte sur les octets exacts reçus.
   const rawBody = await readBody(req, MAX_TIKTOK_WEBHOOK_BODY);
 
-  // 2. Authenticité, AVANT tout parsing JSON.
   const check = verifyTikTokWebhookSignature(
     rawBody,
     req.headers["tiktok-signature"],
@@ -5757,7 +5419,6 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
     throw new HttpError(401, "Invalid webhook signature", "INVALID_SIGNATURE");
   }
 
-  // 3. Structure du message (signé, donc émis par TikTok).
   let payload;
 
   try {
@@ -5781,14 +5442,11 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
   }
 
   if (typeof payload.client_key === "string" && payload.client_key !== TIKTOK_CLIENT_KEY) {
-    // Signé avec notre secret mais destiné à une autre clé : on ignore (200
-    // pour éviter des retries inutiles).
     console.warn("[" + requestId + "] [tiktok:webhook] client_key inattendu : ignoré");
     sendJson(res, 200, { received: true, ignored: true });
     return;
   }
 
-  // 4. Événement déjà traité (livraison "au moins une fois").
   const dedupeKey = sha256(rawBody.toString("utf8"));
 
   if (processedTikTokWebhooks.has(dedupeKey)) {
@@ -5796,7 +5454,6 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
     return;
   }
 
-  // 5. Traitement. Une exception => 500 => TikTok réessaiera (jusqu'à 72 h).
   if (eventName === "authorization.removed") {
     await handleTikTokAuthorizationRemoved(payload, requestId);
   } else if (TIKTOK_ACK_ONLY_EVENTS.has(eventName)) {
@@ -5833,9 +5490,6 @@ route(
   { auth: true }
 );
 
-// L'échange du code utilise l'endpoint OAuth de l'environnement choisi
-// (PINTEREST_OAUTH_BASE) ; le compte est enregistré avec cet environnement
-// (api_env) pour ne jamais mélanger jetons sandbox et production.
 route(
   "POST",
   "/api/pinterest/auth/callback",
@@ -5894,9 +5548,6 @@ route(
   { auth: true }
 );
 
-// Connexion par token manuel (DEV / SANDBOX uniquement).
-// Le jeton est validé contre l'API de l'environnement ACTIF : il est donc
-// enregistré avec le bon api_env.
 route(
   "POST",
   "/api/pinterest/auth/token",
@@ -5951,8 +5602,6 @@ route(
   { auth: true }
 );
 
-// Un compte relié dans un AUTRE environnement (ou avant la migration
-// api_env) n'est pas présenté comme connecté : needs_reconnect = true.
 route(
   "GET",
   "/api/pinterest/status",
@@ -6020,9 +5669,6 @@ route(
   { auth: true }
 );
 
-// Si le lookup de chaîne ÉCHOUE (erreur API) ou s'il n'y a pas de
-// chaîne, on REFUSE la connexion (et on révoque l'accès) au lieu de
-// sauvegarder silencieusement un compte sans chaîne.
 route(
   "POST",
   "/api/youtube/auth/callback",
@@ -6094,15 +5740,6 @@ route(
   { auth: true }
 );
 
-// ---- Publication d'une vidéo YouTube ------------------------------------
-//
-// multipart/form-data :
-//   video (fichier) · title · description · tags (JSON ou "a,b")
-//   privacy_level (public|unlisted|private) · made_for_kids ("true"|"false")
-//   publish_at (ISO 8601, optionnel → programmation) · category_id (optionnel)
-//
-// Même ordre que TikTok pour la mémoire : vérifications bon marché,
-// slot de concurrence, puis seulement lecture du corps.
 route(
   "POST",
   "/api/youtube/publish",
@@ -6117,7 +5754,6 @@ route(
       );
     }
 
-    // Échoue vite si la chaîne n'est pas connectée / expirée.
     const accessToken = await getValidYouTubeToken(user.id);
 
     await acquireVideoSlot();
@@ -6151,7 +5787,6 @@ route(
         throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
       }
 
-      // Validé AVANT tout appel à YouTube.
       const { privacy, publishAt, metadata } = buildYouTubeMetadata(upload.fields);
 
       const uploadUrl = await initYouTubeUpload(
@@ -6173,7 +5808,6 @@ route(
 
       const actualPrivacy = video.status?.privacyStatus || null;
 
-      // Projet Google API non vérifié : YouTube force les vidéos en privé.
       const privacyLocked =
         !publishAt && privacy !== "private" && actualPrivacy === "private";
 
@@ -6209,7 +5843,6 @@ route(
             avatar_url: account.avatar_url,
             custom_url: account.custom_url,
             scope: account.scope,
-            // false → l'utilisateur doit reconnecter YouTube (scope upload absent)
             can_publish: String(account.scope || "")
               .split(/[\s,]+/)
               .includes(YOUTUBE_UPLOAD_SCOPE),
@@ -6379,8 +6012,6 @@ route(
   { auth: true }
 );
 
-// Crée un design vide aux dimensions choisies (40 à 8000 px) et renvoie l'URL
-// de l'éditeur Canva.
 route(
   "POST",
   "/api/canva/designs",
@@ -6421,7 +6052,6 @@ route(
   { auth: true }
 );
 
-// Exporte le design en PNG et renvoie les pages en base64.
 const CANVA_EXPORT_MAX_PAGES = 10;
 const CANVA_EXPORT_MAX_TOTAL = 30 * 1024 * 1024;
 
@@ -6553,16 +6183,12 @@ const server = createServer(async (req, res) => {
       `http://${req.headers.host || `localhost:${PORT}`}`
     );
 
-    // Normalise le trailing slash ("/api/user/" → "/api/user").
     const pathname =
       url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
 
     routeLabel = `${req.method} ${pathname}`;
 
     if (req.method === "GET" || req.method === "HEAD") {
-      // Fichier de vérification TikTok (préfixe d'URL /api/media/tiktok/).
-      // Doit passer AVANT la route des médias : sa regex n'accepte que des
-      // noms hexadécimaux.
       let decodedPath = pathname;
 
       try {
@@ -6581,7 +6207,6 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      // Images servies à TikTok (publique, nom aléatoire non devinable).
       const mediaMatch = pathname.match(
         /^\/api\/media\/tiktok\/([a-f0-9]{32}\.(?:jpg|webp))$/
       );
@@ -6593,11 +6218,6 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // ----------------------------------------------------------
-    // Rate limiting par IP, avant toute logique métier.
-    // Exemptés : webhooks Stripe (serveur → serveur, signature
-    // vérifiée) et health check.
-    // ----------------------------------------------------------
     const isStripeWebhook =
       req.method === "POST" && pathname === "/api/stripe/webhook";
     const isHealth = req.method === "GET" && pathname === "/api/health";
@@ -6611,16 +6231,12 @@ const server = createServer(async (req, res) => {
       enforce(pickLimiter(pathname), getClientIp(req));
     }
 
-    // ----------------------------------------------------------
-    // Garde « provider non configuré »
-    // ----------------------------------------------------------
     for (const [prefix, enabled, name] of providerGuards) {
       if (pathname.startsWith(prefix) && !enabled) {
         throw new HttpError(500, `${name} is not configured`);
       }
     }
 
-    // Pinterest : sandbox et production ne se mélangent jamais.
     if (pathname.startsWith("/api/pinterest/") && pinterestConfigError) {
       console.error(`[${requestId}] Pinterest config: ${pinterestConfigError}`);
       throw new HttpError(
@@ -6630,9 +6246,6 @@ const server = createServer(async (req, res) => {
       );
     }
 
-    // ----------------------------------------------------------
-    // Résolution de la route
-    // ----------------------------------------------------------
     const entry = routes.get(`${req.method} ${pathname}`);
 
     if (!entry) {
@@ -6691,8 +6304,6 @@ const server = createServer(async (req, res) => {
   }
 });
 
-// Timeouts : keepAlive > délai d'inactivité des proxies (Railway ≈ 60 s)
-// pour éviter les 502 sporadiques ; requestTimeout borne les uploads lents.
 server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
 server.requestTimeout = 5 * 60_000;
@@ -6704,6 +6315,7 @@ server.listen(PORT, () => {
   console.log(`  Token encryption: ${TOKEN_ENCRYPTION_KEY ? "on" : "off"}`);
   console.log(`  Rate limits     : strict 10/15min · oauth 30/10min · api 240/min`);
   console.log(`  Password reset  : redirect ${PASSWORD_RESET_REDIRECT_URL} · 3 demandes/15min par email`);
+  console.log(`  MFA             : AAL2 requis pour PUT /api/user/password si MFA activée`);
   console.log(`  Video uploads   : max ${MAX_VIDEO_UPLOADS} concurrent(s)`);
   console.log(
     `  TikTok mode     : ${
@@ -6770,7 +6382,6 @@ server.listen(PORT, () => {
     setInterval(sweepTikTokMedia, 15 * 60 * 1000).unref?.();
   }
 
-  // La colonne api_env (migration) est indispensable pour relier Pinterest.
   if (pinterestUsable) {
     supabaseAdmin
       .from("pinterest_accounts")
@@ -6789,7 +6400,6 @@ server.listen(PORT, () => {
       );
   }
 
-  // Canva : vérifie que la table existe (sinon message explicite).
   if (canvaEnabled) {
     supabaseAdmin
       .from("canva_accounts")
@@ -6846,10 +6456,8 @@ function shutdown(signal, exitCode = 0) {
     process.exit(exitCode);
   });
 
-  // Ferme tout de suite les connexions keep-alive inactives.
   server.closeIdleConnections?.();
 
-  // Force l'arrêt si des connexions persistent.
   setTimeout(() => {
     console.error("Arrêt forcé : connexions encore ouvertes.");
     process.exit(1);
@@ -6866,4 +6474,4 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (error) => {
   console.error("Uncaught exception:", error);
   shutdown("uncaughtException", 1);
-}); 
+});
