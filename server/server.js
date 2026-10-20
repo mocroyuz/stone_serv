@@ -21,6 +21,11 @@
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
+//                    - RECOVERY_CODE_PEPPER (32+ caractères aléatoires)
+//                    - MFA_VERIFIED_SESSION_TTL_MINUTES (défaut : 15)
+//                    - WEBAUTHN_RP_ID, WEBAUTHN_RP_NAME, WEBAUTHN_ORIGIN
+//                      (défauts : stone-prod.vercel.app / Stone /
+//                      https://stone-prod.vercel.app)
 //                    - le frontend n'embarque PAS @supabase/supabase-js
 //                    - le backend proxifie /auth/v1/factors* de Supabase Auth
 //                    - ⚠️ Supabase Auth n'expose PAS `GET /auth/v1/factors` :
@@ -28,9 +33,9 @@
 //                    - après un verify, Supabase renvoie une session AAL2
 //                      que le backend transmet au frontend pour qu'il la
 //                      stocke (remplace la session AAL1)
-//                    - les opérations sensibles (PUT /api/user/password,
-//                      suppression d'un facteur vérifié) exigent AAL2 via
-//                      requireAal2()
+//                    - les opérations sensibles exigent AAL2 via requireAal2()
+//                    - un code de secours valide vérifie le session_id du JWT
+//                      pendant la fenêtre configurée
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -39,6 +44,12 @@ import { createServer } from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { createClient } from "@supabase/supabase-js";
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+} from "@simplewebauthn/server";
 import busboy from "busboy";
 import Stripe from "stripe";
 
@@ -97,12 +108,13 @@ const IS_PRODUCTION = env("NODE_ENV") === "production";
 // ============================================================
 
 class HttpError extends Error {
-  constructor(status, message, code, headers) {
+  constructor(status, message, code, headers, retryAfter) {
     super(message);
     this.name = "HttpError";
     this.status = status;
     this.code = code;
     this.headers = headers;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -241,6 +253,38 @@ const PORT = Number(env("PORT") || 3002);
 const SUPABASE_URL = env("SUPABASE_URL");
 const SUPABASE_ANON_KEY = env("SUPABASE_ANON_KEY");
 const SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY");
+const RECOVERY_CODE_PEPPER = env("RECOVERY_CODE_PEPPER");
+const WEBAUTHN_RP_ID = env("WEBAUTHN_RP_ID") || "stone-prod.vercel.app";
+const WEBAUTHN_RP_NAME = env("WEBAUTHN_RP_NAME") || "Stone";
+const WEBAUTHN_ORIGIN = (
+  env("WEBAUTHN_ORIGIN") || "https://stone-prod.vercel.app"
+).replace(/\/+$/, "");
+const MFA_VERIFIED_SESSION_TTL_MINUTES = Number(
+  env("MFA_VERIFIED_SESSION_TTL_MINUTES") || 15
+);
+
+if (
+  !Number.isSafeInteger(MFA_VERIFIED_SESSION_TTL_MINUTES) ||
+  MFA_VERIFIED_SESSION_TTL_MINUTES < 1 ||
+  MFA_VERIFIED_SESSION_TTL_MINUTES > 1440
+) {
+  throw new Error("MFA_VERIFIED_SESSION_TTL_MINUTES must be an integer between 1 and 1440");
+}
+
+const WEBAUTHN_ORIGIN_URL = new URL(WEBAUTHN_ORIGIN);
+if (
+  !WEBAUTHN_RP_ID ||
+  WEBAUTHN_RP_ID.length > 253 ||
+  WEBAUTHN_RP_ID.includes("/") ||
+  WEBAUTHN_RP_NAME.length === 0 ||
+  WEBAUTHN_RP_NAME.length > 64 ||
+  WEBAUTHN_ORIGIN_URL.origin !== WEBAUTHN_ORIGIN ||
+  WEBAUTHN_ORIGIN_URL.hostname !== WEBAUTHN_RP_ID ||
+  (WEBAUTHN_ORIGIN_URL.protocol !== "https:" &&
+    !["localhost", "127.0.0.1"].includes(WEBAUTHN_ORIGIN_URL.hostname))
+) {
+  throw new Error("Invalid WebAuthn RP or origin configuration");
+}
 
 const DEFAULT_OAUTH_REDIRECT =
   env("OAUTH_REDIRECT_URL") || "http://localhost:5173/";
@@ -728,6 +772,60 @@ function getClientIp(req) {
   return req.socket?.remoteAddress || "unknown";
 }
 
+function authAttemptKey(subjectType, subject, ip) {
+  return crypto
+    .createHmac("sha256", SUPABASE_SERVICE_ROLE_KEY)
+    .update(`${subjectType}\0${subject}\0${ip}`)
+    .digest("hex");
+}
+
+function authAttemptRateLimitError(retryAfter) {
+  return new HttpError(
+    429,
+    "Too many failed authentication attempts. Please try again later.",
+    "RATE_LIMITED",
+    { "Retry-After": String(retryAfter) },
+    retryAfter
+  );
+}
+
+async function checkAuthAttemptLimit(attemptKey) {
+  const { data, error } = await supabaseAdmin.rpc("auth_attempts_check", {
+    p_attempt_key: attemptKey,
+  });
+
+  if (error) throw dbError("auth_attempts_check", error);
+
+  const state = Array.isArray(data) ? data[0] : null;
+  if (!state || typeof state.allowed !== "boolean") {
+    throw dbError("auth_attempts_check", new Error("Invalid RPC response"));
+  }
+
+  if (!state.allowed) {
+    const retryAfter = Number(state.retry_after);
+    if (!Number.isSafeInteger(retryAfter) || retryAfter < 1) {
+      throw dbError("auth_attempts_check", new Error("Invalid retry interval"));
+    }
+    throw authAttemptRateLimitError(retryAfter);
+  }
+}
+
+async function recordAuthAttemptFailure(attemptKey) {
+  const { error } = await supabaseAdmin.rpc("auth_attempts_record_failure", {
+    p_attempt_key: attemptKey,
+  });
+
+  if (error) throw dbError("auth_attempts_record_failure", error);
+}
+
+async function resetAuthAttemptFailures(attemptKey) {
+  const { error } = await supabaseAdmin.rpc("auth_attempts_reset_success", {
+    p_attempt_key: attemptKey,
+  });
+
+  if (error) throw dbError("auth_attempts_reset_success", error);
+}
+
 function createRateLimiter({ windowMs, max, label, maxKeys = 50_000 }) {
   const hits = new Map();
 
@@ -799,7 +897,8 @@ function enforce(limiter, key) {
       429,
       "Too many requests. Please try again later.",
       "RATE_LIMITED",
-      retryAfterSec ? { "Retry-After": String(retryAfterSec) } : undefined
+      retryAfterSec ? { "Retry-After": String(retryAfterSec) } : undefined,
+      retryAfterSec
     );
   }
 }
@@ -1544,6 +1643,15 @@ function getTokenAal(token) {
   return typeof payload?.aal === "string" ? payload.aal : null;
 }
 
+function getTokenSessionId(token) {
+  if (!token) return null;
+  const sessionId = decodeJwtPayload(token)?.session_id;
+  return typeof sessionId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sessionId)
+    ? sessionId
+    : null;
+}
+
 function userHasVerifiedMfa(user) {
   const factors = Array.isArray(user?.factors) ? user.factors : [];
   return factors.some((f) => f?.status === "verified" && isTotp(f));
@@ -1554,15 +1662,216 @@ function verifiedFactorsOf(user) {
   return factors.filter((f) => f?.status === "verified");
 }
 
-function requireAal2(user, token) {
+async function hasVerifiedMfaSession(userId, sessionId) {
+  if (!sessionId) return false;
+
+  const now = new Date().toISOString();
+  const { error: purgeError } = await supabaseAdmin
+    .from("mfa_verified_sessions")
+    .delete()
+    .eq("user_id", userId)
+    .lte("expires_at", now);
+
+  if (purgeError) throw dbError("mfa_verified_sessions.purge", purgeError);
+
+  const { data, error } = await supabaseAdmin
+    .from("mfa_verified_sessions")
+    .select("session_id")
+    .eq("user_id", userId)
+    .eq("session_id", sessionId)
+    .gt("expires_at", now)
+    .maybeSingle();
+
+  if (error) throw dbError("mfa_verified_sessions.lookup", error);
+  return Boolean(data);
+}
+
+async function recordVerifiedMfaSession(userId, sessionId, method) {
+  const now = new Date();
+  const { error } = await supabaseAdmin.from("mfa_verified_sessions").upsert(
+    {
+      user_id: userId,
+      session_id: sessionId,
+      method,
+      verified_at: now.toISOString(),
+      expires_at: new Date(
+        now.getTime() + MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000
+      ).toISOString(),
+    },
+    { onConflict: "user_id,session_id" }
+  );
+
+  if (error) throw dbError("mfa_verified_sessions.upsert", error);
+}
+
+async function requireAal2(user, token) {
   if (!userHasVerifiedMfa(user)) return;
   if (getTokenAal(token) === "aal2") return;
+  if (await hasVerifiedMfaSession(user.id, getTokenSessionId(token))) return;
 
   throw new HttpError(
     403,
     "Two-factor verification required. Complete the MFA challenge, then try again.",
     "MFA_REQUIRED"
   );
+}
+
+const RECOVERY_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function recoveryCodeHash(code) {
+  if (!RECOVERY_CODE_PEPPER || Buffer.byteLength(RECOVERY_CODE_PEPPER) < 32) {
+    throw new HttpError(
+      503,
+      "Recovery codes are temporarily unavailable",
+      "RECOVERY_CODES_UNAVAILABLE"
+    );
+  }
+
+  return crypto
+    .createHmac("sha256", RECOVERY_CODE_PEPPER)
+    .update(code)
+    .digest("hex");
+}
+
+function generateRecoveryCode() {
+  const bytes = crypto.randomBytes(10);
+  const raw = Array.from(bytes, (byte) => RECOVERY_CODE_ALPHABET[byte & 31]).join("");
+  return `${raw.slice(0, 5)}-${raw.slice(5)}`;
+}
+
+async function getLatestRecoveryCodeBatch(userId) {
+  const { data, error } = await supabaseAdmin
+    .from("mfa_recovery_codes")
+    .select("batch_id,created_at")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw dbError("mfa_recovery_codes.latest_batch", error);
+  return data;
+}
+
+async function getRemainingRecoveryCodeCount(userId, batchId) {
+  const { count, error } = await supabaseAdmin
+    .from("mfa_recovery_codes")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("batch_id", batchId)
+    .is("used_at", null);
+
+  if (error) throw dbError("mfa_recovery_codes.remaining_count", error);
+  if (!Number.isSafeInteger(count)) {
+    throw dbError("mfa_recovery_codes.remaining_count", new Error("Invalid row count"));
+  }
+  return count;
+}
+
+async function replaceRecoveryCodeBatch(userId, batchId, hashes) {
+  const { error } = await supabaseAdmin.rpc("mfa_recovery_replace_codes", {
+    p_user_id: userId,
+    p_batch_id: batchId,
+    p_code_hashes: hashes,
+  });
+
+  if (error) throw dbError("mfa_recovery_replace_codes", error);
+}
+
+function sendSecurityEmail(userId, type, meta = {}) {
+  if (!userId || typeof type !== "string" || !type) {
+    throw new Error("Invalid security email event");
+  }
+
+  void meta;
+  console.warn(`[security-email] not sent: provider not configured (${type})`);
+  return false;
+}
+
+const WEBAUTHN_ALLOWED_TRANSPORTS = new Set([
+  "ble",
+  "hybrid",
+  "internal",
+  "nfc",
+  "smart-card",
+  "usb",
+]);
+
+function validateWebAuthnResponse(response) {
+  if (
+    !response ||
+    typeof response !== "object" ||
+    Array.isArray(response) ||
+    typeof response.id !== "string" ||
+    response.id.length < 1 ||
+    response.id.length > 2048 ||
+    typeof response.rawId !== "string" ||
+    response.rawId.length < 1 ||
+    response.rawId.length > 2048 ||
+    response.id !== response.rawId ||
+    response.type !== "public-key" ||
+    !response.response ||
+    typeof response.response !== "object" ||
+    Array.isArray(response.response)
+  ) {
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  if (Buffer.byteLength(JSON.stringify(response)) > 64 * 1024) {
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+}
+
+function normalizedWebAuthnTransports(transports) {
+  if (!Array.isArray(transports)) return [];
+  return transports.filter(
+    (transport) =>
+      typeof transport === "string" && WEBAUTHN_ALLOWED_TRANSPORTS.has(transport)
+  );
+}
+
+function requireTotpForPasskey(user) {
+  if (!userHasVerifiedMfa(user)) {
+    throw new HttpError(400, "Enable an authenticator before using passkeys", "MFA_NOT_ENABLED");
+  }
+}
+
+async function createWebAuthnChallenge(userId, sessionId, purpose, challenge) {
+  const { error } = await supabaseAdmin.rpc("webauthn_create_challenge", {
+    p_user_id: userId,
+    p_session_id: sessionId,
+    p_purpose: purpose,
+    p_challenge: challenge,
+  });
+
+  if (error) throw dbError("webauthn_create_challenge", error);
+}
+
+async function consumeWebAuthnChallenge(userId, sessionId, purpose) {
+  const { data, error } = await supabaseAdmin.rpc("webauthn_consume_challenge", {
+    p_user_id: userId,
+    p_session_id: sessionId,
+    p_purpose: purpose,
+  });
+
+  if (error) throw dbError("webauthn_consume_challenge", error);
+  if (!Array.isArray(data) || typeof data[0]?.challenge !== "string") {
+    throw new HttpError(400, "WebAuthn challenge is invalid or expired", "INVALID_WEBAUTHN_CHALLENGE");
+  }
+  return data[0].challenge;
+}
+
+async function getWebAuthnCredentials(userId) {
+  const { data, error } = await supabaseAdmin
+    .from("webauthn_credentials")
+    .select("id,credential_id,transports,name,created_at,last_used_at")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw dbError("webauthn_credentials.list", error);
+  if (!Array.isArray(data)) {
+    throw dbError("webauthn_credentials.list", new Error("Invalid row list"));
+  }
+  return data;
 }
 
 // ============================================================
@@ -1687,6 +1996,19 @@ async function verifyMfaCode(factorId, code, token) {
   }
 
   return verify;
+}
+
+async function verifyMfaCodeWithAttempts(factorId, code, token, attemptKey) {
+  try {
+    const session = await verifyMfaCode(factorId, code, token);
+    await resetAuthAttemptFailures(attemptKey);
+    return session;
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status !== 400) throw error;
+
+    await recordAuthAttemptFailure(attemptKey);
+    throw new HttpError(400, "Invalid authenticator code", "INVALID_MFA_CODE");
+  }
 }
 
 // ============================================================
@@ -3486,28 +3808,29 @@ route("POST", "/api/auth/signup", async ({ req, res }) => {
 
 route("POST", "/api/auth/login", async ({ req, res }) => {
   const body = await getJsonBody(req);
-  const email = normalizeEmail(body.email);
-  const password = String(body.password || "");
+  const email = typeof body.email === "string" ? normalizeEmail(body.email) : "";
+  const password = typeof body.password === "string" ? body.password : "";
 
-  if (!email || !password) throw new HttpError(400, "Email and password are required");
+  if (!email || email.length > 254 || !EMAIL_REGEX.test(email) || !password || password.length > 128) {
+    throw new HttpError(400, "Email and password are required");
+  }
 
-  enforce(limiterAccount, `login:${email}`);
+  const attemptKey = authAttemptKey("email", email, getClientIp(req));
+  await checkAuthAttemptLimit(attemptKey);
 
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
   if (error) {
-    if (error.status === 429) throw new HttpError(429, "Too many requests. Please try again later.");
+    if (error.status === 429) {
+      throw authAttemptRateLimitError(60);
+    }
+    if (error.status >= 500) throw dbError("auth.signInWithPassword", error);
 
-    const notConfirmed =
-      error.code === "email_not_confirmed" ||
-      error.message.toLowerCase().includes("not confirmed");
-
-    throw new HttpError(
-      401,
-      notConfirmed ? error.message : "Invalid login credentials",
-      notConfirmed ? "EMAIL_NOT_CONFIRMED" : "INVALID_CREDENTIALS"
-    );
+    await recordAuthAttemptFailure(attemptKey);
+    throw new HttpError(401, "Invalid email or password", "INVALID_CREDENTIALS");
   }
+
+  await resetAuthAttemptFailures(attemptKey);
 
   const hasVerifiedMfa = userHasVerifiedMfa(data.user);
   const sessionAal = data.session ? getTokenAal(data.session.access_token) : null;
@@ -3684,6 +4007,15 @@ route("POST", "/api/auth/logout", async ({ req, res }) => {
   sendJson(res, 200, { success: true });
 });
 
+route("POST", "/api/auth/sessions/revoke-others", async ({ res, user, token }) => {
+  const { error } = await supabaseAdmin.auth.admin.signOut(token, "others");
+
+  if (error) throw dbError("auth.admin.signOut(others)", error);
+
+  authCacheInvalidateUser(user.id);
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
 route("POST", "/api/auth/refresh", async ({ req, res }) => {
   const body = await getJsonBody(req);
   const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
@@ -3720,11 +4052,12 @@ route("POST", "/api/auth/resend-verification", async ({ res, user }) => {
 // ROUTES — MFA (proxy complet)
 // ============================================================
 
-route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
-  const factors = verifiedFactorsOf(user);
+route("GET", "/api/auth/mfa/status", async ({ res, user, token }) => {
+  const factors = verifiedFactorsOf(user).filter(isTotp);
   const aal = getTokenAal(token) || "aal1";
   const hasMfa = factors.length > 0;
-  const requiresChallenge = hasMfa && aal === "aal1";
+  const verifiedSession = await hasVerifiedMfaSession(user.id, getTokenSessionId(token));
+  const requiresChallenge = hasMfa && aal !== "aal2" && !verifiedSession;
 
   sendJson(res, 200, {
     success: true,
@@ -3736,15 +4069,392 @@ route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
   });
 }, { auth: true });
 
-route("GET", "/api/mfa/factors", ({ res, user }) => {
+route("GET", "/api/mfa/factors", ({ res, url, user }) => {
+  const includeUnverified = url.searchParams.get("status") === "all";
   const factors = (Array.isArray(user.factors) ? user.factors : [])
-    .filter((f) => isTotp(f) && f.status === "verified")
+    .filter(
+      (f) =>
+        isTotp(f) &&
+        (f.status === "verified" || (includeUnverified && f.status === "unverified"))
+    )
     .map(toPublicFactor);
 
   sendJson(res, 200, { success: true, factors });
 }, { auth: true });
 
+route("GET", "/api/mfa/recovery-codes", async ({ res, user }) => {
+  const batch = await getLatestRecoveryCodeBatch(user.id);
+  const remaining = batch
+    ? await getRemainingRecoveryCodeCount(user.id, batch.batch_id)
+    : 0;
+
+  sendJson(res, 200, {
+    success: true,
+    remaining,
+    generatedAt: batch?.created_at || null,
+  });
+}, { auth: true });
+
+route("POST", "/api/mfa/recovery-codes", async ({ res, user, token }) => {
+  await requireAal2(user, token);
+  if (!userHasVerifiedMfa(user)) {
+    throw new HttpError(400, "Enable an authenticator before generating recovery codes");
+  }
+
+  const codes = Array.from({ length: 10 }, generateRecoveryCode);
+  const hashes = codes.map((code) => recoveryCodeHash(code.replace("-", "")));
+  const batchId = crypto.randomUUID();
+
+  await replaceRecoveryCodeBatch(user.id, batchId, hashes);
+  sendSecurityEmail(user.id, "recovery_codes_regenerated", { count: codes.length });
+
+  sendJson(res, 200, { success: true, codes });
+}, { auth: true });
+
+route("POST", "/api/mfa/recovery-codes/verify", async ({ req, res, user, token }) => {
+  const body = await getJsonBody(req);
+  if (typeof body.code !== "string" || body.code.length > 32) {
+    throw new HttpError(400, "Invalid or already used recovery code", "INVALID_RECOVERY_CODE");
+  }
+
+  const normalizedCode = body.code.toUpperCase().replace(/[\s-]/g, "");
+  if (!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{10}$/.test(normalizedCode)) {
+    throw new HttpError(400, "Invalid or already used recovery code", "INVALID_RECOVERY_CODE");
+  }
+
+  const attemptKey = authAttemptKey("user", user.id, getClientIp(req));
+  await checkAuthAttemptLimit(attemptKey);
+
+  const sessionId = getTokenSessionId(token);
+  if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
+
+  const batch = await getLatestRecoveryCodeBatch(user.id);
+  const invalidCode = async () => {
+    await recordAuthAttemptFailure(attemptKey);
+    throw new HttpError(400, "Invalid or already used recovery code", "INVALID_RECOVERY_CODE");
+  };
+
+  if (!batch) return invalidCode();
+
+  const { data: recoveryCodes, error: listError } = await supabaseAdmin
+    .from("mfa_recovery_codes")
+    .select("code_hash")
+    .eq("user_id", user.id)
+    .eq("batch_id", batch.batch_id);
+
+  if (listError) throw dbError("mfa_recovery_codes.lookup", listError);
+  if (!Array.isArray(recoveryCodes)) {
+    throw dbError("mfa_recovery_codes.lookup", new Error("Invalid row list"));
+  }
+
+  const candidateHash = recoveryCodeHash(normalizedCode);
+  const candidateBuffer = Buffer.from(candidateHash, "hex");
+  let matchedHash = null;
+
+  for (const row of recoveryCodes.length
+    ? recoveryCodes
+    : [{ code_hash: "0".repeat(64) }]) {
+    const storedBuffer = Buffer.from(row.code_hash, "hex");
+    const matches =
+      storedBuffer.length === candidateBuffer.length &&
+      crypto.timingSafeEqual(storedBuffer, candidateBuffer);
+    if (matches) matchedHash = row.code_hash;
+  }
+
+  if (!matchedHash) return invalidCode();
+
+  const now = new Date();
+  const expiresAt = new Date(
+    now.getTime() + MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000
+  ).toISOString();
+  const { data: consumed, error: consumeError } = await supabaseAdmin.rpc(
+    "mfa_recovery_consume_code",
+    {
+      p_user_id: user.id,
+      p_batch_id: batch.batch_id,
+      p_code_hash: matchedHash,
+      p_session_id: sessionId,
+      p_verified_at: now.toISOString(),
+      p_expires_at: expiresAt,
+    }
+  );
+
+  if (consumeError) throw dbError("mfa_recovery_consume_code", consumeError);
+  const result = Array.isArray(consumed) ? consumed[0] : null;
+  if (!result) return invalidCode();
+
+  const remaining = Number(result.remaining);
+  if (!Number.isSafeInteger(remaining) || remaining < 0) {
+    throw dbError("mfa_recovery_consume_code", new Error("Invalid remaining count"));
+  }
+
+  await resetAuthAttemptFailures(attemptKey);
+  sendSecurityEmail(user.id, "recovery_code_used", { remaining });
+  sendJson(res, 200, {
+    success: true,
+    session: { access_token: token },
+    remaining,
+  });
+}, { auth: true });
+
+route("POST", "/api/mfa/passkeys/register/options", async ({ res, user, token }) => {
+  requireTotpForPasskey(user);
+  await requireAal2(user, token);
+
+  const sessionId = getTokenSessionId(token);
+  if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
+
+  const credentials = await getWebAuthnCredentials(user.id);
+  const displayName = [
+    user.user_metadata?.first_name,
+    user.user_metadata?.last_name,
+  ]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join(" ")
+    .slice(0, 64);
+
+  const options = await generateRegistrationOptions({
+    rpName: WEBAUTHN_RP_NAME,
+    rpID: WEBAUTHN_RP_ID,
+    userName: (user.email || user.id).slice(0, 64),
+    userID: Buffer.from(user.id, "utf8"),
+    userDisplayName: (displayName || user.email || "Stone user").slice(0, 64),
+    timeout: 5 * 60 * 1000,
+    attestationType: "none",
+    excludeCredentials: credentials.map((credential) => ({
+      id: credential.credential_id,
+      transports: normalizedWebAuthnTransports(credential.transports),
+    })),
+    authenticatorSelection: {
+      residentKey: "required",
+      userVerification: "required",
+    },
+  });
+
+  await createWebAuthnChallenge(user.id, sessionId, "register", options.challenge);
+  sendJson(res, 200, { success: true, options });
+}, { auth: true });
+
+route("POST", "/api/mfa/passkeys/register/verify", async ({ req, res, user, token }) => {
+  requireTotpForPasskey(user);
+  await requireAal2(user, token);
+
+  const body = await getJsonBody(req);
+  validateWebAuthnResponse(body.response);
+  if (
+    body.name !== undefined &&
+    (typeof body.name !== "string" ||
+      body.name.trim().length === 0 ||
+      body.name.trim().length > 100 ||
+      /[\u0000-\u001f\u007f]/.test(body.name))
+  ) {
+    throw new HttpError(400, "Invalid passkey name", "INVALID_PASSKEY_NAME");
+  }
+
+  const sessionId = getTokenSessionId(token);
+  if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
+
+  const challenge = await consumeWebAuthnChallenge(user.id, sessionId, "register");
+  let verification;
+  try {
+    verification = await verifyRegistrationResponse({
+      response: body.response,
+      expectedChallenge: challenge,
+      expectedOrigin: WEBAUTHN_ORIGIN,
+      expectedRPID: WEBAUTHN_RP_ID,
+      requireUserVerification: true,
+    });
+  } catch (error) {
+    console.error("[webauthn] registration verification failed:", error?.name || "Error");
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  const credential = verification.registrationInfo?.credential;
+  if (
+    !verification.verified ||
+    !credential ||
+    typeof credential.id !== "string" ||
+    credential.id !== body.response.id ||
+    credential.id.length < 1 ||
+    credential.id.length > 2048 ||
+    !(credential.publicKey instanceof Uint8Array) ||
+    credential.publicKey.length === 0 ||
+    !Number.isSafeInteger(credential.counter) ||
+    credential.counter < 0
+  ) {
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  const name = body.name?.trim() || "Passkey";
+  const { data, error } = await supabaseAdmin
+    .from("webauthn_credentials")
+    .insert({
+      user_id: user.id,
+      credential_id: credential.id,
+      public_key: Buffer.from(credential.publicKey).toString("base64url"),
+      counter: credential.counter,
+      transports: normalizedWebAuthnTransports(credential.transports),
+      name,
+    })
+    .select("id,created_at")
+    .single();
+
+  if (error) throw dbError("webauthn_credentials.insert", error);
+
+  sendSecurityEmail(user.id, "authenticator_added", { factorType: "passkey" });
+  sendJson(res, 200, {
+    success: true,
+    passkey: { id: data.id, name, createdAt: data.created_at },
+  });
+}, { auth: true });
+
+route("GET", "/api/mfa/passkeys", async ({ res, user }) => {
+  const credentials = await getWebAuthnCredentials(user.id);
+  sendJson(res, 200, {
+    success: true,
+    passkeys: credentials.map((credential) => ({
+      id: credential.id,
+      name: credential.name,
+      createdAt: credential.created_at,
+      lastUsedAt: credential.last_used_at,
+    })),
+  });
+}, { auth: true });
+
+route("DELETE", "/api/mfa/passkeys", async ({ res, url, user, token }) => {
+  await requireAal2(user, token);
+
+  const id = url.searchParams.get("id");
+  if (
+    !id ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)
+  ) {
+    throw new HttpError(400, "Invalid passkey id", "INVALID_PASSKEY_ID");
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("webauthn_credentials")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", user.id)
+    .select("id")
+    .maybeSingle();
+
+  if (error) throw dbError("webauthn_credentials.delete", error);
+  if (!data) throw new HttpError(404, "Passkey not found", "PASSKEY_NOT_FOUND");
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+route("POST", "/api/mfa/passkeys/authenticate/options", async ({ res, user, token }) => {
+  requireTotpForPasskey(user);
+
+  const sessionId = getTokenSessionId(token);
+  if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
+
+  const credentials = await getWebAuthnCredentials(user.id);
+  if (credentials.length === 0) {
+    throw new HttpError(400, "No passkeys are registered", "NO_PASSKEYS");
+  }
+
+  const options = await generateAuthenticationOptions({
+    rpID: WEBAUTHN_RP_ID,
+    allowCredentials: credentials.map((credential) => ({
+      id: credential.credential_id,
+      transports: normalizedWebAuthnTransports(credential.transports),
+    })),
+    timeout: 5 * 60 * 1000,
+    userVerification: "required",
+  });
+
+  await createWebAuthnChallenge(user.id, sessionId, "authenticate", options.challenge);
+  sendJson(res, 200, { success: true, options });
+}, { auth: true });
+
+route("POST", "/api/mfa/passkeys/authenticate/verify", async ({ req, res, user, token }) => {
+  requireTotpForPasskey(user);
+
+  const body = await getJsonBody(req);
+  validateWebAuthnResponse(body.response);
+
+  const sessionId = getTokenSessionId(token);
+  if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
+
+  const challenge = await consumeWebAuthnChallenge(user.id, sessionId, "authenticate");
+  const { data: credential, error: lookupError } = await supabaseAdmin
+    .from("webauthn_credentials")
+    .select("id,credential_id,public_key,counter,transports")
+    .eq("user_id", user.id)
+    .eq("credential_id", body.response.id)
+    .maybeSingle();
+
+  if (lookupError) throw dbError("webauthn_credentials.lookup", lookupError);
+  if (!credential) {
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  const currentCounter = Number(credential.counter);
+  if (
+    !Number.isSafeInteger(currentCounter) ||
+    currentCounter < 0 ||
+    typeof credential.public_key !== "string" ||
+    !/^[A-Za-z0-9_-]+$/.test(credential.public_key)
+  ) {
+    throw dbError("webauthn_credentials.lookup", new Error("Invalid credential data"));
+  }
+
+  let verification;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response: body.response,
+      expectedChallenge: challenge,
+      expectedOrigin: WEBAUTHN_ORIGIN,
+      expectedRPID: WEBAUTHN_RP_ID,
+      requireUserVerification: true,
+      credential: {
+        id: credential.credential_id,
+        publicKey: Buffer.from(credential.public_key, "base64url"),
+        counter: currentCounter,
+        transports: normalizedWebAuthnTransports(credential.transports),
+      },
+    });
+  } catch (error) {
+    console.error("[webauthn] authentication verification failed:", error?.name || "Error");
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  if (
+    !verification.verified ||
+    verification.authenticationInfo.credentialID !== credential.credential_id ||
+    !Number.isSafeInteger(verification.authenticationInfo.newCounter) ||
+    verification.authenticationInfo.newCounter < currentCounter
+  ) {
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  const now = new Date().toISOString();
+  const { data: updatedCredential, error: updateError } = await supabaseAdmin
+    .from("webauthn_credentials")
+    .update({
+      counter: verification.authenticationInfo.newCounter,
+      last_used_at: now,
+    })
+    .eq("id", credential.id)
+    .eq("counter", currentCounter)
+    .select("id")
+    .maybeSingle();
+
+  if (updateError) throw dbError("webauthn_credentials.update_counter", updateError);
+  if (!updatedCredential) {
+    throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
+  }
+
+  await recordVerifiedMfaSession(user.id, sessionId, "passkey");
+  sendJson(res, 200, { success: true, session: { access_token: token } });
+}, { auth: true });
+
 route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
+  if (userHasVerifiedMfa(user)) await requireAal2(user, token);
+
   enforce(limiterAccount, `mfa-enroll:${user.id}`);
 
   const stale = (Array.isArray(user.factors) ? user.factors : []).filter(
@@ -3794,18 +4504,24 @@ route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
 }, { auth: true });
 
 route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
-  enforce(limiterAccount, `mfa-enroll-verify:${user.id}`);
-
   const body = await getJsonBody(req);
-  const factorId = String(body.factorId || "").trim();
-  const code = String(body.code || "").replace(/\D/g, "").slice(0, 8);
+  const factorId = typeof body.factorId === "string" ? body.factorId.trim() : "";
+  const code = typeof body.code === "string" ? body.code : "";
 
   if (!factorId || factorId.length > 128) throw new HttpError(400, "Missing factorId");
   if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, "Invalid code", "INVALID_CODE");
 
-  const session = await verifyMfaCode(factorId, code, token);
+  const attemptKey = authAttemptKey("user", user.id, getClientIp(req));
+  await checkAuthAttemptLimit(attemptKey);
+  const alreadyHadAuthenticator = userHasVerifiedMfa(user);
+  const session = await verifyMfaCodeWithAttempts(factorId, code, token, attemptKey);
 
   authCacheInvalidateUser(user.id);
+  sendSecurityEmail(
+    user.id,
+    alreadyHadAuthenticator ? "authenticator_added" : "mfa_activated",
+    { factorType: "totp" }
+  );
 
   sendJson(res, 200, {
     success: true,
@@ -3817,13 +4533,12 @@ route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
 }, { auth: true });
 
 route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
-  enforce(limiterAccount, `mfa-verify:${user.id}`);
-
   const body = await getJsonBody(req);
-  let factorId = String(body.factorId || "").trim();
-  const code = String(body.code || "").replace(/\D/g, "").slice(0, 8);
+  let factorId = typeof body.factorId === "string" ? body.factorId.trim() : "";
+  const code = typeof body.code === "string" ? body.code : "";
 
   if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, "Invalid code", "INVALID_CODE");
+  if (factorId.length > 128) throw new HttpError(400, "Invalid factorId", "INVALID_FACTOR_ID");
 
   if (!factorId) {
     const first = (Array.isArray(user.factors) ? user.factors : []).find(
@@ -3833,7 +4548,9 @@ route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
     factorId = first.id;
   }
 
-  const session = await verifyMfaCode(factorId, code, token);
+  const attemptKey = authAttemptKey("user", user.id, getClientIp(req));
+  await checkAuthAttemptLimit(attemptKey);
+  const session = await verifyMfaCodeWithAttempts(factorId, code, token, attemptKey);
 
   sendJson(res, 200, {
     success: true,
@@ -3854,8 +4571,9 @@ route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
   );
   if (!factor) throw new HttpError(404, "Factor not found", "FACTOR_NOT_FOUND");
 
+  const verifiedTotpCount = verifiedFactorsOf(user).filter(isTotp).length;
   if (factor.status === "verified") {
-    requireAal2(user, token); // 403 MFA_REQUIRED si AAL1
+    await requireAal2(user, token); // 403 MFA_REQUIRED si AAL1
   }
 
   await supabaseAuthRequest(`/factors/${encodeURIComponent(factorId)}`, {
@@ -3864,6 +4582,9 @@ route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
   });
 
   authCacheInvalidateUser(user.id);
+  if (factor.status === "verified" && verifiedTotpCount === 1) {
+    sendSecurityEmail(user.id, "mfa_disabled", { factorType: "totp" });
+  }
 
   sendJson(res, 200, { success: true });
 }, { auth: true });
@@ -3880,7 +4601,9 @@ route("GET", "/api/user/profile", ({ res, user }) => {
   sendJson(res, 200, { success: true, user: formatUser(user) });
 }, { auth: true });
 
-route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user }) => {
+route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user, token }) => {
+  await requireAal2(user, token);
+
   const body = await getJsonBody(req);
   const metadata = { ...(user.user_metadata || {}) };
   const limitedString = (value, max) => String(value ?? "").slice(0, max);
@@ -3927,7 +4650,7 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user }) => {
 
 route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) => {
   // 1. AAL2 requis si l'utilisateur a la 2FA activée
-  requireAal2(user, token);
+  await requireAal2(user, token);
 
   const body = await getJsonBody(req);
   const currentPassword = String(body.currentPassword ?? body.current_password ?? "").trim();
@@ -3977,7 +4700,9 @@ route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) =
   });
 }, { auth: true });
 
-route("POST", "/api/user/avatar", async ({ req, res, user }) => {
+route("POST", "/api/user/avatar", async ({ req, res, user, token }) => {
+  await requireAal2(user, token);
+
   enforce(limiterAccount, `avatar:${user.id}`);
 
   let upload;
@@ -4013,7 +4738,9 @@ route("POST", "/api/user/avatar", async ({ req, res, user }) => {
   sendJson(res, 200, { success: true, avatar_url: publicUrlData.publicUrl });
 }, { auth: true });
 
-route("DELETE", "/api/user/avatar", async ({ req, res, user }) => {
+route("DELETE", "/api/user/avatar", async ({ req, res, user, token }) => {
+  await requireAal2(user, token);
+
   const body = await getJsonBody(req);
   const filePathOrUrl = String(body.filePathOrUrl || "").trim();
 
@@ -5195,6 +5922,7 @@ const server = createServer(async (req, res) => {
           success: false,
           error: error.message,
           code: error.code || undefined,
+          retryAfter: error.retryAfter || undefined,
           request_id: error.status >= 500 ? requestId : undefined,
         },
         error.headers
@@ -5216,7 +5944,7 @@ server.listen(PORT, () => {
   console.log(`  TRUST_PROXY     : ${TRUST_PROXY ? `1 (${TRUST_PROXY_HOPS} hop)` : "0"}`);
   console.log(`  Token encryption: ${TOKEN_ENCRYPTION_KEY ? "on" : "off"}`);
   console.log(`  MFA             : proxy /api/mfa/* → Supabase /auth/v1/factors*`);
-  console.log(`  MFA policy      : AAL2 requis pour PUT /api/user/password si MFA activée`);
+  console.log(`  MFA policy      : AAL2 requis pour profil, avatar, mot de passe et gestion MFA`);
   console.log(`  Video uploads   : max ${MAX_VIDEO_UPLOADS} concurrent(s)`);
   console.log(`  TikTok mode     : ${TIKTOK_SANDBOX ? "SANDBOX" : "auditée"}${TIKTOK_FORCE_DRAFT ? " + FORCE_DRAFT" : ""}`);
   console.log(`  TikTok photos   : ${PUBLIC_API_URL ? PUBLIC_API_URL : "désactivé"}`);
