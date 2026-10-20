@@ -245,6 +245,23 @@ function dbError(context, error) {
 }
 
 // ============================================================
+// DÉTECTION DES OBJETS POSTGRES ABSENTS (migration manquante)
+// ============================================================
+//
+// Utilisé pour basculer sur des fallbacks mémoire quand la base n'a pas
+// encore reçu les tables / fonctions de la migration MFA & rate limiting.
+// Ce n'est PAS un contournement permanent : la migration SQL doit être
+// appliquée pour que les endpoints recovery-codes / passkeys fonctionnent.
+
+function isSchemaCacheMissingError(error) {
+  const msg = String(error?.message || "");
+  return (
+    /could not find the (table|function)/i.test(msg) ||
+    /in the schema cache/i.test(msg)
+  );
+}
+
+// ============================================================
 // CONFIGURATION
 // ============================================================
 
@@ -789,12 +806,72 @@ function authAttemptRateLimitError(retryAfter) {
   );
 }
 
+// ------------------------------------------------------------
+// Fallback mémoire : rate limiting des tentatives d'authentification
+// (utilisé uniquement si les RPC `auth_attempts_*` n'existent pas encore)
+// ------------------------------------------------------------
+
+const authAttemptsMemory = new Map();
+const AUTH_ATTEMPT_MAX = 5;
+const AUTH_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_ATTEMPT_BLOCK_MS = 15 * 60 * 1000;
+
+function checkAuthAttemptLimitMemory(attemptKey) {
+  const now = Date.now();
+  const entry = authAttemptsMemory.get(attemptKey);
+  if (!entry) return;
+
+  if (entry.blockedUntil && entry.blockedUntil > now) {
+    throw authAttemptRateLimitError(
+      Math.ceil((entry.blockedUntil - now) / 1000)
+    );
+  }
+
+  if (now - entry.firstAt > AUTH_ATTEMPT_WINDOW_MS) {
+    authAttemptsMemory.delete(attemptKey);
+    return;
+  }
+
+  if (entry.count >= AUTH_ATTEMPT_MAX) {
+    entry.blockedUntil = now + AUTH_ATTEMPT_BLOCK_MS;
+    throw authAttemptRateLimitError(
+      Math.ceil(AUTH_ATTEMPT_BLOCK_MS / 1000)
+    );
+  }
+}
+
+function recordAuthAttemptFailureMemory(attemptKey) {
+  const now = Date.now();
+  const entry = authAttemptsMemory.get(attemptKey);
+
+  if (!entry || now - entry.firstAt > AUTH_ATTEMPT_WINDOW_MS) {
+    authAttemptsMemory.set(attemptKey, {
+      count: 1,
+      firstAt: now,
+      blockedUntil: null,
+    });
+    return;
+  }
+
+  entry.count += 1;
+  entry.blockedUntil = null;
+}
+
 async function checkAuthAttemptLimit(attemptKey) {
   const { data, error } = await supabaseAdmin.rpc("auth_attempts_check", {
     p_attempt_key: attemptKey,
   });
 
-  if (error) throw dbError("auth_attempts_check", error);
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      console.warn(
+        "[auth_attempts_check] migration manquante — fallback mémoire actif"
+      );
+      checkAuthAttemptLimitMemory(attemptKey);
+      return;
+    }
+    throw dbError("auth_attempts_check", error);
+  }
 
   const state = Array.isArray(data) ? data[0] : null;
   if (!state || typeof state.allowed !== "boolean") {
@@ -815,7 +892,13 @@ async function recordAuthAttemptFailure(attemptKey) {
     p_attempt_key: attemptKey,
   });
 
-  if (error) throw dbError("auth_attempts_record_failure", error);
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      recordAuthAttemptFailureMemory(attemptKey);
+      return;
+    }
+    throw dbError("auth_attempts_record_failure", error);
+  }
 }
 
 async function resetAuthAttemptFailures(attemptKey) {
@@ -823,8 +906,18 @@ async function resetAuthAttemptFailures(attemptKey) {
     p_attempt_key: attemptKey,
   });
 
-  if (error) throw dbError("auth_attempts_reset_success", error);
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      authAttemptsMemory.delete(attemptKey);
+      return;
+    }
+    throw dbError("auth_attempts_reset_success", error);
+  }
 }
+
+// ------------------------------------------------------------
+// Rate limiters en mémoire
+// ------------------------------------------------------------
 
 function createRateLimiter({ windowMs, max, label, maxKeys = 50_000 }) {
   const hits = new Map();
@@ -1662,6 +1755,41 @@ function verifiedFactorsOf(user) {
   return factors.filter((f) => f?.status === "verified");
 }
 
+// ------------------------------------------------------------
+// Fallback mémoire si la table `mfa_verified_sessions` n'existe pas encore
+// ------------------------------------------------------------
+
+const mfaVerifiedMemory = new Map();
+const MFA_MEMORY_MAX = 10_000;
+
+function readVerifiedMfaSessionMemory(userId, sessionId) {
+  const key = `${userId}:${sessionId}`;
+  const expires = mfaVerifiedMemory.get(key);
+  if (!expires) return false;
+  if (expires <= Date.now()) {
+    mfaVerifiedMemory.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function writeVerifiedMfaSessionMemory(userId, sessionId) {
+  if (mfaVerifiedMemory.size >= MFA_MEMORY_MAX) {
+    mfaVerifiedMemory.delete(mfaVerifiedMemory.keys().next().value);
+  }
+  mfaVerifiedMemory.set(
+    `${userId}:${sessionId}`,
+    Date.now() + MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000
+  );
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, expires] of mfaVerifiedMemory) {
+    if (expires <= now) mfaVerifiedMemory.delete(key);
+  }
+}, 60_000).unref?.();
+
 async function hasVerifiedMfaSession(userId, sessionId) {
   if (!sessionId) return false;
 
@@ -1672,7 +1800,12 @@ async function hasVerifiedMfaSession(userId, sessionId) {
     .eq("user_id", userId)
     .lte("expires_at", now);
 
-  if (purgeError) throw dbError("mfa_verified_sessions.purge", purgeError);
+  if (purgeError) {
+    if (isSchemaCacheMissingError(purgeError)) {
+      return readVerifiedMfaSessionMemory(userId, sessionId);
+    }
+    throw dbError("mfa_verified_sessions.purge", purgeError);
+  }
 
   const { data, error } = await supabaseAdmin
     .from("mfa_verified_sessions")
@@ -1682,26 +1815,39 @@ async function hasVerifiedMfaSession(userId, sessionId) {
     .gt("expires_at", now)
     .maybeSingle();
 
-  if (error) throw dbError("mfa_verified_sessions.lookup", error);
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      return readVerifiedMfaSessionMemory(userId, sessionId);
+    }
+    throw dbError("mfa_verified_sessions.lookup", error);
+  }
   return Boolean(data);
 }
 
 async function recordVerifiedMfaSession(userId, sessionId, method) {
   const now = new Date();
+  const expiresAt = new Date(
+    now.getTime() + MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000
+  );
+
   const { error } = await supabaseAdmin.from("mfa_verified_sessions").upsert(
     {
       user_id: userId,
       session_id: sessionId,
       method,
       verified_at: now.toISOString(),
-      expires_at: new Date(
-        now.getTime() + MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000
-      ).toISOString(),
+      expires_at: expiresAt.toISOString(),
     },
     { onConflict: "user_id,session_id" }
   );
 
-  if (error) throw dbError("mfa_verified_sessions.upsert", error);
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      writeVerifiedMfaSessionMemory(userId, sessionId);
+      return;
+    }
+    throw dbError("mfa_verified_sessions.upsert", error);
+  }
 }
 
 async function requireAal2(user, token) {
