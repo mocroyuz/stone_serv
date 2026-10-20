@@ -22,61 +22,23 @@
 //   Photos TikTok: URL publique de CE serveur (domaine de l'API, PAS le
 //                  frontend), lue dans l'ordre :
 //                  PUBLIC_API_URL → VITE_API_BASE_URL → RAILWAY_PUBLIC_DOMAIN
-//                  (le préfixe /api/media/tiktok/ doit être vérifié chez TikTok).
 //   TikTok       : TIKTOK_AUDITED=1 une fois l'app auditée par TikTok.
-//                  Sinon l'app est en MODE SANDBOX :
-//                    - seuls les « Sandbox testers » du portail peuvent
-//                      autoriser l'app (sinon access_denied → 403 explicite)
-//                    - DIRECT_POST limité à privacy_level = SELF_ONLY
-//                    - posts photos forcés en brouillon (MEDIA_UPLOAD)
-//                  TIKTOK_FORCE_DRAFT=1 force TOUT en brouillons, même
-//                  après audit (pratique pour tester sans publier).
+//                  Sinon l'app est en MODE SANDBOX (voir plus bas).
 //   Pinterest    : PINTEREST_APP_ID, PINTEREST_APP_SECRET.
-//                  Par défaut : SANDBOX (PINTEREST_API_BASE =
-//                  https://api-sandbox.pinterest.com/v5) et l'endpoint OAuth
-//                  est dérivé de l'environnement de l'API.
-//                  Production : PINTEREST_API_BASE=https://api.pinterest.com/v5
-//                  (PINTEREST_OAUTH_BASE est alors dérivé automatiquement ;
-//                  s'il est défini, il doit être du MÊME environnement, sinon
-//                  les routes Pinterest répondent 500 plutôt que de mélanger
-//                  sandbox et production). PINTEREST_AUTH_URL est surchargeable.
-//                  Chaque compte relié mémorise son environnement (colonne
-//                  pinterest_accounts.api_env) : un jeton d'un autre
-//                  environnement n'est jamais utilisé (reconnexion demandée).
+//                  Par défaut : SANDBOX.
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
-//                  Les scopes par défaut incluent youtube.upload (nécessaire
-//                  pour publier). Tant que le projet Google n'a pas passé
-//                  l'audit « YouTube API Services », YouTube force les
-//                  vidéos envoyées par l'API en PRIVÉ.
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
-//                  CANVA_REDIRECT_URI (optionnel, défaut : ${APP_URL}/canva/callback)
-//                  CANVA_SCOPES (optionnel, défaut :
-//                    design:content:read design:content:write design:meta:read
-//                    profile:read)
-//                  Dans le portail Canva (canva.dev → Your integrations) :
-//                    - Authorized redirects : la même URL que CANVA_REDIRECT_URI
-//                    - Scopes : les mêmes que CANVA_SCOPES
-//   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
-//                  STRIPE_PRICE_STARTER_MONTHLY, STRIPE_PRICE_STARTER_ANNUAL,
-//                  STRIPE_PRICE_PRO_MONTHLY, STRIPE_PRICE_PRO_ANNUAL,
-//                  STRIPE_PRICE_ENTERPRISE_MONTHLY, STRIPE_PRICE_ENTERPRISE_ANNUAL
-//                  Le serveur vérifie au démarrage que tous les price IDs
-//                  sont définis (sinon le checkout échouera silencieusement
-//                  pour ces plans).
-//   MFA (2FA)    : Le FRONTEND élève la session en AAL2 via supabase-js
-//                  (enrôlement TOTP / passkeys). Le BACKEND :
-//                    - renvoie mfa_enabled / aal / mfa_required à la connexion
-//                    - expose GET /api/auth/mfa/status (AAL + facteurs)
-//                    - refuse les opérations sensibles (changement de mot de
-//                      passe) si l'utilisateur a activé la MFA mais que sa
-//                      session est encore en AAL1 (403 MFA_REQUIRED).
-//                  Le frontend doit alors afficher le challenge MFA
-//                  (needsMfaChallenge / verifyMfaLogin) puis rejouer
-//                  l'opération.
-//   Optionnel    : ALLOWED_ORIGINS, TRUST_PROXY, TRUST_PROXY_HOPS,
-//                  MAX_VIDEO_UPLOADS, TIKTOK_VERIFICATION_FILE,
-//                  TIKTOK_SKIP_PHOTO_PROBE=1, STRIPE_*, TIKTOK_*,
-//                  PINTEREST_*, YOUTUBE_*, CANVA_*
+//   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
+//   MFA (2FA)    : TOUT passe par le backend :
+//                    - le frontend n'embarque PLUS @supabase/supabase-js
+//                    - le backend proxifie /auth/v1/factors* de Supabase Auth
+//                      (enroll / challenge / verify / list / unenroll)
+//                    - après un verify, Supabase renvoie une session AAL2
+//                      que le backend transmet au frontend pour qu'il la
+//                      stocke (remplace la session AAL1)
+//                    - les opérations sensibles (PUT /api/user/password)
+//                      exigent AAL2 via requireAal2()
+//                    - PAS de clé VITE_* côté frontend, PAS de CORS Supabase
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -163,11 +125,6 @@ const toBool = (v) => v === true || v === "true" || v === "1";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Mutualise les appels concurrents identiques (refresh de token,
-// création de client Stripe...) : un seul vol, tout le monde attend
-// le même résultat. Évite les courses entre refresh tokens.
-// ATTENTION : les appelants partagent le MÊME résultat. Ne pas l'utiliser
-// pour des écritures différentes sur la même clé (voir runSerial).
 const inflight = new Map();
 
 function withLock(key, fn) {
@@ -182,10 +139,6 @@ function withLock(key, fn) {
   return promise;
 }
 
-// File d'attente par clé : les tâches s'exécutent UNE PAR UNE, chacune avec
-// son propre résultat (contrairement à withLock). Sert aux écritures
-// « lire → modifier → écrire » qui ne doivent pas s'écraser entre elles
-// (ex. app_metadata d'un utilisateur).
 const serialChains = new Map();
 
 function runSerial(key, fn) {
@@ -201,7 +154,6 @@ function runSerial(key, fn) {
   return result;
 }
 
-// Cache de déduplication à durée de vie limitée (événements webhook).
 function createSeenCache(maxEntries, ttlMs) {
   const entries = new Map();
 
@@ -227,9 +179,6 @@ function createSeenCache(maxEntries, ttlMs) {
   };
 }
 
-// Les callbacks OAuth peuvent être appelés deux fois (React StrictMode,
-// double clic) : le code étant à usage unique côté provider, on renvoie
-// le même résultat pendant 60 s au lieu d'une erreur.
 const callbackCache = new Map();
 const CALLBACK_TTL_MS = 60_000;
 
@@ -251,7 +200,6 @@ setInterval(() => {
   }
 }, 60_000).unref?.();
 
-// fetch + lecture JSON avec timeout global (en-têtes ET corps).
 async function fetchJson(resource, options = {}, timeoutMs = 15_000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -287,8 +235,6 @@ function upstreamStatus(status) {
 const reconnectError = (name, code) =>
   new HttpError(409, `${name} session expired, please reconnect`, code);
 
-// Erreur de base de données : le détail reste dans les logs serveur, le
-// client reçoit un message générique (jamais de secret ni de requête).
 function dbError(context, error) {
   console.error(`[db] ${context}:`, error?.message || error);
   return new HttpError(500, "Database error", "DB_ERROR");
@@ -319,19 +265,9 @@ const STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET");
 
 const APP_URL = (env("APP_URL") || "http://localhost:5173").replace(/\/+$/, "");
 
-// ============================================================
-// CONFIGURATION MOT DE PASSE OUBLIÉ
-// ============================================================
-//
-// Le frontend utilise un routage par hash (#/...). Supabase ajoute les
-// jetons de récupération après cette URL (dans le hash) : la page
-// #/reset-password du frontend doit les lire puis appeler
-// POST /api/auth/reset-password.
-
 const PASSWORD_RESET_REDIRECT_URL =
   env("PASSWORD_RESET_REDIRECT_URL") || `${APP_URL}/#/reset-password`;
 
-// Âge maximal (en secondes) d'un jeton de récupération accepté.
 const RECOVERY_TOKEN_MAX_AGE_SEC = 60 * 60;
 
 const STRIPE_PRICES = {
@@ -348,10 +284,6 @@ const STRIPE_PRICES = {
     annual: env("STRIPE_PRICE_ENTERPRISE_ANNUAL"),
   },
 };
-
-// ============================================================
-// [MODIF 2a] PLANS — correspondance price ID Stripe ↔ plan
-// ============================================================
 
 const PLAN_NAMES = {
   starter: "Starter",
@@ -381,10 +313,6 @@ function planDetails(priceId, metadataPlan) {
     plan_name: key ? PLAN_NAMES[key] : null,
   };
 }
-
-// ============================================================
-// URLs DE RETOUR STRIPE
-// ============================================================
 
 const STRIPE_SUCCESS_URL = `${APP_URL}/#/account?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
 const STRIPE_CANCEL_URL = `${APP_URL}/#/pricing?checkout=cancel`;
@@ -416,8 +344,6 @@ const TIKTOK_PRIVACY_LEVELS = new Set([
   "FOLLOWER_OF_CREATOR",
   "SELF_ONLY",
 ]);
-
-// ---- Mode sandbox -------------------------------------------------------
 
 const TIKTOK_AUDITED = env("TIKTOK_AUDITED") === "1";
 const TIKTOK_SANDBOX = !TIKTOK_AUDITED;
@@ -477,7 +403,7 @@ function resolvePublicApiUrl() {
         return { url: value, source };
       }
     } catch {
-      // valeur relative ou invalide : on essaie la suivante
+      // ignore
     }
   }
 
@@ -507,36 +433,6 @@ function publicApiLooksLikeFrontend() {
 
 function publicApiSourceLabel(source) {
   return source || "URL publique";
-}
-
-if (tiktokEnabled && !PUBLIC_API_URL) {
-  console.warn(
-    "⚠️  PUBLIC_API_URL / VITE_API_BASE_URL manquant — la publication de photos TikTok sera désactivée (ex. https://api.tondomaine.com)."
-  );
-}
-
-if (tiktokEnabled && PUBLIC_API_URL && !PUBLIC_API_URL.startsWith("https://")) {
-  console.warn(
-    `⚠️  ${publicApiSourceLabel(PUBLIC_API_URL_SOURCE)} (${PUBLIC_API_URL}) n'est pas en https — TikTok refusera de télécharger les photos.`
-  );
-}
-
-if (tiktokEnabled && publicApiLooksLikeFrontend()) {
-  console.warn(
-    `⚠️  ${publicApiSourceLabel(PUBLIC_API_URL_SOURCE)} (${PUBLIC_API_URL}) ressemble au FRONTEND, pas à l'API. Définis PUBLIC_API_URL=https://<domaine-de-ce-serveur>.`
-  );
-}
-
-if (tiktokEnabled && TIKTOK_SANDBOX) {
-  console.warn(
-    "ℹ️  TikTok en MODE SANDBOX (TIKTOK_AUDITED≠1) — DIRECT_POST limité à SELF_ONLY, photos en brouillon, seuls les « Sandbox testers » du portail peuvent se connecter."
-  );
-}
-
-if (tiktokEnabled && TIKTOK_FORCE_DRAFT) {
-  console.warn(
-    "ℹ️  TIKTOK_FORCE_DRAFT=1 — toutes les publications partent en brouillon."
-  );
 }
 
 // ============================================================
@@ -628,19 +524,12 @@ const YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3";
 
 const youtubeEnabled = Boolean(YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET);
 
-// ---- Publication YouTube ------------------------------------------------
 const YOUTUBE_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos";
 const YOUTUBE_CHUNK_SIZE = 8 * 1024 * 1024;
 const YOUTUBE_PRIVACY_LEVELS = new Set(["public", "unlisted", "private"]);
 const YOUTUBE_TITLE_MAX = 100;
 const YOUTUBE_DESCRIPTION_MAX_BYTES = 5000;
 const YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload";
-
-if (youtubeEnabled && !YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE)) {
-  console.warn(
-    "⚠️  YOUTUBE_SCOPES ne contient pas youtube.upload — la publication YouTube sera impossible."
-  );
-}
 
 // ============================================================
 // CONFIGURATION CANVA
@@ -660,18 +549,6 @@ const CANVA_AUTH_URL = "https://www.canva.com/api/oauth/authorize";
 
 const canvaEnabled = Boolean(CANVA_CLIENT_ID && CANVA_CLIENT_SECRET);
 
-if (!canvaEnabled) {
-  console.warn(
-    "⚠️  Canva non configuré (CANVA_CLIENT_ID / CANVA_CLIENT_SECRET manquant)."
-  );
-}
-
-if (canvaEnabled && CANVA_REDIRECT_URI.includes("#")) {
-  console.warn(
-    `⚠️  CANVA_REDIRECT_URI contient un "#" (${CANVA_REDIRECT_URI}) — c'est invalide.`
-  );
-}
-
 // ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
@@ -685,15 +562,6 @@ let OAUTH_STATE_SECRET =
 
 if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
   OAUTH_STATE_SECRET = crypto.randomBytes(32).toString("hex");
-  console.warn(
-    "⚠️  OAUTH_STATE_SECRET manquant — secret éphémère généré (dev uniquement)."
-  );
-}
-
-if (IS_PRODUCTION && !env("OAUTH_STATE_SECRET")) {
-  console.warn(
-    "⚠️  OAUTH_STATE_SECRET manquant : définis un secret dédié (32+ caractères aléatoires) en production."
-  );
 }
 
 const TOKEN_ENCRYPTION_KEY = env("TOKEN_ENCRYPTION_KEY")
@@ -701,12 +569,6 @@ const TOKEN_ENCRYPTION_KEY = env("TOKEN_ENCRYPTION_KEY")
   : null;
 
 const ENC_PREFIX = "enc:v1:";
-
-if (!TOKEN_ENCRYPTION_KEY) {
-  console.warn(
-    "⚠️  TOKEN_ENCRYPTION_KEY manquant — les tokens TikTok / Pinterest / YouTube / Canva sont stockés en clair."
-  );
-}
 
 function encryptSecret(value) {
   if (!value) return value ?? null;
@@ -721,9 +583,7 @@ function encryptSecret(value) {
   ]);
   const tag = cipher.getAuthTag();
 
-  return (
-    ENC_PREFIX + Buffer.concat([iv, tag, encrypted]).toString("base64url")
-  );
+  return ENC_PREFIX + Buffer.concat([iv, tag, encrypted]).toString("base64url");
 }
 
 function decryptSecret(value) {
@@ -777,10 +637,6 @@ if (missingVars.length > 0) {
   console.error("Supabase non configuré. Variables manquantes :");
   for (const name of missingVars) console.error(` - ${name}`);
   console.error("");
-  console.error("Définis-les dans les variables d'environnement de");
-  console.error("ton hébergeur, ou dans le fichier :");
-  console.error(envPath);
-  console.error("");
 
   process.exit(1);
 }
@@ -794,42 +650,16 @@ try {
 } catch {
   console.error("");
   console.error("SUPABASE_URL invalide :", JSON.stringify(SUPABASE_URL));
-  console.error(
-    "Elle doit ressembler à : https://xxxxxxxx.supabase.co (sans guillemets)."
-  );
   console.error("");
 
   process.exit(1);
 }
 
 const SUPABASE_BASE_URL = SUPABASE_URL.replace(/\/+$/, "");
-
-if (env("DEBUG_ENV") === "1") {
-  console.log("[env] SUPABASE_URL      :", JSON.stringify(SUPABASE_URL));
-  console.log("[env] ANON key length   :", SUPABASE_ANON_KEY.length);
-  console.log("[env] SERVICE key length:", SUPABASE_SERVICE_ROLE_KEY.length);
-  console.log("[env] APP_URL           :", JSON.stringify(APP_URL));
-  console.log("[env] PASSWORD_RESET    :", JSON.stringify(PASSWORD_RESET_REDIRECT_URL));
-  console.log("[env] PUBLIC_API_URL    :", JSON.stringify(PUBLIC_API_URL), `(${PUBLIC_API_URL_SOURCE || "aucune source"})`);
-  console.log("[env] TIKTOK_REDIRECT   :", JSON.stringify(TIKTOK_REDIRECT_URI));
-  console.log("[env] TIKTOK_AUDITED    :", TIKTOK_AUDITED);
-  console.log("[env] TIKTOK_FORCE_DRAFT:", TIKTOK_FORCE_DRAFT);
-  console.log("[env] PINTEREST_REDIRECT:", JSON.stringify(PINTEREST_REDIRECT_URI));
-  console.log("[env] PINTEREST_API_BASE:", JSON.stringify(PINTEREST_API_BASE));
-  console.log("[env] PINTEREST_OAUTH   :", JSON.stringify(PINTEREST_OAUTH_BASE));
-  console.log("[env] PINTEREST_ENV     :", PINTEREST_ENVIRONMENT);
-  console.log("[env] YOUTUBE_REDIRECT  :", JSON.stringify(YOUTUBE_REDIRECT_URI));
-  console.log("[env] YOUTUBE_SCOPES    :", JSON.stringify(YOUTUBE_SCOPES));
-  console.log("[env] CANVA_REDIRECT    :", JSON.stringify(CANVA_REDIRECT_URI));
-  console.log("[env] CANVA_SCOPES      :", JSON.stringify(CANVA_SCOPES));
-  console.log("[env] TOKEN ENCRYPTION  :", Boolean(TOKEN_ENCRYPTION_KEY));
-  console.log("[env] STRIPE success    :", JSON.stringify(STRIPE_SUCCESS_URL));
-  console.log("[env] STRIPE cancel     :", JSON.stringify(STRIPE_CANCEL_URL));
-  console.log("[env] STRIPE portal     :", JSON.stringify(STRIPE_PORTAL_RETURN_URL));
-}
+const SUPABASE_AUTH_BASE = `${SUPABASE_BASE_URL}/auth/v1`;
 
 // ============================================================
-// FAIL-FAST EN PRODUCTION
+// FAIL-FAST PRODUCTION
 // ============================================================
 
 if (IS_PRODUCTION) {
@@ -858,104 +688,6 @@ if (IS_PRODUCTION) {
 
     process.exit(1);
   }
-} else {
-  if (!env("APP_URL")) {
-    console.warn(
-      "⚠️  APP_URL manquant — fallback http://localhost:5173 (dev uniquement)."
-    );
-  }
-
-  if (!env("OAUTH_REDIRECT_URL")) {
-    console.warn(
-      "⚠️  OAUTH_REDIRECT_URL manquant — fallback http://localhost:5173/ (dev uniquement)."
-    );
-  }
-}
-
-if (IS_PRODUCTION && PASSWORD_RESET_REDIRECT_URL.startsWith("http://localhost")) {
-  console.warn(
-    "⚠️  PASSWORD_RESET_REDIRECT_URL pointe vers localhost en production — les liens de réinitialisation seront inutilisables."
-  );
-}
-
-if (!STRIPE_SECRET_KEY) {
-  console.warn("⚠️  Stripe non configuré (STRIPE_SECRET_KEY manquant).");
-}
-
-if (!STRIPE_WEBHOOK_SECRET) {
-  console.warn(
-    "⚠️  STRIPE_WEBHOOK_SECRET manquant — les webhooks seront refusés."
-  );
-}
-
-if (STRIPE_SECRET_KEY) {
-  const missingPrices = [];
-
-  for (const [plan, periods] of Object.entries(STRIPE_PRICES)) {
-    for (const [period, priceId] of Object.entries(periods)) {
-      if (!priceId) {
-        missingPrices.push(
-          `STRIPE_PRICE_${plan.toUpperCase()}_${period.toUpperCase()}`
-        );
-      }
-    }
-  }
-
-  if (missingPrices.length > 0) {
-    console.error("");
-    console.error("❌ Price IDs Stripe manquants :");
-    for (const name of missingPrices) console.error(` - ${name}`);
-    console.error("");
-    console.error("Récupère-les dans Stripe Dashboard → Products →");
-    console.error("(ton produit) → Pricing, puis ajoute-les aux variables");
-    console.error("d'environnement. Le checkout échouera pour ces plans.");
-    console.error("");
-  }
-}
-
-if (!tiktokEnabled) {
-  console.warn(
-    "⚠️  TikTok non configuré (TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET manquant)."
-  );
-}
-
-if (!pinterestEnabled) {
-  console.warn(
-    "⚠️  Pinterest non configuré (PINTEREST_APP_ID / PINTEREST_APP_SECRET manquant)."
-  );
-}
-
-if (!youtubeEnabled) {
-  console.warn(
-    "⚠️  YouTube non configuré (YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET manquant)."
-  );
-}
-
-for (const [label, value] of [
-  ["TIKTOK_REDIRECT_URI", TIKTOK_REDIRECT_URI],
-  ["PINTEREST_REDIRECT_URI", PINTEREST_REDIRECT_URI],
-  ["YOUTUBE_REDIRECT_URI", YOUTUBE_REDIRECT_URI],
-  ["CANVA_REDIRECT_URI", CANVA_REDIRECT_URI],
-]) {
-  if (value.includes("#")) {
-    console.warn(
-      `⚠️  ${label} contient un "#" (${value}) — c'est invalide. Utilise https://<frontend>/<provider>/callback.`
-    );
-  }
-}
-
-if (pinterestEnabled && pinterestConfigError) {
-  console.error(
-    `❌ Pinterest : configuration incohérente (${pinterestConfigError}). Les routes Pinterest répondront 500 tant que ce n'est pas corrigé (API = ${PINTEREST_API_BASE}, OAuth = ${PINTEREST_OAUTH_BASE}).`
-  );
-}
-
-if (pinterestEnabled && !pinterestConfigError) {
-  console.warn(
-    PINTEREST_ENVIRONMENT === "sandbox"
-      ? `ℹ️  Pinterest en mode SANDBOX (API = ${PINTEREST_API_BASE}, OAuth = ${PINTEREST_OAUTH_BASE}).`
-      : `ℹ️  Pinterest en mode PRODUCTION (API = ${PINTEREST_API_BASE}, OAuth = ${PINTEREST_OAUTH_BASE}).`
-  );
 }
 
 // ============================================================
@@ -1113,7 +845,6 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "https://stone-prod.vercel.app",
-  "https://stone-prod-2fpb2146e-xsdevs-projects.vercel.app",
 ];
 
 const VERCEL_DEPLOYMENT_ORIGIN_PATTERN =
@@ -1123,12 +854,6 @@ const extraAllowedOrigins = (env("ALLOWED_ORIGINS") || "")
   .split(",")
   .map(normalizeOrigin)
   .filter(Boolean);
-
-if (extraAllowedOrigins.includes("*")) {
-  console.warn(
-    '⚠️  ALLOWED_ORIGINS contient "*" : ignoré (incompatible avec les credentials). Liste les origines explicitement.'
-  );
-}
 
 const allowedOrigins = new Set(
   [
@@ -1170,9 +895,7 @@ function setCorsHeaders(req, res) {
       !warnedRejectedOrigins.has(origin)
     ) {
       warnedRejectedOrigins.add(origin);
-      console.warn(
-        `[cors] Origine refusée : ${origin} — ajoute-la à ALLOWED_ORIGINS ou APP_URL si elle est légitime.`
-      );
+      console.warn(`[cors] Origine refusée : ${origin}`);
     }
   }
 
@@ -1203,7 +926,7 @@ function setSecurityHeaders(res) {
 }
 
 // ============================================================
-// VALIDATION DU redirectTo (anti open redirect)
+// VALIDATION DU redirectTo
 // ============================================================
 
 function sanitizeRedirectTo(value) {
@@ -1219,9 +942,7 @@ function sanitizeRedirectTo(value) {
     }
 
     if (!isOriginAllowed(parsed.origin)) {
-      console.warn(
-        `[oauth] redirectTo refusé (origine non autorisée) : ${parsed.origin}`
-      );
+      console.warn(`[oauth] redirectTo refusé : ${parsed.origin}`);
       return DEFAULT_OAUTH_REDIRECT;
     }
 
@@ -1344,7 +1065,7 @@ async function getJsonBody(req) {
 const getRawBody = (req) => readBody(req, MAX_JSON_BODY);
 
 // ============================================================
-// MULTIPART (avatar, vidéo)
+// MULTIPART
 // ============================================================
 
 function parseMultipart(req, { fileField, maxSize }) {
@@ -1436,9 +1157,7 @@ function parseMultipart(req, { fileField, maxSize }) {
         settle(reject, new HttpError(400, "Upload aborted"));
       }
     });
-    req.on("error", () =>
-      settle(reject, new HttpError(400, "Upload aborted"))
-    );
+    req.on("error", () => settle(reject, new HttpError(400, "Upload aborted")));
 
     req.pipe(bb);
   });
@@ -1537,9 +1256,7 @@ function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
         settle(reject, new HttpError(400, "Upload aborted"));
       }
     });
-    req.on("error", () =>
-      settle(reject, new HttpError(400, "Upload aborted"))
-    );
+    req.on("error", () => settle(reject, new HttpError(400, "Upload aborted")));
 
     req.pipe(bb);
   });
@@ -1561,12 +1278,7 @@ const AVATAR_EXTENSIONS = {
 function sniffImageType(buffer) {
   if (!buffer || buffer.length < 12) return null;
 
-  if (
-    buffer[0] === 0x89 &&
-    buffer[1] === 0x50 &&
-    buffer[2] === 0x4e &&
-    buffer[3] === 0x47
-  ) {
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
     return "image/png";
   }
 
@@ -1574,12 +1286,7 @@ function sniffImageType(buffer) {
     return "image/jpeg";
   }
 
-  if (
-    buffer[0] === 0x47 &&
-    buffer[1] === 0x49 &&
-    buffer[2] === 0x46 &&
-    buffer[3] === 0x38
-  ) {
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) {
     return "image/gif";
   }
 
@@ -1602,12 +1309,7 @@ function sniffVideoType(buffer) {
       : "video/mp4";
   }
 
-  if (
-    buffer[0] === 0x1a &&
-    buffer[1] === 0x45 &&
-    buffer[2] === 0xdf &&
-    buffer[3] === 0xa3
-  ) {
+  if (buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) {
     return "video/webm";
   }
 
@@ -1628,9 +1330,7 @@ function extractAvatarStoragePath(filePathOrUrl) {
     }
   }
 
-  if (!filePathOrUrl.startsWith("http")) {
-    return filePathOrUrl;
-  }
+  if (!filePathOrUrl.startsWith("http")) return filePathOrUrl;
 
   return null;
 }
@@ -1644,7 +1344,7 @@ function isOwnedAvatarPath(storagePath, userId) {
 }
 
 // ============================================================
-// LIMITE DE CONCURRENCE DES UPLOADS VIDÉO
+// LIMITE DE CONCURRENCE DES UPLOADS
 // ============================================================
 
 const MAX_VIDEO_UPLOADS = Math.max(1, Number(env("MAX_VIDEO_UPLOADS") || 2));
@@ -1777,9 +1477,7 @@ async function getAuthenticatedUser(req) {
   } = await supabase.auth.getUser(token);
 
   if (error || !user) {
-    const isExpired = Boolean(
-      error?.message?.toLowerCase().includes("expired")
-    );
+    const isExpired = Boolean(error?.message?.toLowerCase().includes("expired"));
 
     return {
       user: null,
@@ -1795,17 +1493,13 @@ async function getAuthenticatedUser(req) {
 }
 
 async function adminUpdateUser(userId, attributes) {
-  const result = await supabaseAdmin.auth.admin.updateUserById(
-    userId,
-    attributes
-  );
-
+  const result = await supabaseAdmin.auth.admin.updateUserById(userId, attributes);
   authCacheInvalidateUser(userId);
   return result;
 }
 
 // ============================================================
-// JETON DE RÉCUPÉRATION (mot de passe oublié)
+// JETON DE RÉCUPÉRATION
 // ============================================================
 
 function decodeJwtPayload(token) {
@@ -1813,9 +1507,7 @@ function decodeJwtPayload(token) {
     const parts = String(token).split(".");
     if (parts.length !== 3) return null;
 
-    const payload = JSON.parse(
-      Buffer.from(parts[1], "base64url").toString("utf8")
-    );
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
 
     return payload && typeof payload === "object" ? payload : null;
   } catch {
@@ -1842,49 +1534,30 @@ function isRecoverySessionToken(token) {
 }
 
 // ============================================================
-// MFA — AAL & FACTEURS (backend enforcement)
+// MFA — AAL & FACTEURS
 // ============================================================
-//
-// Le frontend élève la session en AAL2 via le client Supabase
-// (mfa.challengeAndVerify). Le backend se contente de :
-//   - renvoyer l'AAL courant (JWT `aal`) et les facteurs vérifiés
-//   - refuser les opérations sensibles si MFA activée + AAL1
-//     (code 403 MFA_REQUIRED → le frontend doit afficher le
-//     challenge MFA puis rejouer l'opération).
 
-/**
- * Lit le claim `aal` du JWT (aal1 / aal2), ou null si absent.
- * Un JWT sans claim `aal` correspond à une session sans MFA → aal1.
- */
 function getTokenAal(token) {
   if (!token) return null;
   const payload = decodeJwtPayload(token);
   return typeof payload?.aal === "string" ? payload.aal : null;
 }
 
-/**
- * true si l'utilisateur a au moins un facteur MFA vérifié
- * (TOTP ou WebAuthn / passkey).
- */
 function userHasVerifiedMfa(user) {
   const factors = Array.isArray(user?.factors) ? user.factors : [];
   return factors.some(
     (f) =>
       f?.status === "verified" &&
-      (f.factor_type === "totp" || f.factor_type === "webauthn")
+      (f.factor_type === "totp" || f.factor_type === "webauthn" ||
+        f.type === "totp" || f.type === "webauthn")
   );
 }
 
-/** Liste des facteurs vérifiés (objet Supabase factor). */
 function verifiedFactorsOf(user) {
   const factors = Array.isArray(user?.factors) ? user.factors : [];
   return factors.filter((f) => f?.status === "verified");
 }
 
-/**
- * Refuse l'opération si l'utilisateur a activé la MFA mais n'a pas
- * encore élevé sa session en AAL2. Sans MFA, no-op.
- */
 function requireAal2(user, token) {
   if (!userHasVerifiedMfa(user)) return;
   if (getTokenAal(token) === "aal2") return;
@@ -1894,6 +1567,120 @@ function requireAal2(user, token) {
     "Two-factor verification required. Complete the MFA challenge, then try again.",
     "MFA_REQUIRED"
   );
+}
+
+// ============================================================
+// MFA — PROXY SUPABASE AUTH (enroll / challenge / verify / list / unenroll)
+// ============================================================
+//
+// Le frontend n'a AUCUNE clé Supabase : tout passe par ces routes.
+// Elles appellent /auth/v1/factors* avec le token AAL1/AAL2 de
+// l'utilisateur, ce qui permet à Supabase d'appliquer ses règles
+// (unenroll d'un facteur vérifié = AAL2 requis, etc.).
+
+async function supabaseAuthRequest(pathname, { method = "GET", token, json } = {}) {
+  const headers = {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${token}`,
+    "X-Client-Info": "stone-server/1.0",
+  };
+  let body;
+
+  if (json) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(json);
+  }
+
+  let result;
+
+  try {
+    result = await fetchJson(
+      `${SUPABASE_AUTH_BASE}${pathname}`,
+      { method, headers, body },
+      20_000
+    );
+  } catch (error) {
+    throw upstreamError("Supabase Auth", error);
+  }
+
+  const { response, data } = result;
+
+  if (!response.ok) {
+    const msg =
+      data?.msg ||
+      data?.message ||
+      data?.error_description ||
+      (typeof data?.error === "string" ? data.error : null) ||
+      `Supabase Auth error (HTTP ${response.status})`;
+
+    throw new HttpError(
+      response.status === 429 ? 429 : response.status >= 500 ? 502 : 400,
+      msg,
+      data?.error_code || data?.code || "SUPABASE_AUTH_ERROR"
+    );
+  }
+
+  return data;
+}
+
+function normalizeFactorsResponse(data) {
+  if (Array.isArray(data)) {
+    return { all: data, totp: data.filter((f) => f.type === "totp") };
+  }
+
+  const all = Array.isArray(data?.all) ? data.all : [];
+  const totp = Array.isArray(data?.totp)
+    ? data.totp
+    : all.filter((f) => f.type === "totp");
+
+  return { all, totp };
+}
+
+function toPublicFactor(f) {
+  return {
+    id: f.id,
+    friendlyName: f.friendly_name || f.friendlyName || null,
+    factorType: f.type || f.factor_type || "totp",
+    status: f.status || "unverified",
+    createdAt: f.created_at || f.createdAt || null,
+  };
+}
+
+async function verifyMfaCode(factorId, code, token) {
+  // 1. Challenge
+  const challenge = await supabaseAuthRequest(
+    `/factors/${encodeURIComponent(factorId)}/challenge`,
+    { method: "POST", token, json: {} }
+  );
+
+  const challengeId = challenge?.id;
+  if (!challengeId) {
+    throw new HttpError(
+      502,
+      "Supabase did not return a challenge",
+      "MFA_NO_CHALLENGE"
+    );
+  }
+
+  // 2. Verify
+  const verify = await supabaseAuthRequest(
+    `/factors/${encodeURIComponent(factorId)}/verify`,
+    {
+      method: "POST",
+      token,
+      json: { challenge_id: challengeId, code },
+    }
+  );
+
+  if (!verify?.access_token || !verify?.refresh_token) {
+    throw new HttpError(
+      502,
+      "Supabase did not return a session",
+      "MFA_NO_SESSION"
+    );
+  }
+
+  return verify;
 }
 
 // ============================================================
@@ -1935,10 +1722,7 @@ function formatUser(user) {
     bio: metadata.bio || "",
     email_confirmed_at: user.email_confirmed_at || null,
     created_at: user.created_at || null,
-    // app_metadata n'est modifiable QUE par le serveur (service role) :
-    // un utilisateur ne peut pas s'auto-attribuer un abonnement.
     subscription: user.app_metadata?.subscription || null,
-    // Indicateur MFA calculé côté serveur (facteurs vérifiés).
     mfa_enabled: userHasVerifiedMfa(user),
   };
 }
@@ -1952,7 +1736,7 @@ const sessionPayload = (session) =>
     : null;
 
 // ============================================================
-// APP_METADATA — LECTURE / ÉCRITURE FIABLES
+// APP_METADATA
 // ============================================================
 
 async function getAppMetadata(userId) {
@@ -2239,7 +2023,6 @@ async function processStripeEvent(event) {
         if (!userId) break;
 
         const subscription = await retrieveSubscription(subscriptionId);
-
         await syncSubscriptionToUser(userId, subscription, { eventCreated });
         break;
       }
@@ -2260,7 +2043,7 @@ async function processStripeEvent(event) {
 }
 
 // ============================================================
-// STATE OAUTH SIGNÉ (anti-CSRF, stateless)
+// STATE OAUTH SIGNÉ
 // ============================================================
 
 function hmac(value) {
@@ -2309,25 +2092,6 @@ function checkOAuthState(provider, state, userId) {
   }
 }
 
-function verifyOAuthState(provider, state, userId) {
-  return checkOAuthState(provider, state, userId) === null;
-}
-
-const OAUTH_REJECT_HINTS = {
-  missing_code:
-    "le frontend n'a pas envoyé de `code` (refus de l'utilisateur, ou paramètres mal lus dans l'URL)",
-  code_too_long: "`code` anormalement long",
-  missing_state:
-    "le frontend n'a pas envoyé de `state` (paramètres perdus par le routeur / le hash)",
-  malformed_state: "`state` illisible ou tronqué",
-  bad_signature:
-    "le state n'a pas été signé avec le même OAUTH_STATE_SECRET (serveur redémarré avec un secret éphémère, ou URL de départ et de retour sur deux environnements différents)",
-  wrong_provider: "le state a été créé pour un autre réseau",
-  wrong_user:
-    "le state appartient à un autre utilisateur (changement de compte pendant l'autorisation)",
-  expired: "le state a plus de 10 minutes : relance la connexion",
-};
-
 function assertValidOAuthCallback(provider, body, userId) {
   const code = String(body.code || "");
 
@@ -2337,9 +2101,7 @@ function assertValidOAuthCallback(provider, body, userId) {
   else reason = checkOAuthState(provider, body.state, userId);
 
   if (reason) {
-    console.warn(
-      `[oauth:${provider}] callback rejeté (${reason}) : ${OAUTH_REJECT_HINTS[reason] || ""}`
-    );
+    console.warn(`[oauth:${provider}] callback rejeté (${reason})`);
     throw new HttpError(400, "Invalid or expired state", "OAUTH_STATE_INVALID");
   }
 
@@ -2347,7 +2109,7 @@ function assertValidOAuthCallback(provider, body, userId) {
 }
 
 // ============================================================
-// TOKENS OAUTH — LECTURE / ÉCRITURE COMMUNES
+// TOKENS OAUTH — LECTURE / ÉCRITURE
 // ============================================================
 
 async function selectTokenRow(table, userId) {
@@ -2393,19 +2155,16 @@ const iso = (ms) => new Date(ms).toISOString();
 
 const TIKTOK_FRIENDLY_ERRORS = {
   unaudited_client_can_only_post_to_private_accounts:
-    "Mode sandbox : TikTok n'accepte que des posts privés (SELF_ONLY) tant que l'app n'est pas auditée. Définis privacy_level=SELF_ONLY ou passe en mode brouillon.",
+    "Mode sandbox : TikTok n'accepte que des posts privés (SELF_ONLY) tant que l'app n'est pas auditée.",
   url_ownership_unverified:
-    "TikTok could not verify the media URL prefix. Check PUBLIC_API_URL and the URL properties in the TikTok developer portal.",
-  spam_risk_too_many_posts:
-    "TikTok daily posting limit reached. Please try again later.",
-  spam_risk_user_banned_from_posting:
-    "This TikTok account cannot post right now.",
-  reached_active_user_cap:
-    "TikTok daily user cap reached for this app. Try again later.",
+    "TikTok could not verify the media URL prefix. Check PUBLIC_API_URL.",
+  spam_risk_too_many_posts: "TikTok daily posting limit reached.",
+  spam_risk_user_banned_from_posting: "This TikTok account cannot post right now.",
+  reached_active_user_cap: "TikTok daily user cap reached for this app.",
   app_version_check_failed:
-    "Please update your TikTok app to the latest version to use this feature, then try again.",
+    "Please update your TikTok app to the latest version to use this feature.",
   access_denied:
-    "Connection refused by TikTok. In sandbox mode, add the TikTok account as a Sandbox tester in the TikTok developer portal, then try again.",
+    "Connection refused by TikTok. In sandbox mode, add the TikTok account as a Sandbox tester.",
 };
 
 async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) {
@@ -2425,11 +2184,7 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
   let result;
 
   try {
-    result = await fetchJson(
-      `${TIKTOK_API}${pathname}`,
-      { method, headers, body },
-      20_000
-    );
+    result = await fetchJson(`${TIKTOK_API}${pathname}`, { method, headers, body }, 20_000);
   } catch (error) {
     throw upstreamError("TikTok", error);
   }
@@ -2441,38 +2196,22 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
   }
 
   if (data.error?.code && data.error.code !== "ok") {
-    console.error(
-      "[tiktok]",
-      pathname,
-      JSON.stringify({
-        code: data.error.code,
-        message: data.error.message,
-        log_id: data.error.log_id,
-      })
-    );
-
     throw new HttpError(
       400,
-      TIKTOK_FRIENDLY_ERRORS[data.error.code] ||
-        data.error.message ||
-        data.error.code,
+      TIKTOK_FRIENDLY_ERRORS[data.error.code] || data.error.message || data.error.code,
       data.error.code
     );
   }
 
   if (!response.ok) {
-    throw new HttpError(
-      upstreamStatus(response.status),
-      `TikTok error (HTTP ${response.status})`,
-      "TIKTOK_UPSTREAM"
-    );
+    throw new HttpError(upstreamStatus(response.status), `TikTok error (HTTP ${response.status})`, "TIKTOK_UPSTREAM");
   }
 
   return data;
 }
 
 // ============================================================
-// TIKTOK — STOCKAGE / REFRESH DES TOKENS
+// TIKTOK — TOKENS
 // ============================================================
 
 const TIKTOK_PROFILE_REFRESH_MS = 30 * 60 * 1000;
@@ -2513,11 +2252,7 @@ function buildTikTokTokenRow(t) {
 
 async function saveTikTokTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("tiktok_accounts").upsert(
-    {
-      user_id: userId,
-      ...buildTikTokTokenRow(t),
-      ...extra,
-    },
+    { user_id: userId, ...buildTikTokTokenRow(t), ...extra },
     { onConflict: "user_id" }
   );
 
@@ -2568,11 +2303,7 @@ async function getValidTikTokToken(userId) {
       }
 
       if (!refreshed?.access_token) {
-        throw new HttpError(
-          502,
-          "TikTok returned an invalid token response",
-          "TIKTOK_BAD_TOKEN_RESPONSE"
-        );
+        throw new HttpError(502, "TikTok returned an invalid token response", "TIKTOK_BAD_TOKEN_RESPONSE");
       }
 
       const applied = await updateTokensIfUnchanged(
@@ -2585,17 +2316,9 @@ async function getValidTikTokToken(userId) {
       if (applied) return refreshed.access_token;
     }
 
-    throw new HttpError(
-      409,
-      "TikTok account changed during token refresh, please retry",
-      "TIKTOK_REFRESH_CONFLICT"
-    );
+    throw new HttpError(409, "TikTok account changed during token refresh, please retry", "TIKTOK_REFRESH_CONFLICT");
   });
 }
-
-// ============================================================
-// TIKTOK — RAFRAÎCHISSEMENT DU PROFIL (avatar)
-// ============================================================
 
 async function refreshTikTokProfile(userId, { force = false } = {}) {
   const lockKey = `tiktok-profile:${userId}:${force ? "force" : "normal"}`;
@@ -2607,9 +2330,7 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
     const now = Date.now();
     const retryAt = tiktokProfileRetryAt.get(userId) || 0;
 
-    if (now < retryAt) {
-      return { account, needsReconnect: false };
-    }
+    if (now < retryAt) return { account, needsReconnect: false };
 
     const last = tiktokProfileRefreshedAt.get(userId) || 0;
     if (!force && now - last < TIKTOK_PROFILE_REFRESH_MS) {
@@ -2617,14 +2338,10 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
     }
 
     if (tiktokProfileRefreshedAt.size > 10_000) {
-      tiktokProfileRefreshedAt.delete(
-        tiktokProfileRefreshedAt.keys().next().value
-      );
+      tiktokProfileRefreshedAt.delete(tiktokProfileRefreshedAt.keys().next().value);
     }
     if (tiktokProfileRetryAt.size > 10_000) {
-      tiktokProfileRetryAt.delete(
-        tiktokProfileRetryAt.keys().next().value
-      );
+      tiktokProfileRetryAt.delete(tiktokProfileRetryAt.keys().next().value);
     }
 
     try {
@@ -2647,18 +2364,11 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
 
       const { error } = await supabaseAdmin
         .from("tiktok_accounts")
-        .update({
-          avatar_url: profile.avatar_url,
-          display_name: displayName,
-        })
+        .update({ avatar_url: profile.avatar_url, display_name: displayName })
         .eq("user_id", userId);
 
       if (error) {
-        console.warn("TikTok profile save failed:", error.message);
-        tiktokProfileRetryAt.set(
-          userId,
-          now + TIKTOK_PROFILE_TRANSIENT_RETRY_MS
-        );
+        tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_TRANSIENT_RETRY_MS);
         return { account, needsReconnect: false };
       }
 
@@ -2666,43 +2376,32 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
       tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_MIN_INTERVAL_MS);
 
       return {
-        account: {
-          ...account,
-          avatar_url: profile.avatar_url,
-          display_name: displayName,
-        },
+        account: { ...account, avatar_url: profile.avatar_url, display_name: displayName },
         needsReconnect: false,
       };
     } catch (error) {
       if (
         error instanceof HttpError &&
-        (error.code === "TIKTOK_REFRESH_EXPIRED" ||
-          error.code === "TIKTOK_NOT_CONNECTED")
+        (error.code === "TIKTOK_REFRESH_EXPIRED" || error.code === "TIKTOK_NOT_CONNECTED")
       ) {
         tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_DEAD_RETRY_MS);
         return { account, needsReconnect: true };
       }
 
-      console.warn("TikTok profile refresh failed:", error.message);
-      tiktokProfileRetryAt.set(
-        userId,
-        now + TIKTOK_PROFILE_TRANSIENT_RETRY_MS
-      );
+      tiktokProfileRetryAt.set(userId, now + TIKTOK_PROFILE_TRANSIENT_RETRY_MS);
       return { account, needsReconnect: false };
     }
   });
 }
 
 // ============================================================
-// TIKTOK — UPLOAD VIDÉO
+// TIKTOK — UPLOAD
 // ============================================================
 
 function computeChunking(size) {
   const MB = 1024 * 1024;
 
-  if (size <= 64 * MB) {
-    return { chunkSize: size, totalChunks: 1 };
-  }
+  if (size <= 64 * MB) return { chunkSize: size, totalChunks: 1 };
 
   const chunkSize = 10 * MB;
   return { chunkSize, totalChunks: Math.floor(size / chunkSize) };
@@ -2729,32 +2428,19 @@ async function putChunk(uploadUrl, part, mimeType, start, end, total) {
 
       if (response.ok || response.status === 206) return;
 
-      if (
-        response.status >= 400 &&
-        response.status < 500 &&
-        response.status !== 429
-      ) {
-        throw new HttpError(
-          502,
-          `TikTok upload rejected (HTTP ${response.status})`,
-          "TIKTOK_UPLOAD_REJECTED"
-        );
+      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        throw new HttpError(502, `TikTok upload rejected (HTTP ${response.status})`, "TIKTOK_UPLOAD_REJECTED");
       }
 
       lastError = new Error(`HTTP ${response.status}`);
     } catch (error) {
-      if (error instanceof HttpError && error.code === "TIKTOK_UPLOAD_REJECTED") {
-        throw error;
-      }
+      if (error instanceof HttpError && error.code === "TIKTOK_UPLOAD_REJECTED") throw error;
       lastError = error;
     }
 
-    if (attempt < MAX_ATTEMPTS) {
-      await delay(attempt * 1000);
-    }
+    if (attempt < MAX_ATTEMPTS) await delay(attempt * 1000);
   }
 
-  console.error("TikTok chunk upload failed:", lastError?.message);
   throw new HttpError(502, "TikTok upload failed, please retry", "TIKTOK_UPLOAD_FAILED");
 }
 
@@ -2771,12 +2457,11 @@ async function uploadVideoToTikTok(uploadUrl, buffer, mimeType, chunking) {
 }
 
 // ============================================================
-// TIKTOK — MODES / PRIVACY (logique sandbox)
+// TIKTOK — MODES / PRIVACY
 // ============================================================
 
 function resolvePrivacy(requested) {
   if (TIKTOK_SANDBOX || TIKTOK_FORCE_DRAFT) return "SELF_ONLY";
-
   const value = String(requested || "SELF_ONLY");
   return TIKTOK_PRIVACY_LEVELS.has(value) ? value : "SELF_ONLY";
 }
@@ -2825,10 +2510,7 @@ async function initTikTokPublish(accessToken, mode, postInfoFields, sourceInfo) 
       })
     : tiktokApi("/v2/post/publish/video/init/", {
         token: accessToken,
-        json: {
-          post_info: buildPostInfo(postInfoFields),
-          source_info: sourceInfo,
-        },
+        json: { post_info: buildPostInfo(postInfoFields), source_info: sourceInfo },
       });
 }
 
@@ -2845,14 +2527,11 @@ function isValidTikTokPublishId(value) {
 }
 
 // ============================================================
-// TIKTOK — PHOTOS (carrousel)
+// TIKTOK — PHOTOS
 // ============================================================
 
 async function ensureTikTokMediaBucket() {
-  const { error } = await supabaseAdmin.storage.createBucket(
-    TIKTOK_MEDIA_BUCKET,
-    { public: false }
-  );
+  const { error } = await supabaseAdmin.storage.createBucket(TIKTOK_MEDIA_BUCKET, { public: false });
 
   if (error && !/already exists|duplicate/i.test(error.message || "")) {
     console.warn("TikTok media bucket:", error.message);
@@ -2890,7 +2569,7 @@ async function removeTikTokPhotos(names) {
   try {
     await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).remove(names);
   } catch {
-    // le balayage périodique s'en chargera
+    // balayage périodique
   }
 }
 
@@ -2929,9 +2608,7 @@ async function storeTikTokPhotos(photos) {
 }
 
 async function serveTikTokMedia(req, res, fileName) {
-  const { data, error } = await supabaseAdmin.storage
-    .from(TIKTOK_MEDIA_BUCKET)
-    .download(fileName);
+  const { data, error } = await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).download(fileName);
 
   if (error || !data) {
     sendJson(res, 404, { success: false, error: "Not found" });
@@ -2973,30 +2650,14 @@ async function probePublicPhoto(imageUrl, index = 1, total = 1) {
     } finally {
       clearTimeout(timer);
     }
-  } catch (error) {
-    console.error(
-      "[tiktok:photos] probe failed:",
-      imageUrl,
-      error?.message || error
-    );
-
-    throw new HttpError(
-      502,
-      `The photo URL is not reachable from the internet${label}. Check PUBLIC_API_URL (it must be the public domain of this API server).`,
-      "PHOTO_URL_UNREACHABLE"
-    );
+  } catch {
+    throw new HttpError(502, `The photo URL is not reachable${label}. Check PUBLIC_API_URL.`, "PHOTO_URL_UNREACHABLE");
   }
 
   const okType = /^image\/(jpeg|webp)/i.test(contentType || "");
 
-  console.log("[tiktok:photos] probe", status, contentType, imageUrl);
-
   if (status !== 200 || !okType) {
-    throw new HttpError(
-      502,
-      `The photo URL did not return a valid image${label} (HTTP ${status}, ${contentType || "no content-type"}). PUBLIC_API_URL probably points to the wrong host.`,
-      "PHOTO_URL_INVALID"
-    );
+    throw new HttpError(502, `Invalid image${label} (HTTP ${status}, ${contentType || "no content-type"})`, "PHOTO_URL_INVALID");
   }
 }
 
@@ -3009,9 +2670,7 @@ async function probePublicPhotos(imageUrls) {
     await Promise.all(
       imageUrls
         .slice(i, i + BATCH)
-        .map((imageUrl, offset) =>
-          probePublicPhoto(imageUrl, i + offset + 1, imageUrls.length)
-        )
+        .map((url, offset) => probePublicPhoto(url, i + offset + 1, imageUrls.length))
     );
   }
 }
@@ -3054,16 +2713,6 @@ function initTikTokPhotoPublish(accessToken, mode, postInfo, imageUrls, coverInd
     media_type: "PHOTO",
   };
 
-  console.log(
-    "[tiktok:photos] init",
-    JSON.stringify({
-      post_mode: payload.post_mode,
-      cover: coverIndex,
-      count: imageUrls.length,
-      first_url: imageUrls[0],
-    })
-  );
-
   return tiktokApi("/v2/post/publish/content/init/", {
     token: accessToken,
     json: payload,
@@ -3071,7 +2720,7 @@ function initTikTokPhotoPublish(accessToken, mode, postInfo, imageUrls, coverInd
 }
 
 // ============================================================
-// PINTEREST — APPEL API
+// PINTEREST
 // ============================================================
 
 async function pinterestApi(
@@ -3082,11 +2731,7 @@ async function pinterestApi(
   let body;
 
   if (basic) {
-    const credentials = Buffer.from(
-      `${PINTEREST_APP_ID}:${PINTEREST_APP_SECRET}`
-    ).toString("base64");
-
-    headers.Authorization = `Basic ${credentials}`;
+    headers.Authorization = `Basic ${Buffer.from(`${PINTEREST_APP_ID}:${PINTEREST_APP_SECRET}`).toString("base64")}`;
   } else if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
@@ -3125,10 +2770,6 @@ async function pinterestApi(
 
   return data;
 }
-
-// ============================================================
-// PINTEREST — STOCKAGE / REFRESH DES TOKENS
-// ============================================================
 
 function buildPinterestTokenRow(t, { replaceRefresh = false } = {}) {
   const now = Date.now();
@@ -3188,17 +2829,8 @@ async function getValidPinterestToken(userId) {
   const load = async () => {
     const account = await getPinterestAccount(userId);
 
-    if (!account) {
-      throw new HttpError(
-        400,
-        "Pinterest account not connected",
-        "PINTEREST_NOT_CONNECTED"
-      );
-    }
-
-    if (!pinterestAccountMatchesEnv(account)) {
-      throw reconnectError("Pinterest", "PINTEREST_ENV_MISMATCH");
-    }
+    if (!account) throw new HttpError(400, "Pinterest account not connected", "PINTEREST_NOT_CONNECTED");
+    if (!pinterestAccountMatchesEnv(account)) throw reconnectError("Pinterest", "PINTEREST_ENV_MISMATCH");
 
     return account;
   };
@@ -3211,7 +2843,6 @@ async function getValidPinterestToken(userId) {
       const account = await load();
 
       if (isTokenFresh(account)) return account.access_token;
-
       if (!account.refresh_token || isPast(account.refresh_expires_at)) {
         throw reconnectError("Pinterest", "PINTEREST_REFRESH_EXPIRED");
       }
@@ -3229,18 +2860,12 @@ async function getValidPinterestToken(userId) {
           },
         });
       } catch (error) {
-        if (isPinterestInvalidGrant(error)) {
-          throw reconnectError("Pinterest", "PINTEREST_REFRESH_EXPIRED");
-        }
+        if (isPinterestInvalidGrant(error)) throw reconnectError("Pinterest", "PINTEREST_REFRESH_EXPIRED");
         throw error;
       }
 
       if (!refreshed?.access_token) {
-        throw new HttpError(
-          502,
-          "Pinterest returned an invalid token response",
-          "PINTEREST_BAD_TOKEN_RESPONSE"
-        );
+        throw new HttpError(502, "Pinterest returned an invalid token response", "PINTEREST_BAD_TOKEN_RESPONSE");
       }
 
       const applied = await updateTokensIfUnchanged(
@@ -3253,16 +2878,12 @@ async function getValidPinterestToken(userId) {
       if (applied) return refreshed.access_token;
     }
 
-    throw new HttpError(
-      409,
-      "Pinterest account changed during token refresh, please retry",
-      "PINTEREST_REFRESH_CONFLICT"
-    );
+    throw new HttpError(409, "Pinterest account changed during token refresh, please retry", "PINTEREST_REFRESH_CONFLICT");
   });
 }
 
 // ============================================================
-// YOUTUBE — APPEL API GOOGLE
+// YOUTUBE
 // ============================================================
 
 async function googleRequest(requestUrl, { method = "GET", token, form, json } = {}) {
@@ -3294,10 +2915,7 @@ async function googleRequest(requestUrl, { method = "GET", token, form, json } =
 
     throw new HttpError(
       upstreamStatus(response.status),
-      data.error_description ||
-        data.error?.message ||
-        oauthError ||
-        `Google error (HTTP ${response.status})`,
+      data.error_description || data.error?.message || oauthError || `Google error (HTTP ${response.status})`,
       oauthError
     );
   }
@@ -3306,10 +2924,7 @@ async function googleRequest(requestUrl, { method = "GET", token, form, json } =
 }
 
 async function fetchYouTubeChannel(accessToken) {
-  const data = await googleRequest(
-    `${YOUTUBE_API_BASE}/channels?part=snippet&mine=true`,
-    { token: accessToken }
-  );
+  const data = await googleRequest(`${YOUTUBE_API_BASE}/channels?part=snippet&mine=true`, { token: accessToken });
 
   const channel = data.items?.[0];
   if (!channel) return null;
@@ -3320,17 +2935,9 @@ async function fetchYouTubeChannel(accessToken) {
     id: channel.id,
     title: channel.snippet?.title || null,
     customUrl: channel.snippet?.customUrl || null,
-    avatarUrl:
-      thumbnails.high?.url ||
-      thumbnails.medium?.url ||
-      thumbnails.default?.url ||
-      null,
+    avatarUrl: thumbnails.high?.url || thumbnails.medium?.url || thumbnails.default?.url || null,
   };
 }
-
-// ============================================================
-// YOUTUBE — STOCKAGE / REFRESH DES TOKENS
-// ============================================================
 
 function buildYouTubeTokenRow(t) {
   const now = Date.now();
@@ -3357,10 +2964,7 @@ function buildYouTubeTokenRow(t) {
 async function saveYouTubeTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("youtube_accounts")
-    .upsert(
-      { user_id: userId, ...buildYouTubeTokenRow(t), ...extra },
-      { onConflict: "user_id" }
-    );
+    .upsert({ user_id: userId, ...buildYouTubeTokenRow(t), ...extra }, { onConflict: "user_id" });
 
   if (error) throw dbError("youtube_accounts upsert", error);
 }
@@ -3377,13 +2981,7 @@ async function getValidYouTubeToken(userId) {
   const load = async () => {
     const account = await getYouTubeAccount(userId);
 
-    if (!account) {
-      throw new HttpError(
-        400,
-        "YouTube account not connected",
-        "YOUTUBE_NOT_CONNECTED"
-      );
-    }
+    if (!account) throw new HttpError(400, "YouTube account not connected", "YOUTUBE_NOT_CONNECTED");
 
     return account;
   };
@@ -3396,10 +2994,7 @@ async function getValidYouTubeToken(userId) {
       const account = await load();
 
       if (isTokenFresh(account)) return account.access_token;
-
-      if (youtubeRefreshExpired(account)) {
-        throw reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
-      }
+      if (youtubeRefreshExpired(account)) throw reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
 
       let refreshed;
 
@@ -3421,11 +3016,7 @@ async function getValidYouTubeToken(userId) {
       }
 
       if (!refreshed?.access_token) {
-        throw new HttpError(
-          502,
-          "Google returned an invalid token response",
-          "YOUTUBE_BAD_TOKEN_RESPONSE"
-        );
+        throw new HttpError(502, "Google returned an invalid token response", "YOUTUBE_BAD_TOKEN_RESPONSE");
       }
 
       const applied = await updateTokensIfUnchanged(
@@ -3438,27 +3029,15 @@ async function getValidYouTubeToken(userId) {
       if (applied) return refreshed.access_token;
     }
 
-    throw new HttpError(
-      409,
-      "YouTube account changed during token refresh, please retry",
-      "YOUTUBE_REFRESH_CONFLICT"
-    );
+    throw new HttpError(409, "YouTube account changed during token refresh, please retry", "YOUTUBE_REFRESH_CONFLICT");
   });
 }
 
-// ============================================================
-// YOUTUBE — PUBLICATION (upload resumable)
-// ============================================================
-
 const YOUTUBE_FRIENDLY_ERRORS = {
-  quotaExceeded:
-    "YouTube daily quota reached for this app. Please try again tomorrow.",
-  dailyLimitExceeded:
-    "YouTube daily quota reached for this app. Please try again tomorrow.",
-  uploadLimitExceeded:
-    "This YouTube channel has reached its daily upload limit. Please try again later.",
-  youtubeSignupRequired:
-    "This Google account has no YouTube channel. Create one on youtube.com, then reconnect.",
+  quotaExceeded: "YouTube daily quota reached for this app. Please try again tomorrow.",
+  dailyLimitExceeded: "YouTube daily quota reached for this app. Please try again tomorrow.",
+  uploadLimitExceeded: "This YouTube channel has reached its daily upload limit. Please try again later.",
+  youtubeSignupRequired: "This Google account has no YouTube channel. Create one on youtube.com, then reconnect.",
   forbidden: "YouTube refused this upload for this channel.",
   invalidTitle: "Invalid YouTube title.",
   invalidDescription: "Invalid YouTube description.",
@@ -3466,8 +3045,7 @@ const YOUTUBE_FRIENDLY_ERRORS = {
   invalidPublishAt: "Invalid scheduled date. Pick a date in the future.",
   invalidVideoMetadata: "YouTube rejected the video metadata.",
   mediaBodyRequired: "The video file is empty.",
-  videoTooLong:
-    "This video is too long for your YouTube account. Verify your channel to upload longer videos.",
+  videoTooLong: "This video is too long for your YouTube account.",
 };
 
 function youtubeApiError(status, data) {
@@ -3476,21 +3054,12 @@ function youtubeApiError(status, data) {
     (typeof data?.error === "string" ? data.error : undefined) ||
     data?.error?.status;
 
-  console.error(
-    "[youtube]",
-    JSON.stringify({ status, reason, message: data?.error?.message })
-  );
-
   if (status === 401 || reason === "authError" || reason === "invalid_grant") {
     return reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
   }
 
   if (reason === "insufficientPermissions") {
-    return new HttpError(
-      409,
-      "YouTube permission missing, please reconnect your YouTube account.",
-      "YOUTUBE_SCOPE_MISSING"
-    );
+    return new HttpError(409, "YouTube permission missing, please reconnect your YouTube account.", "YOUTUBE_SCOPE_MISSING");
   }
 
   if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
@@ -3499,9 +3068,7 @@ function youtubeApiError(status, data) {
 
   return new HttpError(
     upstreamStatus(status),
-    YOUTUBE_FRIENDLY_ERRORS[reason] ||
-      data?.error?.message ||
-      `YouTube error (HTTP ${status})`,
+    YOUTUBE_FRIENDLY_ERRORS[reason] || data?.error?.message || `YouTube error (HTTP ${status})`,
     reason
   );
 }
@@ -3539,55 +3106,27 @@ function parseYouTubeTags(raw) {
 function buildYouTubeMetadata(fields) {
   const title = String(fields.title || "").replace(/[<>]/g, "").trim();
 
-  if (!title) {
-    throw new HttpError(
-      400,
-      "A title is required for YouTube videos.",
-      "YOUTUBE_TITLE_REQUIRED"
-    );
-  }
-
-  if (title.length > YOUTUBE_TITLE_MAX) {
-    throw new HttpError(
-      400,
-      `The YouTube title must be at most ${YOUTUBE_TITLE_MAX} characters.`,
-      "YOUTUBE_TITLE_TOO_LONG"
-    );
-  }
+  if (!title) throw new HttpError(400, "A title is required for YouTube videos.", "YOUTUBE_TITLE_REQUIRED");
+  if (title.length > YOUTUBE_TITLE_MAX) throw new HttpError(400, `The YouTube title must be at most ${YOUTUBE_TITLE_MAX} characters.`, "YOUTUBE_TITLE_TOO_LONG");
 
   const description = String(fields.description || "").replace(/[<>]/g, "").trim();
 
   if (Buffer.byteLength(description, "utf8") > YOUTUBE_DESCRIPTION_MAX_BYTES) {
-    throw new HttpError(
-      400,
-      "The YouTube description is too long (max 5,000 characters).",
-      "YOUTUBE_DESCRIPTION_TOO_LONG"
-    );
+    throw new HttpError(400, "The YouTube description is too long (max 5,000 characters).", "YOUTUBE_DESCRIPTION_TOO_LONG");
   }
 
   if (fields.made_for_kids !== "true" && fields.made_for_kids !== "false") {
-    throw new HttpError(
-      400,
-      "Tell YouTube if this video is made for kids.",
-      "YOUTUBE_MADE_FOR_KIDS_REQUIRED"
-    );
+    throw new HttpError(400, "Tell YouTube if this video is made for kids.", "YOUTUBE_MADE_FOR_KIDS_REQUIRED");
   }
 
-  let privacy = YOUTUBE_PRIVACY_LEVELS.has(fields.privacy_level)
-    ? fields.privacy_level
-    : "private";
-
+  let privacy = YOUTUBE_PRIVACY_LEVELS.has(fields.privacy_level) ? fields.privacy_level : "private";
   let publishAt = null;
 
   if (fields.publish_at) {
     const date = new Date(fields.publish_at);
 
     if (Number.isNaN(date.getTime()) || date.getTime() < Date.now() + 60_000) {
-      throw new HttpError(
-        400,
-        "Pick a date and time in the future.",
-        "YOUTUBE_PUBLISH_AT_INVALID"
-      );
+      throw new HttpError(400, "Pick a date and time in the future.", "YOUTUBE_PUBLISH_AT_INVALID");
     }
 
     publishAt = date.toISOString();
@@ -3595,20 +3134,13 @@ function buildYouTubeMetadata(fields) {
   }
 
   const tags = parseYouTubeTags(fields.tags);
-  const categoryId = /^\d{1,3}$/.test(String(fields.category_id || ""))
-    ? String(fields.category_id)
-    : "22";
+  const categoryId = /^\d{1,3}$/.test(String(fields.category_id || "")) ? String(fields.category_id) : "22";
 
   return {
     privacy,
     publishAt,
     metadata: {
-      snippet: {
-        title,
-        description,
-        categoryId,
-        ...(tags.length > 0 ? { tags } : {}),
-      },
+      snippet: { title, description, categoryId, ...(tags.length > 0 ? { tags } : {}) },
       status: {
         privacyStatus: privacy,
         selfDeclaredMadeForKids: fields.made_for_kids === "true",
@@ -3648,26 +3180,16 @@ async function initYouTubeUpload(accessToken, metadata, size, mimeType) {
   const location = response.headers.get("location");
 
   if (!location || !location.startsWith("https://www.googleapis.com/")) {
-    throw new HttpError(
-      502,
-      "YouTube did not return a valid upload URL",
-      "YOUTUBE_NO_UPLOAD_URL"
-    );
+    throw new HttpError(502, "YouTube did not return a valid upload URL", "YOUTUBE_NO_UPLOAD_URL");
   }
 
   return location;
 }
 
 async function youtubePut(uploadUrl, headers, body) {
-  const { response, data } = await fetchJson(
-    uploadUrl,
-    { method: "PUT", headers, body, redirect: "manual" },
-    120_000
-  );
+  const { response, data } = await fetchJson(uploadUrl, { method: "PUT", headers, body, redirect: "manual" }, 120_000);
 
-  if (response.status === 200 || response.status === 201) {
-    return { done: true, video: data };
-  }
+  if (response.status === 200 || response.status === 201) return { done: true, video: data };
 
   if (response.status === 308) {
     const match = /bytes=0-(\d+)/.exec(response.headers.get("range") || "");
@@ -3691,58 +3213,41 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 
       const result = await youtubePut(
         uploadUrl,
-        {
-          "Content-Type": mimeType,
-          "Content-Range": `bytes ${offset}-${end}/${total}`,
-        },
+        { "Content-Type": mimeType, "Content-Range": `bytes ${offset}-${end}/${total}` },
         buffer.subarray(offset, end + 1)
       );
 
       if (result.done) return result.video;
 
-      if (result.next <= offset) {
-        throw Object.assign(new Error("No progress"), { status: 500 });
-      }
+      if (result.next <= offset) throw Object.assign(new Error("No progress"), { status: 500 });
 
       offset = result.next;
     } catch (error) {
       const status = error?.status;
 
-      if (status && status < 500 && status !== 429) {
-        throw youtubeApiError(status, error.data);
-      }
+      if (status && status < 500 && status !== 429) throw youtubeApiError(status, error.data);
 
       failures++;
 
       if (failures > 5) {
-        console.error("YouTube upload failed:", error?.message);
-        throw new HttpError(
-          502,
-          "YouTube upload failed, please retry",
-          "YOUTUBE_UPLOAD_FAILED"
-        );
+        throw new HttpError(502, "YouTube upload failed, please retry", "YOUTUBE_UPLOAD_FAILED");
       }
 
       await delay(failures * 1000);
 
       try {
-        const query = await youtubePut(
-          uploadUrl,
-          { "Content-Range": `bytes */${total}` },
-          undefined
-        );
-
+        const query = await youtubePut(uploadUrl, { "Content-Range": `bytes */${total}` }, undefined);
         if (query.done) return query.video;
         offset = query.next;
       } catch {
-        // on retentera au prochain tour
+        // retry
       }
     }
   }
 }
 
 // ============================================================
-// CANVA — HELPERS (PKCE + APPELS API)
+// CANVA
 // ============================================================
 
 const canvaPkce = new Map();
@@ -3774,17 +3279,12 @@ function takeCanvaVerifier(state) {
   return entry && entry.expires > Date.now() ? entry.verifier : null;
 }
 
-async function canvaApi(
-  pathname,
-  { method = "GET", token, basic = false, form, json } = {}
-) {
+async function canvaApi(pathname, { method = "GET", token, basic = false, form, json } = {}) {
   const headers = { Accept: "application/json" };
   let body;
 
   if (basic) {
-    headers.Authorization =
-      "Basic " +
-      Buffer.from(`${CANVA_CLIENT_ID}:${CANVA_CLIENT_SECRET}`).toString("base64");
+    headers.Authorization = "Basic " + Buffer.from(`${CANVA_CLIENT_ID}:${CANVA_CLIENT_SECRET}`).toString("base64");
   } else if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
@@ -3842,10 +3342,7 @@ function buildCanvaTokenRow(t) {
 async function saveCanvaTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("canva_accounts")
-    .upsert(
-      { user_id: userId, ...buildCanvaTokenRow(t), ...extra },
-      { onConflict: "user_id" }
-    );
+    .upsert({ user_id: userId, ...buildCanvaTokenRow(t), ...extra }, { onConflict: "user_id" });
 
   if (error) throw dbError("canva_accounts upsert", error);
 }
@@ -3855,11 +3352,7 @@ const getCanvaAccount = (userId) => selectTokenRow("canva_accounts", userId);
 async function getValidCanvaToken(userId) {
   const load = async () => {
     const account = await getCanvaAccount(userId);
-
-    if (!account) {
-      throw new HttpError(400, "Canva account not connected", "CANVA_NOT_CONNECTED");
-    }
-
+    if (!account) throw new HttpError(400, "Canva account not connected", "CANVA_NOT_CONNECTED");
     return account;
   };
 
@@ -3871,10 +3364,7 @@ async function getValidCanvaToken(userId) {
       const account = await load();
 
       if (isTokenFresh(account)) return account.access_token;
-
-      if (!account.refresh_token) {
-        throw reconnectError("Canva", "CANVA_REFRESH_EXPIRED");
-      }
+      if (!account.refresh_token) throw reconnectError("Canva", "CANVA_REFRESH_EXPIRED");
 
       let refreshed;
 
@@ -3882,10 +3372,7 @@ async function getValidCanvaToken(userId) {
         refreshed = await canvaApi("/oauth/token", {
           method: "POST",
           basic: true,
-          form: {
-            grant_type: "refresh_token",
-            refresh_token: account.refresh_token,
-          },
+          form: { grant_type: "refresh_token", refresh_token: account.refresh_token },
         });
       } catch (error) {
         if (
@@ -3939,9 +3426,7 @@ route("GET", "/api/health", ({ res }) => {
     server: "Stone",
     supabase: true,
     stripe: Boolean(stripe),
-    tiktok: tiktokEnabled
-      ? { enabled: true, ...tiktokCapabilities() }
-      : { enabled: false },
+    tiktok: tiktokEnabled ? { enabled: true, ...tiktokCapabilities() } : { enabled: false },
     pinterest: pinterestUsable,
     youtube: youtubeEnabled,
     canva: canvaEnabled,
@@ -3954,28 +3439,15 @@ route("GET", "/api/health", ({ res }) => {
 
 route("POST", "/api/auth/signup", async ({ req, res }) => {
   const body = await getJsonBody(req);
-
   const email = normalizeEmail(body.email);
   const password = String(body.password || "");
-
   const firstName = String(body.firstName ?? body.first_name ?? "").trim();
   const lastName = String(body.lastName ?? body.last_name ?? "").trim();
 
-  if (!email || !password) {
-    throw new HttpError(400, "Email and password are required");
-  }
-
-  if (email.length > 254 || !EMAIL_REGEX.test(email)) {
-    throw new HttpError(400, "Invalid email address");
-  }
-
-  if (password.length < 8) {
-    throw new HttpError(400, "Password must contain at least 8 characters");
-  }
-
-  if (password.length > 128) {
-    throw new HttpError(400, "Password must contain at most 128 characters");
-  }
+  if (!email || !password) throw new HttpError(400, "Email and password are required");
+  if (email.length > 254 || !EMAIL_REGEX.test(email)) throw new HttpError(400, "Invalid email address");
+  if (password.length < 8) throw new HttpError(400, "Password must contain at least 8 characters");
+  if (password.length > 128) throw new HttpError(400, "Password must contain at most 128 characters");
 
   enforce(limiterAccount, `signup:${email}`);
 
@@ -3983,22 +3455,16 @@ route("POST", "/api/auth/signup", async ({ req, res }) => {
     email,
     password,
     options: {
-      data: {
-        first_name: firstName.slice(0, 100),
-        last_name: lastName.slice(0, 100),
-      },
+      data: { first_name: firstName.slice(0, 100), last_name: lastName.slice(0, 100) },
     },
   });
 
-  if (error) {
-    throw new HttpError(error.status === 429 ? 429 : 400, error.message);
-  }
+  if (error) throw new HttpError(error.status === 429 ? 429 : 400, error.message);
 
   sendJson(res, 201, {
     success: true,
     user: data.user ? formatUser(data.user) : null,
     session: sessionPayload(data.session),
-    // Un nouvel utilisateur n'a jamais la MFA.
     mfa_enabled: false,
     mfa_required: false,
     aal: data.session ? getTokenAal(data.session.access_token) : null,
@@ -4010,25 +3476,17 @@ route("POST", "/api/auth/signup", async ({ req, res }) => {
 
 route("POST", "/api/auth/login", async ({ req, res }) => {
   const body = await getJsonBody(req);
-
   const email = normalizeEmail(body.email);
   const password = String(body.password || "");
 
-  if (!email || !password) {
-    throw new HttpError(400, "Email and password are required");
-  }
+  if (!email || !password) throw new HttpError(400, "Email and password are required");
 
   enforce(limiterAccount, `login:${email}`);
 
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password,
-  });
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
   if (error) {
-    if (error.status === 429) {
-      throw new HttpError(429, "Too many requests. Please try again later.");
-    }
+    if (error.status === 429) throw new HttpError(429, "Too many requests. Please try again later.");
 
     const notConfirmed =
       error.code === "email_not_confirmed" ||
@@ -4049,12 +3507,6 @@ route("POST", "/api/auth/login", async ({ req, res }) => {
     success: true,
     user: data.user ? formatUser(data.user) : null,
     session: sessionPayload(data.session),
-    // ── MFA ──
-    // mfa_enabled : au moins un facteur vérifié (TOTP / passkey)
-    // mfa_required: MFA activée mais session encore en AAL1 → le frontend
-    //               doit afficher le challenge avant d'accéder aux
-    //               opérations sensibles.
-    // aal         : niveau courant (aal1 / aal2 / null si pas de session)
     mfa_enabled: hasVerifiedMfa,
     mfa_required: mfaRequired,
     aal: sessionAal,
@@ -4063,20 +3515,14 @@ route("POST", "/api/auth/login", async ({ req, res }) => {
 
 route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   const body = await getJsonBody(req);
-
   const email = normalizeEmail(body.email);
   const password = String(body.password || "");
 
-  if (!email || !password) {
-    throw new HttpError(400, "Email and password are required");
-  }
+  if (!email || !password) throw new HttpError(400, "Email and password are required");
 
   enforce(limiterAccount, `login:${email}`);
 
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password,
-  });
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
   if (error) {
     const notConfirmed =
@@ -4104,13 +3550,8 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   });
 });
 
-// ------------------------------------------------------------
-// MOT DE PASSE OUBLIÉ — étape 1 : envoi de l'email
-// ------------------------------------------------------------
-
 route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
   const body = await getJsonBody(req);
-
   const email = normalizeEmail(body.email);
 
   if (!email || email.length > 254 || !EMAIL_REGEX.test(email)) {
@@ -4124,65 +3565,29 @@ route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
   });
 
   if (error) {
-    if (error.status === 429) {
-      throw new HttpError(
-        429,
-        "Too many requests. Please try again later.",
-        "RATE_LIMITED"
-      );
-    }
-
-    console.error(
-      `[${requestId}] forgot-password: ${error.status || ""} ${error.message}`
-    );
+    if (error.status === 429) throw new HttpError(429, "Too many requests. Please try again later.", "RATE_LIMITED");
+    console.error(`[${requestId}] forgot-password: ${error.status || ""} ${error.message}`);
   }
 
   sendJson(res, 200, {
     success: true,
-    message:
-      "If an account exists for this email, a password reset link has been sent.",
+    message: "If an account exists for this email, a password reset link has been sent.",
   });
 });
 
-// ------------------------------------------------------------
-// MOT DE PASSE OUBLIÉ — étape 2 : nouveau mot de passe
-// ------------------------------------------------------------
-
 route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   const body = await getJsonBody(req);
-
-  const password = String(
-    body.password ?? body.newPassword ?? body.new_password ?? ""
-  );
+  const password = String(body.password ?? body.newPassword ?? body.new_password ?? "");
   const accessToken = String(body.accessToken ?? body.access_token ?? "").trim();
   const tokenHash = String(body.tokenHash ?? body.token_hash ?? "").trim();
 
-  if (!password) {
-    throw new HttpError(400, "A new password is required");
-  }
-
-  if (password.length < 8) {
-    throw new HttpError(400, "Password must contain at least 8 characters");
-  }
-
-  if (password.length > 128) {
-    throw new HttpError(400, "Password must contain at most 128 characters");
-  }
-
-  if (!accessToken && !tokenHash) {
-    throw new HttpError(
-      400,
-      "Missing recovery token",
-      "RECOVERY_TOKEN_MISSING"
-    );
-  }
+  if (!password) throw new HttpError(400, "A new password is required");
+  if (password.length < 8) throw new HttpError(400, "Password must contain at least 8 characters");
+  if (password.length > 128) throw new HttpError(400, "Password must contain at most 128 characters");
+  if (!accessToken && !tokenHash) throw new HttpError(400, "Missing recovery token", "RECOVERY_TOKEN_MISSING");
 
   const invalidLink = () =>
-    new HttpError(
-      401,
-      "This reset link is invalid or has expired. Request a new one.",
-      "INVALID_RESET_TOKEN"
-    );
+    new HttpError(401, "This reset link is invalid or has expired. Request a new one.", "INVALID_RESET_TOKEN");
 
   let user = null;
   let sessionToken = null;
@@ -4190,25 +3595,16 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   if (tokenHash) {
     if (tokenHash.length > 512) throw invalidLink();
 
-    const { data, error } = await supabase.auth.verifyOtp({
-      token_hash: tokenHash,
-      type: "recovery",
-    });
-
+    const { data, error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type: "recovery" });
     if (error || !data?.user || !data?.session) throw invalidLink();
 
     user = data.user;
     sessionToken = data.session.access_token;
   } else {
     if (accessToken.length > 4096) throw invalidLink();
-
     if (!isRecoverySessionToken(accessToken)) throw invalidLink();
 
-    const {
-      data: { user: found },
-      error,
-    } = await supabase.auth.getUser(accessToken);
-
+    const { data: { user: found }, error } = await supabase.auth.getUser(accessToken);
     if (error || !found) throw invalidLink();
 
     user = found;
@@ -4220,38 +3616,23 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   const { error: updateError } = await adminUpdateUser(user.id, { password });
 
   if (updateError) {
-    if (
-      updateError.code === "same_password" ||
-      updateError.code === "weak_password"
-    ) {
-      throw new HttpError(
-        400,
-        updateError.message || "This password cannot be used.",
-        updateError.code
-      );
+    if (updateError.code === "same_password" || updateError.code === "weak_password") {
+      throw new HttpError(400, updateError.message || "This password cannot be used.", updateError.code);
     }
-
     throw dbError("auth.admin.updateUserById(password)", updateError);
   }
 
   try {
     await supabaseAdmin.auth.admin.signOut(sessionToken, "global");
   } catch (signOutError) {
-    console.warn(
-      `[${requestId}] reset-password: session revoke failed:`,
-      signOutError?.message || signOutError
-    );
+    console.warn(`[${requestId}] reset-password: session revoke failed:`, signOutError?.message || signOutError);
   }
 
   authCacheInvalidateUser(user.id);
 
-  sendJson(res, 200, {
-    success: true,
-    message: "Password updated successfully. You can now sign in.",
-  });
+  sendJson(res, 200, { success: true, message: "Password updated successfully. You can now sign in." });
 });
 
-// Google / GitHub : URL d'autorisation.
 function registerOAuthLoginRoute(provider, extraOptions) {
   route("POST", `/api/auth/${provider}/url`, async ({ req, res }) => {
     const body = await getJsonBody(req).catch(() => ({}));
@@ -4259,16 +3640,10 @@ function registerOAuthLoginRoute(provider, extraOptions) {
 
     const { data, error } = await supabaseOAuth.auth.signInWithOAuth({
       provider,
-      options: {
-        redirectTo,
-        skipBrowserRedirect: true,
-        ...extraOptions,
-      },
+      options: { redirectTo, skipBrowserRedirect: true, ...extraOptions },
     });
 
-    if (error || !data?.url) {
-      throw error || new Error(`${provider}/url: no URL returned`);
-    }
+    if (error || !data?.url) throw error || new Error(`${provider}/url: no URL returned`);
 
     sendJson(res, 200, { success: true, url: data.url });
   });
@@ -4280,7 +3655,6 @@ registerOAuthLoginRoute("google", {
 
 registerOAuthLoginRoute("github", { scopes: "read:user user:email" });
 
-// Révoque réellement la session côté Supabase (et vide le cache).
 route("POST", "/api/auth/logout", async ({ req, res }) => {
   const authorization = req.headers.authorization || "";
   const token = authorization.replace(/^Bearer\s+/i, "").trim();
@@ -4302,490 +3676,449 @@ route("POST", "/api/auth/logout", async ({ req, res }) => {
 
 route("POST", "/api/auth/refresh", async ({ req, res }) => {
   const body = await getJsonBody(req);
-
   const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
 
-  if (!refreshToken || refreshToken.length > 4096) {
-    throw new HttpError(400, "Missing refresh token");
-  }
+  if (!refreshToken || refreshToken.length > 4096) throw new HttpError(400, "Missing refresh token");
 
-  const { data, error } = await supabase.auth.refreshSession({
-    refresh_token: refreshToken,
-  });
+  const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
 
   if (error || !data.session) {
-    throw new HttpError(
-      401,
-      "Invalid or expired refresh token",
-      "INVALID_REFRESH_TOKEN"
-    );
+    throw new HttpError(401, "Invalid or expired refresh token", "INVALID_REFRESH_TOKEN");
   }
 
   sendJson(res, 200, {
     success: true,
     session: sessionPayload(data.session),
-    // Le refresh conserve l'AAL de la session d'origine : un client peut
-    // vérifier si son token a été dégradé (ne devrait pas arriver, mais
-    // ceinture + bretelles).
     aal: getTokenAal(data.session.access_token),
   });
 });
 
-route(
-  "POST",
-  "/api/auth/resend-verification",
-  async ({ res, user }) => {
-    if (user.email_confirmed_at) {
-      throw new HttpError(400, "This email is already verified");
-    }
+route("POST", "/api/auth/resend-verification", async ({ res, user }) => {
+  if (user.email_confirmed_at) throw new HttpError(400, "This email is already verified");
+  if (!user.email) throw new HttpError(400, "No email associated with this account");
 
-    if (!user.email) {
-      throw new HttpError(400, "No email associated with this account");
-    }
+  enforce(limiterAccount, `resend:${user.id}`);
 
-    enforce(limiterAccount, `resend:${user.id}`);
+  const { error } = await supabase.auth.resend({ type: "signup", email: user.email });
 
-    const { error } = await supabase.auth.resend({
-      type: "signup",
-      email: user.email,
-    });
+  if (error) throw error;
 
-    if (error) throw error;
-
-    sendJson(res, 200, { success: true, message: "Verification email sent" });
-  },
-  { auth: true }
-);
+  sendJson(res, 200, { success: true, message: "Verification email sent" });
+}, { auth: true });
 
 // ============================================================
-// ROUTES — MFA (statut AAL + facteurs)
+// ROUTES — MFA (proxy complet : le frontend ne voit rien de Supabase)
 // ============================================================
 //
-// Utilisé par le frontend pour savoir où il en est (facultatif : il peut
-// aussi interroger Supabase directement via needsMfaChallenge()). Utile
-// pour les clients API / mobiles qui n'embarquent pas supabase-js.
-//
-//   aal                 : niveau courant (aal1 / aal2 / null sans JWT)
-//   next_aal            : niveau attendu (aal2 si MFA activée)
-//   mfa_enabled         : au moins un facteur vérifié
-//   requires_challenge  : MFA activée mais session en AAL1
-//   factors             : liste des facteurs VÉRIFIÉS uniquement
-route(
-  "GET",
-  "/api/auth/mfa/status",
-  ({ res, user, token }) => {
-    const factors = verifiedFactorsOf(user);
-    const aal = getTokenAal(token) || "aal1";
-    const hasMfa = factors.length > 0;
-    const requiresChallenge = hasMfa && aal === "aal1";
+// Toutes ces routes exigent une session utilisateur (Authorization).
+// Le backend utilise SUPABASE_ANON_KEY + le token utilisateur pour
+// parler à /auth/v1/factors*. Rien n'est stocké côté backend : le
+// frontend reçoit les nouvelles sessions AAL2 et les stocke lui-même.
 
-    sendJson(res, 200, {
-      success: true,
-      aal,
-      next_aal: requiresChallenge ? "aal2" : aal,
-      mfa_enabled: hasMfa,
-      requires_challenge: requiresChallenge,
-      factors: factors.map((f) => ({
-        id: f.id,
-        type: f.factor_type,
-        friendly_name: f.friendly_name || null,
-        created_at: f.created_at || null,
-      })),
-    });
-  },
-  { auth: true }
-);
+// ---- GET /api/auth/mfa/status ----
+route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
+  const factors = verifiedFactorsOf(user);
+  const aal = getTokenAal(token) || "aal1";
+  const hasMfa = factors.length > 0;
+  const requiresChallenge = hasMfa && aal === "aal1";
+
+  sendJson(res, 200, {
+    success: true,
+    aal,
+    next_aal: requiresChallenge ? "aal2" : aal,
+    mfa_enabled: hasMfa,
+    requires_challenge: requiresChallenge,
+    factors: factors.map(toPublicFactor),
+  });
+}, { auth: true });
+
+// ---- GET /api/mfa/factors ----
+route("GET", "/api/mfa/factors", async ({ res, token }) => {
+  const data = await supabaseAuthRequest("/factors", { token });
+  const { totp } = normalizeFactorsResponse(data);
+
+  sendJson(res, 200, {
+    success: true,
+    factors: totp.filter((f) => f.status === "verified").map(toPublicFactor),
+  });
+}, { auth: true });
+
+// ---- POST /api/mfa/enroll ----
+// Crée un facteur TOTP (purge d'abord les unverified abandonnés).
+route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
+  enforce(limiterAccount, `mfa-enroll:${user.id}`);
+
+  // Purge des facteurs unverified
+  try {
+    const list = await supabaseAuthRequest("/factors", { token });
+    const { all } = normalizeFactorsResponse(list);
+    const stale = all.filter((f) => (f.type === "totp") && f.status === "unverified");
+
+    for (const f of stale) {
+      try {
+        await supabaseAuthRequest(`/factors/${encodeURIComponent(f.id)}`, {
+          method: "DELETE",
+          token,
+        });
+      } catch (e) {
+        console.warn("[mfa] purge stale factor failed:", e.message);
+      }
+    }
+  } catch (e) {
+    console.warn("[mfa] list factors before enroll failed:", e.message);
+  }
+
+  const data = await supabaseAuthRequest("/factors", {
+    method: "POST",
+    token,
+    json: {
+      factor_type: "totp",
+      friendly_name: `Authenticator ${Date.now()}`,
+    },
+  });
+
+  sendJson(res, 200, {
+    success: true,
+    factorId: data.id,
+    qrCode: data?.totp?.qr_code || "",
+    secret: data?.totp?.secret || "",
+  });
+}, { auth: true });
+
+// ---- POST /api/mfa/enroll/verify ----
+// Challenge + verify du facteur tout juste créé. Renvoie la session AAL2.
+route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
+  enforce(limiterAccount, `mfa-enroll-verify:${user.id}`);
+
+  const body = await getJsonBody(req);
+  const factorId = String(body.factorId || "").trim();
+  const code = String(body.code || "").replace(/\D/g, "").slice(0, 8);
+
+  if (!factorId || factorId.length > 128) throw new HttpError(400, "Missing factorId");
+  if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, "Invalid code", "INVALID_CODE");
+
+  const session = await verifyMfaCode(factorId, code, token);
+
+  sendJson(res, 200, {
+    success: true,
+    session: {
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+    },
+  });
+}, { auth: true });
+
+// ---- POST /api/mfa/verify ----
+// Vérifie un code TOTP (login ou élévation AAL2). Si factorId est omis,
+// on prend le premier facteur TOTP vérifié. Renvoie la session AAL2.
+route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
+  enforce(limiterAccount, `mfa-verify:${user.id}`);
+
+  const body = await getJsonBody(req);
+  let factorId = String(body.factorId || "").trim();
+  const code = String(body.code || "").replace(/\D/g, "").slice(0, 8);
+
+  if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, "Invalid code", "INVALID_CODE");
+
+  if (!factorId) {
+    const list = await supabaseAuthRequest("/factors", { token });
+    const { totp } = normalizeFactorsResponse(list);
+    const first = totp.find((f) => f.status === "verified");
+
+    if (!first) throw new HttpError(400, "No authenticator found", "NO_MFA_FACTOR");
+
+    factorId = first.id;
+  }
+
+  const session = await verifyMfaCode(factorId, code, token);
+
+  sendJson(res, 200, {
+    success: true,
+    session: {
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+    },
+  });
+}, { auth: true });
+
+// ---- DELETE /api/mfa/factors?factorId=xxx ----
+// Supprime un facteur. Un facteur vérifié exige AAL2 (comme Supabase).
+// Un facteur unverified (setup abandonné) peut être supprimé sans AAL2.
+route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
+  const factorId = url.searchParams.get("factorId");
+
+  if (!factorId || factorId.length > 128) throw new HttpError(400, "Missing factorId");
+
+  const list = await supabaseAuthRequest("/factors", { token });
+  const { all } = normalizeFactorsResponse(list);
+  const factor = all.find((f) => f.id === factorId);
+
+  if (!factor) throw new HttpError(404, "Factor not found", "FACTOR_NOT_FOUND");
+
+  if (factor.status === "verified") {
+    requireAal2(user, token); // 403 MFA_REQUIRED si AAL1
+  }
+
+  await supabaseAuthRequest(`/factors/${encodeURIComponent(factorId)}`, {
+    method: "DELETE",
+    token,
+  });
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
 
 // ============================================================
 // ROUTES — UTILISATEUR
 // ============================================================
 
-route(
-  "GET",
-  "/api/user",
-  ({ res, user }) => {
-    sendJson(res, 200, { success: true, user: formatUser(user) });
-  },
-  { auth: true }
-);
+route("GET", "/api/user", ({ res, user }) => {
+  sendJson(res, 200, { success: true, user: formatUser(user) });
+}, { auth: true });
 
-route(
-  "GET",
-  "/api/user/profile",
-  ({ res, user }) => {
-    sendJson(res, 200, { success: true, user: formatUser(user) });
-  },
-  { auth: true }
-);
+route("GET", "/api/user/profile", ({ res, user }) => {
+  sendJson(res, 200, { success: true, user: formatUser(user) });
+}, { auth: true });
 
-route(
-  ["PUT", "PATCH"],
-  "/api/user/profile",
-  async ({ req, res, user }) => {
-    const body = await getJsonBody(req);
+route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const metadata = { ...(user.user_metadata || {}) };
+  const limitedString = (value, max) => String(value ?? "").slice(0, max);
 
-    const metadata = { ...(user.user_metadata || {}) };
+  if (body.firstName !== undefined || body.first_name !== undefined) {
+    metadata.first_name = limitedString(body.firstName ?? body.first_name ?? "", 100);
+  }
 
-    const limitedString = (value, max) => String(value ?? "").slice(0, max);
+  if (body.lastName !== undefined || body.last_name !== undefined) {
+    metadata.last_name = limitedString(body.lastName ?? body.last_name ?? "", 100);
+  }
 
-    if (body.firstName !== undefined || body.first_name !== undefined) {
-      metadata.first_name = limitedString(
-        body.firstName ?? body.first_name ?? "",
-        100
-      );
+  if (body.bio !== undefined) metadata.bio = limitedString(body.bio, 500);
+
+  if (body.avatarUrl !== undefined || body.avatar_url !== undefined) {
+    const avatarUrl = limitedString(body.avatarUrl ?? body.avatar_url ?? "", 1000);
+    const ownPrefix = `${SUPABASE_BASE_URL}/storage/v1/object/public/${AVATAR_BUCKET}/${user.id}/`;
+
+    if (avatarUrl && !avatarUrl.startsWith(ownPrefix)) {
+      throw new HttpError(400, "Invalid avatar URL");
     }
 
-    if (body.lastName !== undefined || body.last_name !== undefined) {
-      metadata.last_name = limitedString(
-        body.lastName ?? body.last_name ?? "",
-        100
-      );
-    }
+    metadata.custom_avatar_url = avatarUrl;
+  }
 
-    if (body.bio !== undefined) {
-      metadata.bio = limitedString(body.bio, 500);
-    }
+  const { data, error } = await adminUpdateUser(user.id, { user_metadata: metadata });
+  if (error) throw error;
 
-    if (body.avatarUrl !== undefined || body.avatar_url !== undefined) {
-      const avatarUrl = limitedString(
-        body.avatarUrl ?? body.avatar_url ?? "",
-        1000
-      );
+  sendJson(res, 200, { success: true, user: formatUser(data.user) });
+}, { auth: true });
 
-      const ownPrefix = `${SUPABASE_BASE_URL}/storage/v1/object/public/${AVATAR_BUCKET}/${user.id}/`;
+route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) => {
+  requireAal2(user, token);
 
-      if (avatarUrl && !avatarUrl.startsWith(ownPrefix)) {
-        throw new HttpError(400, "Invalid avatar URL");
-      }
+  const body = await getJsonBody(req);
+  const currentPassword = String(body.currentPassword ?? body.current_password ?? "");
+  const newPassword = String(body.newPassword ?? body.new_password ?? "");
 
-      metadata.custom_avatar_url = avatarUrl;
-    }
+  if (!currentPassword || !newPassword) throw new HttpError(400, "Current and new password are required");
+  if (newPassword.length < 8) throw new HttpError(400, "New password must contain at least 8 characters");
+  if (newPassword.length > 128) throw new HttpError(400, "New password must contain at most 128 characters");
+  if (!user.email) throw new HttpError(400, "No email associated with this account");
 
-    const { data, error } = await adminUpdateUser(user.id, {
-      user_metadata: metadata,
+  enforce(limiterAccount, `password:${user.id}`);
+
+  const { error: verifyError } = await supabase.auth.signInWithPassword({
+    email: user.email,
+    password: currentPassword,
+  });
+
+  if (verifyError) throw new HttpError(401, "Current password is incorrect");
+
+  const { error } = await adminUpdateUser(user.id, { password: newPassword });
+  if (error) throw error;
+
+  sendJson(res, 200, { success: true, message: "Password updated successfully" });
+}, { auth: true });
+
+route("POST", "/api/user/avatar", async ({ req, res, user }) => {
+  enforce(limiterAccount, `avatar:${user.id}`);
+
+  let upload;
+
+  try {
+    upload = await parseMultipart(req, { fileField: "avatar", maxSize: MAX_AVATAR_SIZE });
+  } catch (error) {
+    if (error?.code === "FILE_TOO_LARGE") throw new HttpError(400, "Avatar is too large. Maximum size is 2 MB.");
+    if (error?.code === "NO_FILE") throw new HttpError(400, "No 'avatar' file was provided.");
+    throw new HttpError(400, "Could not read the uploaded file.");
+  }
+
+  const sniffedType = sniffImageType(upload.buffer);
+
+  if (!sniffedType || !ALLOWED_AVATAR_TYPES.includes(sniffedType)) {
+    throw new HttpError(400, "Unsupported image format. Use PNG, JPEG, WebP or GIF.");
+  }
+
+  const storagePath = `${user.id}/${crypto.randomUUID()}.${AVATAR_EXTENSIONS[sniffedType]}`;
+
+  const { error: storageError } = await supabaseAdmin.storage
+    .from(AVATAR_BUCKET)
+    .upload(storagePath, upload.buffer, {
+      contentType: sniffedType,
+      cacheControl: "31536000",
+      upsert: false,
     });
 
-    if (error) throw error;
+  if (storageError) throw storageError;
 
-    sendJson(res, 200, { success: true, user: formatUser(data.user) });
-  },
-  { auth: true }
-);
+  const { data: publicUrlData } = supabaseAdmin.storage.from(AVATAR_BUCKET).getPublicUrl(storagePath);
 
-// Changement de mot de passe : nécessite l'AAL2 si la MFA est activée.
-// (Un token AAL1 volé ne suffit pas : le vrai mot de passe actuel est
-// toujours exigé, mais on va plus loin en exigeant que le second facteur
-// ait été vérifié dans CETTE session.)
-route(
-  ["PUT", "POST"],
-  "/api/user/password",
-  async ({ req, res, user, token }) => {
-    // → 403 MFA_REQUIRED si MFA activée mais session en AAL1.
-    //   Le frontend doit afficher le challenge MFA puis rejouer.
-    requireAal2(user, token);
+  sendJson(res, 200, { success: true, avatar_url: publicUrlData.publicUrl });
+}, { auth: true });
 
-    const body = await getJsonBody(req);
+route("DELETE", "/api/user/avatar", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const filePathOrUrl = String(body.filePathOrUrl || "").trim();
 
-    const currentPassword = String(
-      body.currentPassword ?? body.current_password ?? ""
-    );
-    const newPassword = String(body.newPassword ?? body.new_password ?? "");
+  if (!filePathOrUrl) throw new HttpError(400, "Missing filePathOrUrl");
 
-    if (!currentPassword || !newPassword) {
-      throw new HttpError(400, "Current and new password are required");
-    }
+  const storagePath = extractAvatarStoragePath(filePathOrUrl);
 
-    if (newPassword.length < 8) {
-      throw new HttpError(
-        400,
-        "New password must contain at least 8 characters"
-      );
-    }
-
-    if (newPassword.length > 128) {
-      throw new HttpError(
-        400,
-        "New password must contain at most 128 characters"
-      );
-    }
-
-    if (!user.email) {
-      throw new HttpError(400, "No email associated with this account");
-    }
-
-    enforce(limiterAccount, `password:${user.id}`);
-
-    const { error: verifyError } = await supabase.auth.signInWithPassword({
-      email: user.email,
-      password: currentPassword,
-    });
-
-    if (verifyError) {
-      throw new HttpError(401, "Current password is incorrect");
-    }
-
-    const { error } = await adminUpdateUser(user.id, { password: newPassword });
-
-    if (error) throw error;
-
-    sendJson(res, 200, {
-      success: true,
-      message: "Password updated successfully",
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/user/avatar",
-  async ({ req, res, user }) => {
-    enforce(limiterAccount, `avatar:${user.id}`);
-
-    let upload;
-
-    try {
-      upload = await parseMultipart(req, {
-        fileField: "avatar",
-        maxSize: MAX_AVATAR_SIZE,
-      });
-    } catch (error) {
-      if (error?.code === "FILE_TOO_LARGE") {
-        throw new HttpError(400, "Avatar is too large. Maximum size is 2 MB.");
-      }
-      if (error?.code === "NO_FILE") {
-        throw new HttpError(400, "No 'avatar' file was provided.");
-      }
-      throw new HttpError(400, "Could not read the uploaded file.");
-    }
-
-    const sniffedType = sniffImageType(upload.buffer);
-
-    if (!sniffedType || !ALLOWED_AVATAR_TYPES.includes(sniffedType)) {
-      throw new HttpError(
-        400,
-        "Unsupported image format. Use PNG, JPEG, WebP or GIF."
-      );
-    }
-
-    const storagePath = `${user.id}/${crypto.randomUUID()}.${AVATAR_EXTENSIONS[sniffedType]}`;
-
-    const { error: storageError } = await supabaseAdmin.storage
-      .from(AVATAR_BUCKET)
-      .upload(storagePath, upload.buffer, {
-        contentType: sniffedType,
-        cacheControl: "31536000",
-        upsert: false,
-      });
-
-    if (storageError) throw storageError;
-
-    const { data: publicUrlData } = supabaseAdmin.storage
-      .from(AVATAR_BUCKET)
-      .getPublicUrl(storagePath);
-
-    sendJson(res, 200, { success: true, avatar_url: publicUrlData.publicUrl });
-  },
-  { auth: true }
-);
-
-route(
-  "DELETE",
-  "/api/user/avatar",
-  async ({ req, res, user }) => {
-    const body = await getJsonBody(req);
-
-    const filePathOrUrl = String(body.filePathOrUrl || "").trim();
-
-    if (!filePathOrUrl) {
-      throw new HttpError(400, "Missing filePathOrUrl");
-    }
-
-    const storagePath = extractAvatarStoragePath(filePathOrUrl);
-
-    if (!storagePath) {
-      sendJson(res, 200, { success: true });
-      return;
-    }
-
-    if (!isOwnedAvatarPath(storagePath, user.id)) {
-      throw new HttpError(403, "You can only delete your own avatar");
-    }
-
-    const { error } = await supabaseAdmin.storage
-      .from(AVATAR_BUCKET)
-      .remove([storagePath]);
-
-    if (error) throw error;
-
+  if (!storagePath) {
     sendJson(res, 200, { success: true });
-  },
-  { auth: true }
-);
+    return;
+  }
+
+  if (!isOwnedAvatarPath(storagePath, user.id)) {
+    throw new HttpError(403, "You can only delete your own avatar");
+  }
+
+  const { error } = await supabaseAdmin.storage.from(AVATAR_BUCKET).remove([storagePath]);
+  if (error) throw error;
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
 
 // ============================================================
 // ROUTES — STRIPE
 // ============================================================
 
-route(
-  "POST",
-  "/api/stripe/checkout",
-  async ({ req, res, user }) => {
-    requireStripe();
+route("POST", "/api/stripe/checkout", async ({ req, res, user }) => {
+  requireStripe();
 
-    const body = await getJsonBody(req);
-    const plan = String(body.plan || "").toLowerCase();
-    const period = body.period === "annual" ? "annual" : "monthly";
+  const body = await getJsonBody(req);
+  const plan = String(body.plan || "").toLowerCase();
+  const period = body.period === "annual" ? "annual" : "monthly";
 
-    const priceId = Object.hasOwn(STRIPE_PRICES, plan)
-      ? STRIPE_PRICES[plan][period]
-      : undefined;
+  const priceId = Object.hasOwn(STRIPE_PRICES, plan) ? STRIPE_PRICES[plan][period] : undefined;
 
-    if (!priceId) {
-      const knownPlan = Object.hasOwn(STRIPE_PRICES, plan);
-      throw new HttpError(
-        400,
-        knownPlan
-          ? `Plan "${plan}" (${period}) is not configured — missing STRIPE_PRICE_${plan.toUpperCase()}_${period.toUpperCase()}`
-          : `Unknown plan or period (plan="${plan.slice(0, 30)}", period="${period}")`
-      );
-    }
+  if (!priceId) {
+    const knownPlan = Object.hasOwn(STRIPE_PRICES, plan);
+    throw new HttpError(
+      400,
+      knownPlan
+        ? `Plan "${plan}" (${period}) is not configured — missing STRIPE_PRICE_${plan.toUpperCase()}_${period.toUpperCase()}`
+        : `Unknown plan or period (plan="${plan.slice(0, 30)}", period="${period}")`
+    );
+  }
 
-    const customerId = await getStripeCustomerId(user, { create: true });
+  const customerId = await getStripeCustomerId(user, { create: true });
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: customerId,
-      line_items: [{ price: priceId, quantity: 1 }],
-      allow_promotion_codes: true,
-      client_reference_id: user.id,
-      success_url: STRIPE_SUCCESS_URL,
-      cancel_url: STRIPE_CANCEL_URL,
-      subscription_data: {
-        metadata: { supabase_user_id: user.id, plan, period },
-      },
-    });
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    customer: customerId,
+    line_items: [{ price: priceId, quantity: 1 }],
+    allow_promotion_codes: true,
+    client_reference_id: user.id,
+    success_url: STRIPE_SUCCESS_URL,
+    cancel_url: STRIPE_CANCEL_URL,
+    subscription_data: { metadata: { supabase_user_id: user.id, plan, period } },
+  });
 
-    sendJson(res, 200, { success: true, id: session.id, url: session.url });
-  },
-  { auth: true }
-);
+  sendJson(res, 200, { success: true, id: session.id, url: session.url });
+}, { auth: true });
 
-route(
-  "POST",
-  "/api/stripe/portal",
-  async ({ res, user }) => {
-    requireStripe();
+route("POST", "/api/stripe/portal", async ({ res, user }) => {
+  requireStripe();
 
-    const customerId = await getStripeCustomerId(user);
+  const customerId = await getStripeCustomerId(user);
 
-    if (!customerId) {
-      throw new HttpError(
-        400,
-        "No Stripe customer associated with this account"
-      );
-    }
+  if (!customerId) throw new HttpError(400, "No Stripe customer associated with this account");
 
-    const session = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: STRIPE_PORTAL_RETURN_URL,
-    });
+  const session = await stripe.billingPortal.sessions.create({
+    customer: customerId,
+    return_url: STRIPE_PORTAL_RETURN_URL,
+  });
 
-    sendJson(res, 200, { success: true, url: session.url });
-  },
-  { auth: true }
-);
+  sendJson(res, 200, { success: true, url: session.url });
+}, { auth: true });
 
-route(
-  "GET",
-  "/api/stripe/subscription",
-  async ({ res, user }) => {
-    requireStripe();
+route("GET", "/api/stripe/subscription", async ({ res, user }) => {
+  requireStripe();
 
-    const customerId = await getStripeCustomerId(user);
+  const customerId = await getStripeCustomerId(user);
 
-    if (!customerId) {
-      sendJson(res, 200, { success: true, subscription: null });
-      return;
-    }
+  if (!customerId) {
+    sendJson(res, 200, { success: true, subscription: null });
+    return;
+  }
 
-    const list = await stripe.subscriptions.list({
-      customer: customerId,
-      status: "all",
-      limit: 1,
-    });
+  const list = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 1 });
+  const sub = list.data[0];
 
-    const sub = list.data[0];
+  if (sub) {
+    const stored = user.app_metadata?.subscription;
+    const fresh = subscriptionSnapshot(sub);
 
-    if (sub) {
-      const stored = user.app_metadata?.subscription;
-      const fresh = subscriptionSnapshot(sub);
+    const changed =
+      !stored ||
+      stored.id !== fresh.id ||
+      stored.status !== fresh.status ||
+      stored.price_id !== fresh.price_id ||
+      stored.plan_key !== fresh.plan_key ||
+      stored.current_period_end !== fresh.current_period_end ||
+      stored.cancel_at_period_end !== fresh.cancel_at_period_end;
 
-      const changed =
-        !stored ||
-        stored.id !== fresh.id ||
-        stored.status !== fresh.status ||
-        stored.price_id !== fresh.price_id ||
-        stored.plan_key !== fresh.plan_key ||
-        stored.current_period_end !== fresh.current_period_end ||
-        stored.cancel_at_period_end !== fresh.cancel_at_period_end;
-
-      if (changed) {
-        try {
-          await syncSubscriptionToUser(user.id, sub);
-        } catch (syncError) {
-          console.error("Subscription self-heal failed:", syncError.message);
-        }
+    if (changed) {
+      try {
+        await syncSubscriptionToUser(user.id, sub);
+      } catch (syncError) {
+        console.error("Subscription self-heal failed:", syncError.message);
       }
     }
+  }
 
-    const priceId = sub?.items?.data?.[0]?.price?.id || null;
+  const priceId = sub?.items?.data?.[0]?.price?.id || null;
 
-    sendJson(res, 200, {
-      success: true,
-      subscription: sub
-        ? {
-            id: sub.id,
-            status: sub.status,
-            price_id: priceId,
-            ...planDetails(priceId, sub.metadata?.plan),
-            current_period_end: sub.current_period_end,
-            cancel_at_period_end: sub.cancel_at_period_end,
-          }
-        : null,
-    });
-  },
-  { auth: true }
-);
+  sendJson(res, 200, {
+    success: true,
+    subscription: sub
+      ? {
+          id: sub.id,
+          status: sub.status,
+          price_id: priceId,
+          ...planDetails(priceId, sub.metadata?.plan),
+          current_period_end: sub.current_period_end,
+          cancel_at_period_end: sub.cancel_at_period_end,
+        }
+      : null,
+  });
+}, { auth: true });
 
 const processedStripeEvents = createSeenCache(10_000, 24 * 60 * 60 * 1000);
 
 route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
-  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
-    throw new HttpError(500, "Stripe webhook not configured");
-  }
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) throw new HttpError(500, "Stripe webhook not configured");
 
   const signature = req.headers["stripe-signature"];
-
-  if (!signature) {
-    throw new HttpError(400, "Missing stripe-signature");
-  }
+  if (!signature) throw new HttpError(400, "Missing stripe-signature");
 
   const rawBody = await getRawBody(req);
 
   let event;
 
   try {
-    event = stripe.webhooks.constructEvent(
-      rawBody,
-      signature,
-      STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(rawBody, signature, STRIPE_WEBHOOK_SECRET);
   } catch (webhookError) {
-    console.warn(
-      `[${requestId}] Webhook signature verification failed:`,
-      webhookError.message
-    );
+    console.warn(`[${requestId}] Webhook signature verification failed:`, webhookError.message);
     throw new HttpError(400, "Webhook signature verification failed");
   }
 
@@ -4795,486 +4128,297 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
   }
 
   await withLock(`stripe-event:${event.id}`, () => processStripeEvent(event));
-
   processedStripeEvents.add(event.id);
 
   sendJson(res, 200, { received: true });
 });
 
 // ============================================================
-// ROUTES — TIKTOK
+// ROUTES — TIKTOK / PINTEREST / YOUTUBE / CANVA
 // ============================================================
 
-route(
-  "POST",
-  "/api/tiktok/auth/url",
-  ({ res, user }) => {
-    const params = new URLSearchParams({
-      client_key: TIKTOK_CLIENT_KEY,
-      scope: TIKTOK_SCOPES,
-      response_type: "code",
-      redirect_uri: TIKTOK_REDIRECT_URI,
-      state: createOAuthState("tiktok", user.id),
-    });
+route("POST", "/api/tiktok/auth/url", ({ res, user }) => {
+  const params = new URLSearchParams({
+    client_key: TIKTOK_CLIENT_KEY,
+    scope: TIKTOK_SCOPES,
+    response_type: "code",
+    redirect_uri: TIKTOK_REDIRECT_URI,
+    state: createOAuthState("tiktok", user.id),
+  });
 
-    sendJson(res, 200, {
-      success: true,
-      url: `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`,
-      capabilities: tiktokCapabilities(),
-    });
-  },
-  { auth: true }
-);
+  sendJson(res, 200, {
+    success: true,
+    url: `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`,
+    capabilities: tiktokCapabilities(),
+  });
+}, { auth: true });
 
-route(
-  "POST",
-  "/api/tiktok/auth/callback",
-  async ({ req, res, user }) => {
-    const body = await getJsonBody(req);
-    const authCode = assertValidOAuthCallback("tiktok", body, user.id);
+route("POST", "/api/tiktok/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("tiktok", body, user.id);
 
-    const account = await dedupeCallback(
-      `tiktok:${user.id}:${sha256(authCode)}`,
-      async () => {
-        let tokens;
-
-        try {
-          tokens = await tiktokApi("/v2/oauth/token/", {
-            form: {
-              client_key: TIKTOK_CLIENT_KEY,
-              client_secret: TIKTOK_CLIENT_SECRET,
-              code: authCode,
-              grant_type: "authorization_code",
-              redirect_uri: TIKTOK_REDIRECT_URI,
-            },
-          });
-        } catch (error) {
-          if (
-            error instanceof HttpError &&
-            (error.code === "access_denied" ||
-              /access_denied/i.test(error.message))
-          ) {
-            throw new HttpError(
-              403,
-              TIKTOK_SANDBOX
-                ? "TikTok refused the connection. In sandbox mode, add the TikTok account as a Sandbox tester in the TikTok developer portal, then try again."
-                : "TikTok refused the connection.",
-              "TIKTOK_ACCESS_DENIED"
-            );
-          }
-          throw error;
-        }
-
-        let profile = {};
-
-        try {
-          const info = await tiktokApi(
-            "/v2/user/info/?fields=open_id,avatar_url,display_name",
-            { method: "GET", token: tokens.access_token }
-          );
-
-          profile = info.data?.user || {};
-        } catch (profileError) {
-          console.warn("TikTok user info error:", profileError.message);
-        }
-
-        await saveTikTokTokens(user.id, tokens, {
-          display_name: profile.display_name || null,
-          avatar_url: profile.avatar_url || null,
-        });
-
-        return {
-          display_name: profile.display_name || null,
-          avatar_url: profile.avatar_url || null,
-        };
-      }
-    );
-
-    sendJson(res, 200, {
-      success: true,
-      account,
-      capabilities: tiktokCapabilities(),
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "GET",
-  "/api/tiktok/status",
-  async ({ res, url, user }) => {
-    const force = url.searchParams.get("refresh") === "1";
-
-    const { account, needsReconnect } = await refreshTikTokProfile(user.id, {
-      force,
-    });
-
-    const usable = Boolean(account) && !needsReconnect;
-
-    sendJson(res, 200, {
-      success: true,
-      connected: usable,
-      needs_reconnect: needsReconnect || undefined,
-      account: usable
-        ? {
-            display_name: account.display_name,
-            avatar_url: account.avatar_url,
-            scope: account.scope,
-          }
-        : null,
-      capabilities: tiktokCapabilities(),
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "DELETE",
-  "/api/tiktok/disconnect",
-  async ({ res, user }) => {
-    const account = await getTikTokAccount(user.id);
-
-    if (account) {
-      if (account.access_token) {
-        try {
-          await tiktokApi("/v2/oauth/revoke/", {
-            form: {
-              client_key: TIKTOK_CLIENT_KEY,
-              client_secret: TIKTOK_CLIENT_SECRET,
-              token: account.access_token,
-            },
-          });
-        } catch (revokeError) {
-          console.warn("TikTok revoke error:", revokeError.message);
-        }
-      }
-
-      const { error } = await supabaseAdmin
-        .from("tiktok_accounts")
-        .delete()
-        .eq("user_id", user.id);
-
-      if (error) throw error;
-
-      clearTikTokProfileThrottle(user.id);
-    }
-
-    sendJson(res, 200, { success: true });
-  },
-  { auth: true }
-);
-
-route(
-  "GET",
-  "/api/tiktok/creator-info",
-  async ({ res, user }) => {
-    const accessToken = await getValidTikTokToken(user.id);
-
-    const result = await tiktokApi("/v2/post/publish/creator_info/query/", {
-      token: accessToken,
-      json: {},
-    });
-
-    sendJson(res, 200, {
-      success: true,
-      creator: result.data,
-      capabilities: tiktokCapabilities(),
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/tiktok/publish",
-  async ({ req, res, user }) => {
-    enforce(limiterPublish, `tiktok:${user.id}`);
-
-    const declared = Number(req.headers["content-length"] || 0);
-
-    if (declared > MAX_VIDEO_SIZE + 1024 * 1024) {
-      throw tooLargeError(
-        `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`
-      );
-    }
-
-    const accessToken = await getValidTikTokToken(user.id);
-
-    await acquireVideoSlot();
+  const account = await dedupeCallback(`tiktok:${user.id}:${sha256(authCode)}`, async () => {
+    let tokens;
 
     try {
-      let upload;
-
-      try {
-        upload = await parseMultipart(req, {
-          fileField: "video",
-          maxSize: MAX_VIDEO_SIZE,
-        });
-      } catch (error) {
-        if (error?.code === "FILE_TOO_LARGE") {
-          throw new HttpError(
-            400,
-            `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`
-          );
-        }
-        if (error?.code === "NO_FILE") {
-          throw new HttpError(400, "No 'video' file was provided.");
-        }
-        throw error instanceof HttpError
-          ? error
-          : new HttpError(400, "Could not read the uploaded file.");
-      }
-
-      const mimeType = sniffVideoType(upload.buffer);
-
-      if (!mimeType) {
-        throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
-      }
-
-      const requestedMode = upload.fields.mode === "draft" ? "draft" : "direct";
-      const mode = resolveVideoMode(requestedMode);
-      const chunking = computeChunking(upload.buffer.length);
-
-      const sourceInfo = {
-        source: "FILE_UPLOAD",
-        video_size: upload.buffer.length,
-        chunk_size: chunking.chunkSize,
-        total_chunk_count: chunking.totalChunks,
-      };
-
-      const init = await initTikTokPublish(
-        accessToken,
-        mode,
-        upload.fields,
-        sourceInfo
-      );
-
-      await uploadVideoToTikTok(
-        init.data.upload_url,
-        upload.buffer,
-        mimeType,
-        chunking
-      );
-
-      sendJson(res, 200, {
-        success: true,
-        mode,
-        requested_mode: requestedMode,
-        forced_privacy_level:
-          mode === "direct" ? resolvePrivacy(upload.fields.privacy_level) : null,
-        sandbox: TIKTOK_SANDBOX,
-        publish_id: init.data.publish_id,
+      tokens = await tiktokApi("/v2/oauth/token/", {
+        form: {
+          client_key: TIKTOK_CLIENT_KEY,
+          client_secret: TIKTOK_CLIENT_SECRET,
+          code: authCode,
+          grant_type: "authorization_code",
+          redirect_uri: TIKTOK_REDIRECT_URI,
+        },
       });
-    } finally {
-      releaseVideoSlot();
-    }
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/tiktok/publish_url",
-  async ({ req, res, user }) => {
-    enforce(limiterPublish, `tiktok:${user.id}`);
-
-    const body = await getJsonBody(req);
-    const videoUrl = String(body.videoUrl || "").trim();
-
-    if (!/^https:\/\//i.test(videoUrl) || videoUrl.length > 2048) {
-      throw new HttpError(400, "videoUrl must be a valid https URL");
+    } catch (error) {
+      if (error instanceof HttpError && (error.code === "access_denied" || /access_denied/i.test(error.message))) {
+        throw new HttpError(403, TIKTOK_SANDBOX
+          ? "TikTok refused the connection. In sandbox mode, add the TikTok account as a Sandbox tester."
+          : "TikTok refused the connection.", "TIKTOK_ACCESS_DENIED");
+      }
+      throw error;
     }
 
-    const requestedMode = body.mode === "draft" ? "draft" : "direct";
-    const mode = resolveVideoMode(requestedMode);
-    const accessToken = await getValidTikTokToken(user.id);
+    let profile = {};
 
-    const init = await initTikTokPublish(accessToken, mode, body, {
-      source: "PULL_FROM_URL",
-      video_url: videoUrl,
+    try {
+      const info = await tiktokApi("/v2/user/info/?fields=open_id,avatar_url,display_name", { method: "GET", token: tokens.access_token });
+      profile = info.data?.user || {};
+    } catch (profileError) {
+      console.warn("TikTok user info error:", profileError.message);
+    }
+
+    await saveTikTokTokens(user.id, tokens, {
+      display_name: profile.display_name || null,
+      avatar_url: profile.avatar_url || null,
     });
+
+    return { display_name: profile.display_name || null, avatar_url: profile.avatar_url || null };
+  });
+
+  sendJson(res, 200, { success: true, account, capabilities: tiktokCapabilities() });
+}, { auth: true });
+
+route("GET", "/api/tiktok/status", async ({ res, url, user }) => {
+  const force = url.searchParams.get("refresh") === "1";
+  const { account, needsReconnect } = await refreshTikTokProfile(user.id, { force });
+  const usable = Boolean(account) && !needsReconnect;
+
+  sendJson(res, 200, {
+    success: true,
+    connected: usable,
+    needs_reconnect: needsReconnect || undefined,
+    account: usable
+      ? { display_name: account.display_name, avatar_url: account.avatar_url, scope: account.scope }
+      : null,
+    capabilities: tiktokCapabilities(),
+  });
+}, { auth: true });
+
+route("DELETE", "/api/tiktok/disconnect", async ({ res, user }) => {
+  const account = await getTikTokAccount(user.id);
+
+  if (account) {
+    if (account.access_token) {
+      try {
+        await tiktokApi("/v2/oauth/revoke/", {
+          form: { client_key: TIKTOK_CLIENT_KEY, client_secret: TIKTOK_CLIENT_SECRET, token: account.access_token },
+        });
+      } catch (revokeError) {
+        console.warn("TikTok revoke error:", revokeError.message);
+      }
+    }
+
+    const { error } = await supabaseAdmin.from("tiktok_accounts").delete().eq("user_id", user.id);
+    if (error) throw error;
+
+    clearTikTokProfileThrottle(user.id);
+  }
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+route("GET", "/api/tiktok/creator-info", async ({ res, user }) => {
+  const accessToken = await getValidTikTokToken(user.id);
+  const result = await tiktokApi("/v2/post/publish/creator_info/query/", { token: accessToken, json: {} });
+
+  sendJson(res, 200, { success: true, creator: result.data, capabilities: tiktokCapabilities() });
+}, { auth: true });
+
+route("POST", "/api/tiktok/publish", async ({ req, res, user }) => {
+  enforce(limiterPublish, `tiktok:${user.id}`);
+
+  const declared = Number(req.headers["content-length"] || 0);
+
+  if (declared > MAX_VIDEO_SIZE + 1024 * 1024) {
+    throw tooLargeError(`Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`);
+  }
+
+  const accessToken = await getValidTikTokToken(user.id);
+  await acquireVideoSlot();
+
+  try {
+    let upload;
+
+    try {
+      upload = await parseMultipart(req, { fileField: "video", maxSize: MAX_VIDEO_SIZE });
+    } catch (error) {
+      if (error?.code === "FILE_TOO_LARGE") throw new HttpError(400, `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`);
+      if (error?.code === "NO_FILE") throw new HttpError(400, "No 'video' file was provided.");
+      throw error instanceof HttpError ? error : new HttpError(400, "Could not read the uploaded file.");
+    }
+
+    const mimeType = sniffVideoType(upload.buffer);
+    if (!mimeType) throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
+
+    const requestedMode = upload.fields.mode === "draft" ? "draft" : "direct";
+    const mode = resolveVideoMode(requestedMode);
+    const chunking = computeChunking(upload.buffer.length);
+
+    const sourceInfo = {
+      source: "FILE_UPLOAD",
+      video_size: upload.buffer.length,
+      chunk_size: chunking.chunkSize,
+      total_chunk_count: chunking.totalChunks,
+    };
+
+    const init = await initTikTokPublish(accessToken, mode, upload.fields, sourceInfo);
+    await uploadVideoToTikTok(init.data.upload_url, upload.buffer, mimeType, chunking);
 
     sendJson(res, 200, {
       success: true,
       mode,
       requested_mode: requestedMode,
-      forced_privacy_level:
-        mode === "direct" ? resolvePrivacy(body.privacy_level) : null,
+      forced_privacy_level: mode === "direct" ? resolvePrivacy(upload.fields.privacy_level) : null,
       sandbox: TIKTOK_SANDBOX,
       publish_id: init.data.publish_id,
     });
-  },
-  { auth: true }
-);
+  } finally {
+    releaseVideoSlot();
+  }
+}, { auth: true });
 
-route(
-  "POST",
-  "/api/tiktok/publish/photos",
-  async ({ req, res, user }) => {
-    if (!PUBLIC_API_URL) {
-      throw new HttpError(
-        500,
-        "Photo publishing is not configured (PUBLIC_API_URL / VITE_API_BASE_URL missing)",
-        "PUBLIC_API_URL_MISSING"
-      );
-    }
+route("POST", "/api/tiktok/publish_url", async ({ req, res, user }) => {
+  enforce(limiterPublish, `tiktok:${user.id}`);
 
-    if (!PUBLIC_API_URL.startsWith("https://")) {
-      throw new HttpError(
-        500,
-        "PUBLIC_API_URL must use https for TikTok photo publishing",
-        "PUBLIC_API_URL_NOT_HTTPS"
-      );
-    }
+  const body = await getJsonBody(req);
+  const videoUrl = String(body.videoUrl || "").trim();
 
-    if (publicApiLooksLikeFrontend()) {
-      throw new HttpError(
-        500,
-        "PUBLIC_API_URL points to the frontend instead of the API server",
-        "PUBLIC_API_URL_WRONG_HOST"
-      );
-    }
+  if (!/^https:\/\//i.test(videoUrl) || videoUrl.length > 2048) {
+    throw new HttpError(400, "videoUrl must be a valid https URL");
+  }
 
-    enforce(limiterPublish, `tiktok:${user.id}`);
+  const requestedMode = body.mode === "draft" ? "draft" : "direct";
+  const mode = resolveVideoMode(requestedMode);
+  const accessToken = await getValidTikTokToken(user.id);
 
-    const declared = Number(req.headers["content-length"] || 0);
+  const init = await initTikTokPublish(accessToken, mode, body, {
+    source: "PULL_FROM_URL",
+    video_url: videoUrl,
+  });
 
-    if (declared > MAX_PHOTOS_TOTAL + 1024 * 1024) {
-      throw tooLargeError(
-        `Photos are too large. Maximum total size is ${MAX_PHOTOS_TOTAL / 1024 / 1024} MB.`
-      );
-    }
+  sendJson(res, 200, {
+    success: true,
+    mode,
+    requested_mode: requestedMode,
+    forced_privacy_level: mode === "direct" ? resolvePrivacy(body.privacy_level) : null,
+    sandbox: TIKTOK_SANDBOX,
+    publish_id: init.data.publish_id,
+  });
+}, { auth: true });
 
-    const accessToken = await getValidTikTokToken(user.id);
+route("POST", "/api/tiktok/publish/photos", async ({ req, res, user }) => {
+  if (!PUBLIC_API_URL) throw new HttpError(500, "Photo publishing is not configured (PUBLIC_API_URL missing)", "PUBLIC_API_URL_MISSING");
+  if (!PUBLIC_API_URL.startsWith("https://")) throw new HttpError(500, "PUBLIC_API_URL must use https", "PUBLIC_API_URL_NOT_HTTPS");
+  if (publicApiLooksLikeFrontend()) throw new HttpError(500, "PUBLIC_API_URL points to the frontend instead of the API server", "PUBLIC_API_URL_WRONG_HOST");
 
-    await acquireVideoSlot();
+  enforce(limiterPublish, `tiktok:${user.id}`);
 
-    let storedNames = [];
+  const declared = Number(req.headers["content-length"] || 0);
+
+  if (declared > MAX_PHOTOS_TOTAL + 1024 * 1024) {
+    throw tooLargeError(`Photos are too large. Maximum total size is ${MAX_PHOTOS_TOTAL / 1024 / 1024} MB.`);
+  }
+
+  const accessToken = await getValidTikTokToken(user.id);
+  await acquireVideoSlot();
+
+  let storedNames = [];
+
+  try {
+    let upload;
 
     try {
-      let upload;
-
-      try {
-        upload = await parseMultipartFiles(req, {
-          fileField: "photos",
-          maxFiles: MAX_TIKTOK_PHOTOS,
-          maxFileSize: MAX_PHOTO_SIZE,
-        });
-      } catch (error) {
-        if (error?.code === "FILE_TOO_LARGE") {
-          throw new HttpError(
-            400,
-            `Each photo must be under ${MAX_PHOTO_SIZE / 1024 / 1024} MB.`
-          );
-        }
-        if (error?.code === "TOO_MANY_FILES") {
-          throw new HttpError(
-            400,
-            `TikTok carousels are limited to ${MAX_TIKTOK_PHOTOS} photos.`
-          );
-        }
-        if (error?.code === "NO_FILE") {
-          throw new HttpError(400, "No photos were provided.");
-        }
-        throw error instanceof HttpError
-          ? error
-          : new HttpError(400, "Could not read the uploaded files.");
-      }
-
-      const photos = [];
-      let totalSize = 0;
-
-      for (const file of upload.files) {
-        const type = sniffImageType(file.buffer);
-
-        if (type !== "image/jpeg" && type !== "image/webp") {
-          throw new HttpError(
-            400,
-            "Unsupported image format. TikTok accepts JPEG and WebP."
-          );
-        }
-
-        totalSize += file.buffer.length;
-        photos.push({ buffer: file.buffer, type });
-      }
-
-      if (totalSize > MAX_PHOTOS_TOTAL) {
-        throw tooLargeError(
-          `Photos are too large. Maximum total size is ${MAX_PHOTOS_TOTAL / 1024 / 1024} MB.`
-        );
-      }
-
-      const fields = upload.fields;
-      const requestedMode = fields.mode === "draft" ? "draft" : "direct";
-      const mode = resolvePhotoMode(requestedMode);
-
-      const postInfo = buildPhotoPostInfo(mode, fields);
-
-      const requestedCover = Number.parseInt(fields.cover_index, 10);
-      const coverIndex = Math.min(
-        Math.max((Number.isFinite(requestedCover) ? requestedCover : 1) - 1, 0),
-        photos.length - 1
-      );
-
-      storedNames = await storeTikTokPhotos(photos);
-      upload = null;
-
-      const imageUrls = storedNames.map(
-        (name) => `${PUBLIC_API_URL}/api/media/tiktok/${name}`
-      );
-
-      await probePublicPhotos(imageUrls);
-
-      const init = await initTikTokPhotoPublish(
-        accessToken,
-        mode,
-        postInfo,
-        imageUrls,
-        coverIndex
-      );
-
-      sendJson(res, 200, {
-        success: true,
-        mode,
-        requested_mode: requestedMode,
-        sandbox: TIKTOK_SANDBOX,
-        publish_id: init.data.publish_id,
-        photo_count: photos.length,
-      });
+      upload = await parseMultipartFiles(req, { fileField: "photos", maxFiles: MAX_TIKTOK_PHOTOS, maxFileSize: MAX_PHOTO_SIZE });
     } catch (error) {
-      if (storedNames.length > 0) await removeTikTokPhotos(storedNames);
-      throw error;
-    } finally {
-      releaseVideoSlot();
-    }
-  },
-  { auth: true }
-);
-
-route(
-  "GET",
-  "/api/tiktok/publish/status",
-  async ({ res, url, user }) => {
-    const publishId = url.searchParams.get("publish_id");
-
-    if (!isValidTikTokPublishId(publishId)) {
-      throw new HttpError(400, "Missing or invalid publish_id");
+      if (error?.code === "FILE_TOO_LARGE") throw new HttpError(400, `Each photo must be under ${MAX_PHOTO_SIZE / 1024 / 1024} MB.`);
+      if (error?.code === "TOO_MANY_FILES") throw new HttpError(400, `TikTok carousels are limited to ${MAX_TIKTOK_PHOTOS} photos.`);
+      if (error?.code === "NO_FILE") throw new HttpError(400, "No photos were provided.");
+      throw error instanceof HttpError ? error : new HttpError(400, "Could not read the uploaded files.");
     }
 
-    const accessToken = await getValidTikTokToken(user.id);
+    const photos = [];
+    let totalSize = 0;
 
-    const result = await tiktokApi("/v2/post/publish/status/fetch/", {
-      token: accessToken,
-      json: { publish_id: publishId },
+    for (const file of upload.files) {
+      const type = sniffImageType(file.buffer);
+
+      if (type !== "image/jpeg" && type !== "image/webp") {
+        throw new HttpError(400, "Unsupported image format. TikTok accepts JPEG and WebP.");
+      }
+
+      totalSize += file.buffer.length;
+      photos.push({ buffer: file.buffer, type });
+    }
+
+    if (totalSize > MAX_PHOTOS_TOTAL) {
+      throw tooLargeError(`Photos are too large. Maximum total size is ${MAX_PHOTOS_TOTAL / 1024 / 1024} MB.`);
+    }
+
+    const fields = upload.fields;
+    const requestedMode = fields.mode === "draft" ? "draft" : "direct";
+    const mode = resolvePhotoMode(requestedMode);
+    const postInfo = buildPhotoPostInfo(mode, fields);
+
+    const requestedCover = Number.parseInt(fields.cover_index, 10);
+    const coverIndex = Math.min(Math.max((Number.isFinite(requestedCover) ? requestedCover : 1) - 1, 0), photos.length - 1);
+
+    storedNames = await storeTikTokPhotos(photos);
+    upload = null;
+
+    const imageUrls = storedNames.map((name) => `${PUBLIC_API_URL}/api/media/tiktok/${name}`);
+    await probePublicPhotos(imageUrls);
+
+    const init = await initTikTokPhotoPublish(accessToken, mode, postInfo, imageUrls, coverIndex);
+
+    sendJson(res, 200, {
+      success: true,
+      mode,
+      requested_mode: requestedMode,
+      sandbox: TIKTOK_SANDBOX,
+      publish_id: init.data.publish_id,
+      photo_count: photos.length,
     });
+  } catch (error) {
+    if (storedNames.length > 0) await removeTikTokPhotos(storedNames);
+    throw error;
+  } finally {
+    releaseVideoSlot();
+  }
+}, { auth: true });
 
-    sendJson(res, 200, { success: true, ...result.data });
-  },
-  { auth: true }
-);
+route("GET", "/api/tiktok/publish/status", async ({ res, url, user }) => {
+  const publishId = url.searchParams.get("publish_id");
+  if (!isValidTikTokPublishId(publishId)) throw new HttpError(400, "Missing or invalid publish_id");
+
+  const accessToken = await getValidTikTokToken(user.id);
+  const result = await tiktokApi("/v2/post/publish/status/fetch/", { token: accessToken, json: { publish_id: publishId } });
+
+  sendJson(res, 200, { success: true, ...result.data });
+}, { auth: true });
 
 // ============================================================
-// ROUTES — TIKTOK WEBHOOK
+// TIKTOK WEBHOOK
 // ============================================================
 
 const MAX_TIKTOK_WEBHOOK_BODY = 64 * 1024;
@@ -5282,10 +4426,7 @@ const TIKTOK_WEBHOOK_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const TIKTOK_WEBHOOK_DEDUPE_MAX = 5_000;
 const TIKTOK_REVOKE_SKEW_SEC = 5;
 
-const processedTikTokWebhooks = createSeenCache(
-  TIKTOK_WEBHOOK_DEDUPE_MAX,
-  TIKTOK_WEBHOOK_DEDUPE_TTL_MS
-);
+const processedTikTokWebhooks = createSeenCache(TIKTOK_WEBHOOK_DEDUPE_MAX, TIKTOK_WEBHOOK_DEDUPE_TTL_MS);
 
 function parseTikTokSignatureHeader(header) {
   if (typeof header !== "string" || header.length > 512) return null;
@@ -5310,39 +4451,22 @@ function parseTikTokSignatureHeader(header) {
   return { timestamp, signature: signature.toLowerCase() };
 }
 
-function verifyTikTokWebhookSignature(
-  rawBody,
-  header,
-  secret,
-  toleranceSec = TIKTOK_WEBHOOK_TOLERANCE_SEC,
-  nowMs = Date.now()
-) {
+function verifyTikTokWebhookSignature(rawBody, header, secret, toleranceSec = TIKTOK_WEBHOOK_TOLERANCE_SEC, nowMs = Date.now()) {
   if (!secret) return { ok: false, reason: "secret_missing" };
 
   const parsed = parseTikTokSignatureHeader(header);
   if (!parsed) return { ok: false, reason: "malformed_header" };
 
-  const expected = crypto
-    .createHmac("sha256", secret)
-    .update(parsed.timestamp + ".")
-    .update(rawBody)
-    .digest();
-
+  const expected = crypto.createHmac("sha256", secret).update(parsed.timestamp + ".").update(rawBody).digest();
   const received = Buffer.from(parsed.signature, "hex");
 
-  if (
-    received.length !== expected.length ||
-    !crypto.timingSafeEqual(received, expected)
-  ) {
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) {
     return { ok: false, reason: "bad_signature" };
   }
 
   if (toleranceSec > 0) {
     const skewSec = Math.abs(nowMs / 1000 - Number(parsed.timestamp));
-
-    if (skewSec > toleranceSec) {
-      return { ok: false, reason: "timestamp_out_of_tolerance" };
-    }
+    if (skewSec > toleranceSec) return { ok: false, reason: "timestamp_out_of_tolerance" };
   }
 
   return { ok: true, timestamp: Number(parsed.timestamp) };
@@ -5361,17 +4485,6 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
     throw new HttpError(400, "Invalid create_time", "INVALID_PAYLOAD");
   }
 
-  let reason = null;
-
-  if (typeof payload.content === "string") {
-    try {
-      const content = JSON.parse(payload.content);
-      if (content && Number.isInteger(content.reason)) reason = content.reason;
-    } catch {
-      // content illisible : la déconnexion est traitée quand même
-    }
-  }
-
   const cutoff = new Date((createTime + TIKTOK_REVOKE_SKEW_SEC) * 1000).toISOString();
 
   const { data, error } = await supabaseAdmin
@@ -5381,9 +4494,7 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
     .lte("updated_at", cutoff)
     .select("user_id");
 
-  if (error) {
-    throw new Error("tiktok_accounts cleanup failed: " + error.message);
-  }
+  if (error) throw new Error("tiktok_accounts cleanup failed: " + error.message);
 
   if (Array.isArray(data)) {
     for (const row of data) {
@@ -5391,12 +4502,7 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
     }
   }
 
-  console.log(
-    "[" + requestId + "] [tiktok:webhook] authorization.removed" +
-      " openid=" + sha256(openId).slice(0, 10) +
-      " reason=" + (reason === null ? "n/a" : reason) +
-      " comptes_supprimés=" + (data ? data.length : 0)
-  );
+  console.log(`[${requestId}] [tiktok:webhook] authorization.removed comptes_supprimés=${data ? data.length : 0}`);
 }
 
 const TIKTOK_ACK_ONLY_EVENTS = new Set([
@@ -5408,14 +4514,10 @@ const TIKTOK_ACK_ONLY_EVENTS = new Set([
 route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
   const rawBody = await readBody(req, MAX_TIKTOK_WEBHOOK_BODY);
 
-  const check = verifyTikTokWebhookSignature(
-    rawBody,
-    req.headers["tiktok-signature"],
-    TIKTOK_CLIENT_SECRET
-  );
+  const check = verifyTikTokWebhookSignature(rawBody, req.headers["tiktok-signature"], TIKTOK_CLIENT_SECRET);
 
   if (!check.ok) {
-    console.warn("[" + requestId + "] [tiktok:webhook] rejeté (" + check.reason + ")");
+    console.warn(`[${requestId}] [tiktok:webhook] rejeté (${check.reason})`);
     throw new HttpError(401, "Invalid webhook signature", "INVALID_SIGNATURE");
   }
 
@@ -5433,16 +4535,11 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
 
   const eventName = payload.event;
 
-  if (
-    typeof eventName !== "string" ||
-    eventName.length > 100 ||
-    !/^[A-Za-z0-9_.]+$/.test(eventName)
-  ) {
+  if (typeof eventName !== "string" || eventName.length > 100 || !/^[A-Za-z0-9_.]+$/.test(eventName)) {
     throw new HttpError(400, "Invalid event", "INVALID_PAYLOAD");
   }
 
   if (typeof payload.client_key === "string" && payload.client_key !== TIKTOK_CLIENT_KEY) {
-    console.warn("[" + requestId + "] [tiktok:webhook] client_key inattendu : ignoré");
     sendJson(res, 200, { received: true, ignored: true });
     return;
   }
@@ -5457,9 +4554,9 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
   if (eventName === "authorization.removed") {
     await handleTikTokAuthorizationRemoved(payload, requestId);
   } else if (TIKTOK_ACK_ONLY_EVENTS.has(eventName)) {
-    console.log("[" + requestId + "] [tiktok:webhook] " + eventName + " reçu (aucune action)");
+    console.log(`[${requestId}] [tiktok:webhook] ${eventName} reçu`);
   } else {
-    console.warn("[" + requestId + "] [tiktok:webhook] événement inconnu ignoré : " + eventName.slice(0, 60));
+    console.warn(`[${requestId}] [tiktok:webhook] événement inconnu : ${eventName.slice(0, 60)}`);
   }
 
   processedTikTokWebhooks.add(dedupeKey);
@@ -5467,685 +4564,473 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
 });
 
 // ============================================================
-// ROUTES — PINTEREST
+// PINTEREST ROUTES
 // ============================================================
 
-route(
-  "POST",
-  "/api/pinterest/auth/url",
-  ({ res, user }) => {
-    const params = new URLSearchParams({
-      client_id: PINTEREST_APP_ID,
-      redirect_uri: PINTEREST_REDIRECT_URI,
-      response_type: "code",
-      scope: PINTEREST_SCOPES,
-      state: createOAuthState("pinterest", user.id),
-    });
-
-    sendJson(res, 200, {
-      success: true,
-      url: `${PINTEREST_AUTH_URL}?${params.toString()}`,
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/pinterest/auth/callback",
-  async ({ req, res, user }) => {
-    const body = await getJsonBody(req);
-    const authCode = assertValidOAuthCallback("pinterest", body, user.id);
-
-    const account = await dedupeCallback(
-      `pinterest:${user.id}:${sha256(authCode)}`,
-      async () => {
-        const tokens = await pinterestApi("/oauth/token", {
-          method: "POST",
-          base: PINTEREST_OAUTH_BASE,
-          basic: true,
-          form: {
-            grant_type: "authorization_code",
-            code: authCode,
-            redirect_uri: PINTEREST_REDIRECT_URI,
-          },
-        });
-
-        if (!tokens?.access_token) {
-          throw new HttpError(
-            502,
-            "Pinterest returned an invalid token response",
-            "PINTEREST_BAD_TOKEN_RESPONSE"
-          );
-        }
-
-        let profile = {};
-
-        try {
-          profile = await pinterestApi("/user_account", {
-            token: tokens.access_token,
-          });
-        } catch (profileError) {
-          console.warn("Pinterest user_account error:", profileError.message);
-        }
-
-        await savePinterestTokens(user.id, tokens, {
-          username: profile.username || null,
-          avatar_url: profile.profile_image || null,
-          account_type: profile.account_type || null,
-        });
-
-        return {
-          display_name: profile.username || null,
-          avatar_url: profile.profile_image || null,
-          account_type: profile.account_type || null,
-        };
-      }
-    );
-
-    sendJson(res, 200, { success: true, connected: true, account });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/pinterest/auth/token",
-  async ({ req, res, user }) => {
-    if (env("PINTEREST_ALLOW_MANUAL_TOKEN") !== "1") {
-      throw new HttpError(403, "Manual token connection is disabled");
-    }
-
-    const body = await getJsonBody(req);
-    const accessToken = String(body.access_token || "").trim();
-
-    if (!accessToken || accessToken.length > 4096) {
-      throw new HttpError(400, "Missing access_token");
-    }
-
-    let profile;
-
-    try {
-      profile = await pinterestApi("/user_account", { token: accessToken });
-    } catch (profileError) {
-      throw new HttpError(
-        400,
-        `Invalid Pinterest token: ${profileError.message}`
-      );
-    }
-
-    await savePinterestTokens(
-      user.id,
-      {
-        access_token: accessToken,
-        refresh_token: null,
-        expires_in: 29 * 24 * 60 * 60,
-        refresh_token_expires_in: 29 * 24 * 60 * 60,
-      },
-      {
-        username: profile.username || null,
-        avatar_url: profile.profile_image || null,
-        account_type: profile.account_type || null,
-      }
-    );
-
-    sendJson(res, 200, {
-      success: true,
-      connected: true,
-      account: {
-        display_name: profile.username || null,
-        avatar_url: profile.profile_image || null,
-        account_type: profile.account_type || null,
-      },
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "GET",
-  "/api/pinterest/status",
-  async ({ res, user }) => {
-    const account = await getPinterestAccount(user.id);
-    const usable = pinterestAccountMatchesEnv(account);
-
-    sendJson(res, 200, {
-      success: true,
-      connected: usable,
-      account: usable
-        ? {
-            display_name: account.username,
-            avatar_url: account.avatar_url,
-            account_type: account.account_type,
-            scope: account.scope,
-          }
-        : null,
-      ...(account && !usable ? { needs_reconnect: true } : {}),
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "DELETE",
-  "/api/pinterest/disconnect",
-  async ({ res, user }) => {
-    const { error } = await supabaseAdmin
-      .from("pinterest_accounts")
-      .delete()
-      .eq("user_id", user.id);
-
-    if (error) throw error;
-
-    sendJson(res, 200, { success: true });
-  },
-  { auth: true }
-);
-
-// ============================================================
-// ROUTES — YOUTUBE
-// ============================================================
-
-route(
-  "POST",
-  "/api/youtube/auth/url",
-  ({ res, user }) => {
-    const params = new URLSearchParams({
-      client_id: YOUTUBE_CLIENT_ID,
-      redirect_uri: YOUTUBE_REDIRECT_URI,
-      response_type: "code",
-      scope: YOUTUBE_SCOPES,
-      access_type: "offline",
-      prompt: "consent",
-      include_granted_scopes: "true",
-      state: createOAuthState("youtube", user.id),
-    });
-
-    sendJson(res, 200, {
-      success: true,
-      url: `${GOOGLE_AUTH_URL}?${params.toString()}`,
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/youtube/auth/callback",
-  async ({ req, res, user }) => {
-    const body = await getJsonBody(req);
-    const authCode = assertValidOAuthCallback("youtube", body, user.id);
-
-    const account = await dedupeCallback(
-      `youtube:${user.id}:${sha256(authCode)}`,
-      async () => {
-        const tokens = await googleRequest(GOOGLE_TOKEN_URL, {
-          method: "POST",
-          form: {
-            client_id: YOUTUBE_CLIENT_ID,
-            client_secret: YOUTUBE_CLIENT_SECRET,
-            code: authCode,
-            grant_type: "authorization_code",
-            redirect_uri: YOUTUBE_REDIRECT_URI,
-          },
-        });
-
-        let channel = null;
-
-        try {
-          channel = await fetchYouTubeChannel(tokens.access_token);
-        } catch (channelError) {
-          console.warn("YouTube channels error:", channelError.message);
-        }
-
-        if (!channel) {
-          try {
-            await googleRequest(GOOGLE_REVOKE_URL, {
-              method: "POST",
-              form: { token: tokens.refresh_token || tokens.access_token },
-            });
-          } catch {
-            // ignore
-          }
-
-          throw new HttpError(
-            400,
-            "No YouTube channel found on this Google account. Create a channel on youtube.com, then try again."
-          );
-        }
-
-        await saveYouTubeTokens(
-          user.id,
-          {
-            ...tokens,
-            refresh_token_expires_in: tokens.refresh_token_expires_in ?? null,
-          },
-          {
-            channel_id: channel.id,
-            channel_title: channel.title || null,
-            custom_url: channel.customUrl || null,
-            avatar_url: channel.avatarUrl || null,
-          }
-        );
-
-        return {
-          display_name: channel.title || null,
-          avatar_url: channel.avatarUrl || null,
-        };
-      }
-    );
-
-    sendJson(res, 200, { success: true, connected: true, account });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/youtube/publish",
-  async ({ req, res, user }) => {
-    enforce(limiterPublish, `youtube:${user.id}`);
-
-    const declared = Number(req.headers["content-length"] || 0);
-
-    if (declared > MAX_VIDEO_SIZE + 1024 * 1024) {
-      throw tooLargeError(
-        `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`
-      );
-    }
-
-    const accessToken = await getValidYouTubeToken(user.id);
-
-    await acquireVideoSlot();
-
-    try {
-      let upload;
-
-      try {
-        upload = await parseMultipart(req, {
-          fileField: "video",
-          maxSize: MAX_VIDEO_SIZE,
-        });
-      } catch (error) {
-        if (error?.code === "FILE_TOO_LARGE") {
-          throw new HttpError(
-            400,
-            `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`
-          );
-        }
-        if (error?.code === "NO_FILE") {
-          throw new HttpError(400, "No 'video' file was provided.");
-        }
-        throw error instanceof HttpError
-          ? error
-          : new HttpError(400, "Could not read the uploaded file.");
-      }
-
-      const mimeType = sniffVideoType(upload.buffer);
-
-      if (!mimeType) {
-        throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
-      }
-
-      const { privacy, publishAt, metadata } = buildYouTubeMetadata(upload.fields);
-
-      const uploadUrl = await initYouTubeUpload(
-        accessToken,
-        metadata,
-        upload.buffer.length,
-        mimeType
-      );
-
-      const video = await uploadVideoToYouTube(uploadUrl, upload.buffer, mimeType);
-
-      if (!video?.id) {
-        throw new HttpError(
-          502,
-          "YouTube did not confirm the upload",
-          "YOUTUBE_NO_VIDEO_ID"
-        );
-      }
-
-      const actualPrivacy = video.status?.privacyStatus || null;
-
-      const privacyLocked =
-        !publishAt && privacy !== "private" && actualPrivacy === "private";
-
-      sendJson(res, 200, {
-        success: true,
-        video_id: video.id,
-        url: `https://www.youtube.com/watch?v=${video.id}`,
-        privacy_status: actualPrivacy,
-        requested_privacy: privacy,
-        publish_at: publishAt,
-        upload_status: video.status?.uploadStatus || null,
-        privacy_locked: privacyLocked,
-      });
-    } finally {
-      releaseVideoSlot();
-    }
-  },
-  { auth: true }
-);
-
-route(
-  "GET",
-  "/api/youtube/status",
-  async ({ res, user }) => {
-    const account = await getYouTubeAccount(user.id);
-
-    sendJson(res, 200, {
-      success: true,
-      connected: Boolean(account),
-      account: account
-        ? {
-            display_name: account.channel_title,
-            avatar_url: account.avatar_url,
-            custom_url: account.custom_url,
-            scope: account.scope,
-            can_publish: String(account.scope || "")
-              .split(/[\s,]+/)
-              .includes(YOUTUBE_UPLOAD_SCOPE),
-          }
-        : null,
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "DELETE",
-  "/api/youtube/disconnect",
-  async ({ res, user }) => {
-    const account = await getYouTubeAccount(user.id);
-
-    if (account) {
-      const tokenToRevoke = account.refresh_token || account.access_token;
-
-      if (tokenToRevoke) {
-        try {
-          await googleRequest(GOOGLE_REVOKE_URL, {
-            method: "POST",
-            form: { token: tokenToRevoke },
-          });
-        } catch (revokeError) {
-          console.warn("YouTube revoke error:", revokeError.message);
-        }
-      }
-
-      const { error } = await supabaseAdmin
-        .from("youtube_accounts")
-        .delete()
-        .eq("user_id", user.id);
-
-      if (error) throw error;
-    }
-
-    sendJson(res, 200, { success: true });
-  },
-  { auth: true }
-);
-
-// ============================================================
-// ROUTES — CANVA
-// ============================================================
-
-route(
-  "POST",
-  "/api/canva/auth/url",
-  ({ res, user }) => {
-    const state = createOAuthState("canva", user.id);
-
-    const params = new URLSearchParams({
-      response_type: "code",
-      client_id: CANVA_CLIENT_ID,
-      redirect_uri: CANVA_REDIRECT_URI,
-      scope: CANVA_SCOPES,
-      code_challenge: createCanvaPkce(state),
-      code_challenge_method: "S256",
-      state,
-    });
-
-    sendJson(res, 200, {
-      success: true,
-      url: `${CANVA_AUTH_URL}?${params.toString()}`,
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/canva/auth/callback",
-  async ({ req, res, user }) => {
-    const body = await getJsonBody(req);
-    const authCode = assertValidOAuthCallback("canva", body, user.id);
-    const state = String(body.state);
-
-    await dedupeCallback(`canva:${user.id}:${sha256(authCode)}`, async () => {
-      const verifier = takeCanvaVerifier(state);
-
-      if (!verifier) {
-        throw new HttpError(400, "Invalid or expired state", "OAUTH_STATE_INVALID");
-      }
-
-      const tokens = await canvaApi("/oauth/token", {
-        method: "POST",
-        basic: true,
-        form: {
-          grant_type: "authorization_code",
-          code: authCode,
-          code_verifier: verifier,
-          redirect_uri: CANVA_REDIRECT_URI,
-        },
-      });
-
-      if (!tokens?.access_token) {
-        throw new HttpError(502, "Canva returned an invalid token response", "CANVA_BAD_TOKEN_RESPONSE");
-      }
-
-      let displayName = null;
-
-      try {
-        const profile = await canvaApi("/users/me/profile", { token: tokens.access_token });
-        displayName = profile.profile?.display_name || null;
-      } catch (profileError) {
-        console.warn("Canva profile error:", profileError.message);
-      }
-
-      await saveCanvaTokens(user.id, tokens, { display_name: displayName });
-
-      return { display_name: displayName };
-    });
-
-    sendJson(res, 200, { success: true, connected: true });
-  },
-  { auth: true }
-);
-
-route(
-  "GET",
-  "/api/canva/status",
-  async ({ res, user }) => {
-    const account = await getCanvaAccount(user.id);
-
-    sendJson(res, 200, {
-      success: true,
-      connected: Boolean(account),
-      account: account ? { display_name: account.display_name } : null,
-    });
-  },
-  { auth: true }
-);
-
-route(
-  "DELETE",
-  "/api/canva/disconnect",
-  async ({ res, user }) => {
-    const account = await getCanvaAccount(user.id);
-
-    if (account) {
-      const tokenToRevoke = account.refresh_token || account.access_token;
-
-      if (tokenToRevoke) {
-        try {
-          await canvaApi("/oauth/revoke", {
-            method: "POST",
-            basic: true,
-            form: { token: tokenToRevoke },
-          });
-        } catch (revokeError) {
-          console.warn("Canva revoke error:", revokeError.message);
-        }
-      }
-
-      const { error } = await supabaseAdmin
-        .from("canva_accounts")
-        .delete()
-        .eq("user_id", user.id);
-
-      if (error) throw error;
-    }
-
-    sendJson(res, 200, { success: true });
-  },
-  { auth: true }
-);
-
-route(
-  "POST",
-  "/api/canva/designs",
-  async ({ req, res, user }) => {
-    enforce(limiterCanva, `canva:${user.id}`);
-
-    const body = await getJsonBody(req);
-    const width = Number(body.width);
-    const height = Number(body.height);
-
-    const valid = (n) => Number.isInteger(n) && n >= 40 && n <= 8000;
-
-    if (!valid(width) || !valid(height)) {
-      throw new HttpError(400, "Invalid design size (40 to 8000 px).");
-    }
-
-    const title = String(body.title || "Stone post").slice(0, 255);
-    const token = await getValidCanvaToken(user.id);
-
-    const data = await canvaApi("/designs", {
+route("POST", "/api/pinterest/auth/url", ({ res, user }) => {
+  const params = new URLSearchParams({
+    client_id: PINTEREST_APP_ID,
+    redirect_uri: PINTEREST_REDIRECT_URI,
+    response_type: "code",
+    scope: PINTEREST_SCOPES,
+    state: createOAuthState("pinterest", user.id),
+  });
+
+  sendJson(res, 200, { success: true, url: `${PINTEREST_AUTH_URL}?${params.toString()}` });
+}, { auth: true });
+
+route("POST", "/api/pinterest/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("pinterest", body, user.id);
+
+  const account = await dedupeCallback(`pinterest:${user.id}:${sha256(authCode)}`, async () => {
+    const tokens = await pinterestApi("/oauth/token", {
       method: "POST",
-      token,
-      json: { design_type: { type: "custom", width, height }, title },
+      base: PINTEREST_OAUTH_BASE,
+      basic: true,
+      form: { grant_type: "authorization_code", code: authCode, redirect_uri: PINTEREST_REDIRECT_URI },
     });
 
-    const design = data.design;
-
-    if (!design?.id || !design.urls?.edit_url) {
-      throw new HttpError(502, "Canva did not return a design", "CANVA_NO_DESIGN");
+    if (!tokens?.access_token) {
+      throw new HttpError(502, "Pinterest returned an invalid token response", "PINTEREST_BAD_TOKEN_RESPONSE");
     }
+
+    let profile = {};
+
+    try {
+      profile = await pinterestApi("/user_account", { token: tokens.access_token });
+    } catch (profileError) {
+      console.warn("Pinterest user_account error:", profileError.message);
+    }
+
+    await savePinterestTokens(user.id, tokens, {
+      username: profile.username || null,
+      avatar_url: profile.profile_image || null,
+      account_type: profile.account_type || null,
+    });
+
+    return {
+      display_name: profile.username || null,
+      avatar_url: profile.profile_image || null,
+      account_type: profile.account_type || null,
+    };
+  });
+
+  sendJson(res, 200, { success: true, connected: true, account });
+}, { auth: true });
+
+route("POST", "/api/pinterest/auth/token", async ({ req, res, user }) => {
+  if (env("PINTEREST_ALLOW_MANUAL_TOKEN") !== "1") {
+    throw new HttpError(403, "Manual token connection is disabled");
+  }
+
+  const body = await getJsonBody(req);
+  const accessToken = String(body.access_token || "").trim();
+
+  if (!accessToken || accessToken.length > 4096) throw new HttpError(400, "Missing access_token");
+
+  let profile;
+
+  try {
+    profile = await pinterestApi("/user_account", { token: accessToken });
+  } catch (profileError) {
+    throw new HttpError(400, `Invalid Pinterest token: ${profileError.message}`);
+  }
+
+  await savePinterestTokens(user.id, {
+    access_token: accessToken,
+    refresh_token: null,
+    expires_in: 29 * 24 * 60 * 60,
+    refresh_token_expires_in: 29 * 24 * 60 * 60,
+  }, {
+    username: profile.username || null,
+    avatar_url: profile.profile_image || null,
+    account_type: profile.account_type || null,
+  });
+
+  sendJson(res, 200, {
+    success: true,
+    connected: true,
+    account: {
+      display_name: profile.username || null,
+      avatar_url: profile.profile_image || null,
+      account_type: profile.account_type || null,
+    },
+  });
+}, { auth: true });
+
+route("GET", "/api/pinterest/status", async ({ res, user }) => {
+  const account = await getPinterestAccount(user.id);
+  const usable = pinterestAccountMatchesEnv(account);
+
+  sendJson(res, 200, {
+    success: true,
+    connected: usable,
+    account: usable
+      ? { display_name: account.username, avatar_url: account.avatar_url, account_type: account.account_type, scope: account.scope }
+      : null,
+    ...(account && !usable ? { needs_reconnect: true } : {}),
+  });
+}, { auth: true });
+
+route("DELETE", "/api/pinterest/disconnect", async ({ res, user }) => {
+  const { error } = await supabaseAdmin.from("pinterest_accounts").delete().eq("user_id", user.id);
+  if (error) throw error;
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// ============================================================
+// YOUTUBE ROUTES
+// ============================================================
+
+route("POST", "/api/youtube/auth/url", ({ res, user }) => {
+  const params = new URLSearchParams({
+    client_id: YOUTUBE_CLIENT_ID,
+    redirect_uri: YOUTUBE_REDIRECT_URI,
+    response_type: "code",
+    scope: YOUTUBE_SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+    include_granted_scopes: "true",
+    state: createOAuthState("youtube", user.id),
+  });
+
+  sendJson(res, 200, { success: true, url: `${GOOGLE_AUTH_URL}?${params.toString()}` });
+}, { auth: true });
+
+route("POST", "/api/youtube/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("youtube", body, user.id);
+
+  const account = await dedupeCallback(`youtube:${user.id}:${sha256(authCode)}`, async () => {
+    const tokens = await googleRequest(GOOGLE_TOKEN_URL, {
+      method: "POST",
+      form: {
+        client_id: YOUTUBE_CLIENT_ID,
+        client_secret: YOUTUBE_CLIENT_SECRET,
+        code: authCode,
+        grant_type: "authorization_code",
+        redirect_uri: YOUTUBE_REDIRECT_URI,
+      },
+    });
+
+    let channel = null;
+
+    try {
+      channel = await fetchYouTubeChannel(tokens.access_token);
+    } catch (channelError) {
+      console.warn("YouTube channels error:", channelError.message);
+    }
+
+    if (!channel) {
+      try {
+        await googleRequest(GOOGLE_REVOKE_URL, {
+          method: "POST",
+          form: { token: tokens.refresh_token || tokens.access_token },
+        });
+      } catch {
+        // ignore
+      }
+
+      throw new HttpError(400, "No YouTube channel found on this Google account. Create a channel on youtube.com, then try again.");
+    }
+
+    await saveYouTubeTokens(user.id, {
+      ...tokens,
+      refresh_token_expires_in: tokens.refresh_token_expires_in ?? null,
+    }, {
+      channel_id: channel.id,
+      channel_title: channel.title || null,
+      custom_url: channel.customUrl || null,
+      avatar_url: channel.avatarUrl || null,
+    });
+
+    return { display_name: channel.title || null, avatar_url: channel.avatarUrl || null };
+  });
+
+  sendJson(res, 200, { success: true, connected: true, account });
+}, { auth: true });
+
+route("POST", "/api/youtube/publish", async ({ req, res, user }) => {
+  enforce(limiterPublish, `youtube:${user.id}`);
+
+  const declared = Number(req.headers["content-length"] || 0);
+
+  if (declared > MAX_VIDEO_SIZE + 1024 * 1024) {
+    throw tooLargeError(`Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`);
+  }
+
+  const accessToken = await getValidYouTubeToken(user.id);
+  await acquireVideoSlot();
+
+  try {
+    let upload;
+
+    try {
+      upload = await parseMultipart(req, { fileField: "video", maxSize: MAX_VIDEO_SIZE });
+    } catch (error) {
+      if (error?.code === "FILE_TOO_LARGE") throw new HttpError(400, `Video is too large. Maximum size is ${MAX_VIDEO_SIZE / 1024 / 1024} MB.`);
+      if (error?.code === "NO_FILE") throw new HttpError(400, "No 'video' file was provided.");
+      throw error instanceof HttpError ? error : new HttpError(400, "Could not read the uploaded file.");
+    }
+
+    const mimeType = sniffVideoType(upload.buffer);
+    if (!mimeType) throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
+
+    const { privacy, publishAt, metadata } = buildYouTubeMetadata(upload.fields);
+
+    const uploadUrl = await initYouTubeUpload(accessToken, metadata, upload.buffer.length, mimeType);
+    const video = await uploadVideoToYouTube(uploadUrl, upload.buffer, mimeType);
+
+    if (!video?.id) throw new HttpError(502, "YouTube did not confirm the upload", "YOUTUBE_NO_VIDEO_ID");
+
+    const actualPrivacy = video.status?.privacyStatus || null;
+    const privacyLocked = !publishAt && privacy !== "private" && actualPrivacy === "private";
 
     sendJson(res, 200, {
       success: true,
-      design_id: design.id,
-      edit_url: design.urls.edit_url,
+      video_id: video.id,
+      url: `https://www.youtube.com/watch?v=${video.id}`,
+      privacy_status: actualPrivacy,
+      requested_privacy: privacy,
+      publish_at: publishAt,
+      upload_status: video.status?.uploadStatus || null,
+      privacy_locked: privacyLocked,
     });
-  },
-  { auth: true }
-);
+  } finally {
+    releaseVideoSlot();
+  }
+}, { auth: true });
+
+route("GET", "/api/youtube/status", async ({ res, user }) => {
+  const account = await getYouTubeAccount(user.id);
+
+  sendJson(res, 200, {
+    success: true,
+    connected: Boolean(account),
+    account: account
+      ? {
+          display_name: account.channel_title,
+          avatar_url: account.avatar_url,
+          custom_url: account.custom_url,
+          scope: account.scope,
+          can_publish: String(account.scope || "").split(/[\s,]+/).includes(YOUTUBE_UPLOAD_SCOPE),
+        }
+      : null,
+  });
+}, { auth: true });
+
+route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
+  const account = await getYouTubeAccount(user.id);
+
+  if (account) {
+    const tokenToRevoke = account.refresh_token || account.access_token;
+
+    if (tokenToRevoke) {
+      try {
+        await googleRequest(GOOGLE_REVOKE_URL, {
+          method: "POST",
+          form: { token: tokenToRevoke },
+        });
+      } catch (revokeError) {
+        console.warn("YouTube revoke error:", revokeError.message);
+      }
+    }
+
+    const { error } = await supabaseAdmin.from("youtube_accounts").delete().eq("user_id", user.id);
+    if (error) throw error;
+  }
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// ============================================================
+// CANVA ROUTES
+// ============================================================
+
+route("POST", "/api/canva/auth/url", ({ res, user }) => {
+  const state = createOAuthState("canva", user.id);
+
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: CANVA_CLIENT_ID,
+    redirect_uri: CANVA_REDIRECT_URI,
+    scope: CANVA_SCOPES,
+    code_challenge: createCanvaPkce(state),
+    code_challenge_method: "S256",
+    state,
+  });
+
+  sendJson(res, 200, { success: true, url: `${CANVA_AUTH_URL}?${params.toString()}` });
+}, { auth: true });
+
+route("POST", "/api/canva/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("canva", body, user.id);
+  const state = String(body.state);
+
+  await dedupeCallback(`canva:${user.id}:${sha256(authCode)}`, async () => {
+    const verifier = takeCanvaVerifier(state);
+
+    if (!verifier) throw new HttpError(400, "Invalid or expired state", "OAUTH_STATE_INVALID");
+
+    const tokens = await canvaApi("/oauth/token", {
+      method: "POST",
+      basic: true,
+      form: { grant_type: "authorization_code", code: authCode, code_verifier: verifier, redirect_uri: CANVA_REDIRECT_URI },
+    });
+
+    if (!tokens?.access_token) {
+      throw new HttpError(502, "Canva returned an invalid token response", "CANVA_BAD_TOKEN_RESPONSE");
+    }
+
+    let displayName = null;
+
+    try {
+      const profile = await canvaApi("/users/me/profile", { token: tokens.access_token });
+      displayName = profile.profile?.display_name || null;
+    } catch (profileError) {
+      console.warn("Canva profile error:", profileError.message);
+    }
+
+    await saveCanvaTokens(user.id, tokens, { display_name: displayName });
+  });
+
+  sendJson(res, 200, { success: true, connected: true });
+}, { auth: true });
+
+route("GET", "/api/canva/status", async ({ res, user }) => {
+  const account = await getCanvaAccount(user.id);
+
+  sendJson(res, 200, {
+    success: true,
+    connected: Boolean(account),
+    account: account ? { display_name: account.display_name } : null,
+  });
+}, { auth: true });
+
+route("DELETE", "/api/canva/disconnect", async ({ res, user }) => {
+  const account = await getCanvaAccount(user.id);
+
+  if (account) {
+    const tokenToRevoke = account.refresh_token || account.access_token;
+
+    if (tokenToRevoke) {
+      try {
+        await canvaApi("/oauth/revoke", { method: "POST", basic: true, form: { token: tokenToRevoke } });
+      } catch (revokeError) {
+        console.warn("Canva revoke error:", revokeError.message);
+      }
+    }
+
+    const { error } = await supabaseAdmin.from("canva_accounts").delete().eq("user_id", user.id);
+    if (error) throw error;
+  }
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+route("POST", "/api/canva/designs", async ({ req, res, user }) => {
+  enforce(limiterCanva, `canva:${user.id}`);
+
+  const body = await getJsonBody(req);
+  const width = Number(body.width);
+  const height = Number(body.height);
+  const valid = (n) => Number.isInteger(n) && n >= 40 && n <= 8000;
+
+  if (!valid(width) || !valid(height)) throw new HttpError(400, "Invalid design size (40 to 8000 px).");
+
+  const title = String(body.title || "Stone post").slice(0, 255);
+  const token = await getValidCanvaToken(user.id);
+
+  const data = await canvaApi("/designs", {
+    method: "POST",
+    token,
+    json: { design_type: { type: "custom", width, height }, title },
+  });
+
+  const design = data.design;
+
+  if (!design?.id || !design.urls?.edit_url) throw new HttpError(502, "Canva did not return a design", "CANVA_NO_DESIGN");
+
+  sendJson(res, 200, { success: true, design_id: design.id, edit_url: design.urls.edit_url });
+}, { auth: true });
 
 const CANVA_EXPORT_MAX_PAGES = 10;
 const CANVA_EXPORT_MAX_TOTAL = 30 * 1024 * 1024;
 
-route(
-  "POST",
-  "/api/canva/export",
-  async ({ req, res, user }) => {
-    enforce(limiterCanva, `canva:${user.id}`);
+route("POST", "/api/canva/export", async ({ req, res, user }) => {
+  enforce(limiterCanva, `canva:${user.id}`);
 
-    const body = await getJsonBody(req);
-    const designId = String(body.design_id || "");
+  const body = await getJsonBody(req);
+  const designId = String(body.design_id || "");
 
-    if (!/^[A-Za-z0-9_-]{1,64}$/.test(designId)) {
-      throw new HttpError(400, "Invalid design_id");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(designId)) throw new HttpError(400, "Invalid design_id");
+
+  const token = await getValidCanvaToken(user.id);
+
+  const created = await canvaApi("/exports", {
+    method: "POST",
+    token,
+    json: { design_id: designId, format: { type: "png" } },
+  });
+
+  const jobId = created.job?.id;
+  if (!jobId) throw new HttpError(502, "Canva did not start the export", "CANVA_NO_EXPORT_JOB");
+
+  let urls = null;
+
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await delay(1000);
+
+    const poll = await canvaApi(`/exports/${encodeURIComponent(jobId)}`, { token });
+    const job = poll.job;
+
+    if (job?.status === "success") {
+      urls = Array.isArray(job.urls) ? job.urls : [];
+      break;
     }
 
-    const token = await getValidCanvaToken(user.id);
+    if (job?.status === "failed") {
+      throw new HttpError(502, job.error?.message || "Canva could not export this design.", "CANVA_EXPORT_FAILED");
+    }
+  }
 
-    const created = await canvaApi("/exports", {
-      method: "POST",
-      token,
-      json: { design_id: designId, format: { type: "png" } },
-    });
+  if (!urls) throw new HttpError(504, "Canva export timed out, please retry", "CANVA_EXPORT_TIMEOUT");
 
-    const jobId = created.job?.id;
+  const pages = [];
+  let total = 0;
 
-    if (!jobId) throw new HttpError(502, "Canva did not start the export", "CANVA_NO_EXPORT_JOB");
+  for (const fileUrl of urls.slice(0, CANVA_EXPORT_MAX_PAGES)) {
+    if (typeof fileUrl !== "string" || !fileUrl.startsWith("https://")) continue;
 
-    let urls = null;
+    let download;
 
-    for (let attempt = 0; attempt < 30; attempt++) {
-      await delay(1000);
-
-      const poll = await canvaApi(`/exports/${encodeURIComponent(jobId)}`, { token });
-      const job = poll.job;
-
-      if (job?.status === "success") {
-        urls = Array.isArray(job.urls) ? job.urls : [];
-        break;
-      }
-
-      if (job?.status === "failed") {
-        throw new HttpError(
-          502,
-          job.error?.message || "Canva could not export this design.",
-          "CANVA_EXPORT_FAILED"
-        );
-      }
+    try {
+      download = await fetch(fileUrl);
+    } catch (error) {
+      throw upstreamError("Canva", error);
     }
 
-    if (!urls) {
-      throw new HttpError(504, "Canva export timed out, please retry", "CANVA_EXPORT_TIMEOUT");
-    }
+    if (!download.ok) throw new HttpError(502, "Could not download the exported design", "CANVA_DOWNLOAD_FAILED");
 
-    const pages = [];
-    let total = 0;
+    const buffer = Buffer.from(await download.arrayBuffer());
+    const mime = sniffImageType(buffer);
 
-    for (const fileUrl of urls.slice(0, CANVA_EXPORT_MAX_PAGES)) {
-      if (typeof fileUrl !== "string" || !fileUrl.startsWith("https://")) continue;
+    if (mime !== "image/png" && mime !== "image/jpeg") continue;
 
-      let download;
+    total += buffer.length;
 
-      try {
-        download = await fetch(fileUrl);
-      } catch (error) {
-        throw upstreamError("Canva", error);
-      }
+    if (total > CANVA_EXPORT_MAX_TOTAL) throw tooLargeError("The exported design is too large.");
 
-      if (!download.ok) {
-        throw new HttpError(502, "Could not download the exported design", "CANVA_DOWNLOAD_FAILED");
-      }
+    pages.push({ mime, data: buffer.toString("base64") });
+  }
 
-      const buffer = Buffer.from(await download.arrayBuffer());
-      const mime = sniffImageType(buffer);
+  if (pages.length === 0) throw new HttpError(502, "Canva returned no image", "CANVA_EMPTY_EXPORT");
 
-      if (mime !== "image/png" && mime !== "image/jpeg") continue;
-
-      total += buffer.length;
-
-      if (total > CANVA_EXPORT_MAX_TOTAL) {
-        throw tooLargeError("The exported design is too large.");
-      }
-
-      pages.push({ mime, data: buffer.toString("base64") });
-    }
-
-    if (pages.length === 0) {
-      throw new HttpError(502, "Canva returned no image", "CANVA_EMPTY_EXPORT");
-    }
-
-    sendJson(res, 200, { success: true, pages });
-  },
-  { auth: true }
-);
+  sendJson(res, 200, { success: true, pages });
+}, { auth: true });
 
 // ============================================================
 // SERVER
@@ -6178,13 +5063,9 @@ const server = createServer(async (req, res) => {
   let routeLabel = `${req.method} ${req.url}`;
 
   try {
-    const url = new URL(
-      req.url || "/",
-      `http://${req.headers.host || `localhost:${PORT}`}`
-    );
+    const url = new URL(req.url || "/", `http://${req.headers.host || `localhost:${PORT}`}`);
 
-    const pathname =
-      url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
+    const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
 
     routeLabel = `${req.method} ${pathname}`;
 
@@ -6194,7 +5075,7 @@ const server = createServer(async (req, res) => {
       try {
         decodedPath = decodeURIComponent(pathname);
       } catch {
-        // chemin mal encodé : on garde la valeur brute
+        // ignore
       }
 
       if (decodedPath === `/api/media/tiktok/${TIKTOK_VERIFICATION_NAME}.txt`) {
@@ -6207,9 +5088,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const mediaMatch = pathname.match(
-        /^\/api\/media\/tiktok\/([a-f0-9]{32}\.(?:jpg|webp))$/
-      );
+      const mediaMatch = pathname.match(/^\/api\/media\/tiktok\/([a-f0-9]{32}\.(?:jpg|webp))$/);
 
       if (mediaMatch) {
         enforce(limiterMedia, getClientIp(req));
@@ -6218,12 +5097,9 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    const isStripeWebhook =
-      req.method === "POST" && pathname === "/api/stripe/webhook";
+    const isStripeWebhook = req.method === "POST" && pathname === "/api/stripe/webhook";
     const isHealth = req.method === "GET" && pathname === "/api/health";
-
-    const isTiktokWebhook =
-      req.method === "POST" && pathname === "/api/tiktok/webhook";
+    const isTiktokWebhook = req.method === "POST" && pathname === "/api/tiktok/webhook";
 
     if (isTiktokWebhook) {
       enforce(limiterTiktokWebhook, getClientIp(req));
@@ -6239,11 +5115,7 @@ const server = createServer(async (req, res) => {
 
     if (pathname.startsWith("/api/pinterest/") && pinterestConfigError) {
       console.error(`[${requestId}] Pinterest config: ${pinterestConfigError}`);
-      throw new HttpError(
-        500,
-        "Pinterest configuration is inconsistent (sandbox / production mismatch)",
-        "PINTEREST_CONFIG_INVALID"
-      );
+      throw new HttpError(500, "Pinterest configuration is inconsistent (sandbox / production mismatch)", "PINTEREST_CONFIG_INVALID");
     }
 
     const entry = routes.get(`${req.method} ${pathname}`);
@@ -6258,14 +5130,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const ctx = {
-      req,
-      res,
-      url,
-      requestId,
-      user: null,
-      token: null,
-    };
+    const ctx = { req, res, url, requestId, user: null, token: null };
 
     if (entry.auth) {
       const { user, token, error, code } = await getAuthenticatedUser(req);
@@ -6282,9 +5147,7 @@ const server = createServer(async (req, res) => {
     await entry.handler(ctx);
   } catch (error) {
     if (error instanceof HttpError) {
-      if (error.status >= 500) {
-        console.error(`[${requestId}] ${routeLabel}:`, error.message);
-      }
+      if (error.status >= 500) console.error(`[${requestId}] ${routeLabel}:`, error.message);
 
       sendJson(
         res,
@@ -6313,115 +5176,16 @@ server.listen(PORT, () => {
   console.log(`  NODE_ENV        : ${env("NODE_ENV") || "(non défini)"}`);
   console.log(`  TRUST_PROXY     : ${TRUST_PROXY ? `1 (${TRUST_PROXY_HOPS} hop)` : "0"}`);
   console.log(`  Token encryption: ${TOKEN_ENCRYPTION_KEY ? "on" : "off"}`);
-  console.log(`  Rate limits     : strict 10/15min · oauth 30/10min · api 240/min`);
-  console.log(`  Password reset  : redirect ${PASSWORD_RESET_REDIRECT_URL} · 3 demandes/15min par email`);
-  console.log(`  MFA             : AAL2 requis pour PUT /api/user/password si MFA activée`);
+  console.log(`  MFA             : proxy /api/mfa/* → Supabase /auth/v1/factors*`);
+  console.log(`  MFA policy      : AAL2 requis pour PUT /api/user/password si MFA activée`);
   console.log(`  Video uploads   : max ${MAX_VIDEO_UPLOADS} concurrent(s)`);
-  console.log(
-    `  TikTok mode     : ${
-      TIKTOK_SANDBOX
-        ? "SANDBOX (SELF_ONLY + photos en brouillon, testers uniquement)"
-        : "auditée (comportement normal)"
-    }${TIKTOK_FORCE_DRAFT ? " + FORCE_DRAFT (tout en brouillon)" : ""}`
-  );
-  console.log(
-    `  TikTok photos   : ${
-      PUBLIC_API_URL
-        ? `${PUBLIC_API_URL} (via ${PUBLIC_API_URL_SOURCE})`
-        : "désactivé (PUBLIC_API_URL / VITE_API_BASE_URL manquant)"
-    }`
-  );
-  console.log(
-    `  Pinterest       : ${
-      !pinterestEnabled
-        ? "désactivé (Pinterest non configuré)"
-        : pinterestConfigError
-          ? `CONFIG INCOHÉRENTE (${pinterestConfigError})`
-          : `${PINTEREST_ENVIRONMENT.toUpperCase()} · API ${PINTEREST_API_BASE} · OAuth ${PINTEREST_OAUTH_BASE}`
-    }`
-  );
-  console.log(
-    `  YouTube publish : ${
-      youtubeEnabled
-        ? YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE)
-          ? "activée (scope youtube.upload présent)"
-          : "impossible (scope youtube.upload manquant)"
-        : "désactivée (YouTube non configuré)"
-    }`
-  );
-  console.log(
-    `  Canva           : ${
-      canvaEnabled
-        ? `activé (redirect ${CANVA_REDIRECT_URI})`
-        : "désactivé (Canva non configuré)"
-    }`
-  );
-  console.log(
-    `  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`
-  );
-  console.log(`  Stripe portal   : return ${STRIPE_PORTAL_RETURN_URL}`);
-
-  if (tiktokEnabled) {
-    console.log(
-      "  TikTok webhook  : " +
-        (PUBLIC_API_URL
-          ? PUBLIC_API_URL + "/api/tiktok/webhook"
-          : "/api/tiktok/webhook (PUBLIC_API_URL manquant : utilise le domaine public de ce serveur)")
-    );
-  }
-
-  if (tiktokEnabled && PUBLIC_API_URL) {
-    console.log(
-      `  TikTok verif    : ${PUBLIC_API_URL}/api/media/tiktok/${TIKTOK_VERIFICATION_NAME}.txt`
-    );
-    ensureTikTokMediaBucket()
-      .then(sweepTikTokMedia)
-      .catch((error) =>
-        console.warn("TikTok media init failed:", error?.message || error)
-      );
-    setInterval(sweepTikTokMedia, 15 * 60 * 1000).unref?.();
-  }
-
-  if (pinterestUsable) {
-    supabaseAdmin
-      .from("pinterest_accounts")
-      .select("api_env")
-      .limit(1)
-      .then(({ error }) => {
-        if (error) {
-          console.error(
-            "❌ pinterest_accounts.api_env inaccessible — applique la migration SQL (colonne api_env) :",
-            error.message
-          );
-        }
-      })
-      .catch((error) =>
-        console.warn("Pinterest api_env check failed:", error?.message || error)
-      );
-  }
-
-  if (canvaEnabled) {
-    supabaseAdmin
-      .from("canva_accounts")
-      .select("user_id")
-      .limit(1)
-      .then(({ error }) => {
-        if (error) {
-          console.error(
-            "❌ canva_accounts inaccessible — crée la table (voir bloc SQL du README Canva) :",
-            error.message
-          );
-        }
-      })
-      .catch((error) =>
-        console.warn("Canva accounts check failed:", error?.message || error)
-      );
-  }
+  console.log(`  TikTok mode     : ${TIKTOK_SANDBOX ? "SANDBOX" : "auditée"}${TIKTOK_FORCE_DRAFT ? " + FORCE_DRAFT" : ""}`);
+  console.log(`  TikTok photos   : ${PUBLIC_API_URL ? PUBLIC_API_URL : "désactivé"}`);
+  console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
+  console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
+  console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
+  console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
 });
-
-// ============================================================
-// SERVER ERRORS
-// ============================================================
 
 server.on("error", (error) => {
   if (error.code === "EADDRINUSE") {
@@ -6438,10 +5202,6 @@ server.on("clientError", (error, socket) => {
     socket.destroy();
   }
 });
-
-// ============================================================
-// ARRÊT PROPRE
-// ============================================================
 
 let shuttingDown = false;
 
