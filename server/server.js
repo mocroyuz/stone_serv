@@ -12,30 +12,19 @@
 //                  lisibles.
 //   Mot de passe oublié :
 //                  PASSWORD_RESET_REDIRECT_URL (optionnel, défaut :
-//                  ${APP_URL}/#/reset-password). C'est la page du FRONTEND
-//                  vers laquelle le lien de l'email renvoie l'utilisateur.
-//                  Cette URL doit être ajoutée dans Supabase → Authentication
-//                  → URL Configuration → Redirect URLs, sinon Supabase
-//                  redirige vers le « Site URL » à la place.
-//                  Le template d'email « Reset Password » de Supabase est
-//                  configuré dans Authentication → Email Templates.
-//   Photos TikTok: URL publique de CE serveur (domaine de l'API, PAS le
-//                  frontend), lue dans l'ordre :
+//                  ${APP_URL}/#/reset-password).
+//   Photos TikTok: URL publique de CE serveur :
 //                  PUBLIC_API_URL → VITE_API_BASE_URL → RAILWAY_PUBLIC_DOMAIN
 //   TikTok       : TIKTOK_AUDITED=1 une fois l'app auditée par TikTok.
-//                  Sinon l'app est en MODE SANDBOX (voir plus bas).
 //   Pinterest    : PINTEREST_APP_ID, PINTEREST_APP_SECRET.
-//                  Par défaut : SANDBOX.
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
 //                    - le frontend n'embarque PAS @supabase/supabase-js
 //                    - le backend proxifie /auth/v1/factors* de Supabase Auth
-//                      (enroll / challenge / verify / unenroll)
 //                    - ⚠️ Supabase Auth n'expose PAS `GET /auth/v1/factors` :
 //                      la liste des facteurs est lue dans `user.factors`
-//                      (déjà chargé par getAuthenticatedUser)
 //                    - après un verify, Supabase renvoie une session AAL2
 //                      que le backend transmet au frontend pour qu'il la
 //                      stocke (remplace la session AAL1)
@@ -1545,7 +1534,6 @@ function isRecoverySessionToken(token) {
 // getAuthenticatedUser → supabase.auth.getUser). On lit donc
 // simplement `user.factors` partout.
 
-/** true si le facteur est TOTP (gère `type` ET `factor_type`). */
 function isTotp(f) {
   return f?.factor_type === "totp" || f?.type === "totp";
 }
@@ -1578,13 +1566,29 @@ function requireAal2(user, token) {
 }
 
 // ============================================================
-// MFA — PROXY SUPABASE AUTH (enroll / challenge / verify / unenroll)
+// MFA — DETECTION PASSWORD VS OAUTH
 // ============================================================
 //
-// Le frontend n'a AUCUNE clé Supabase : tout passe par ces routes.
-// Elles appellent /auth/v1/factors* avec le token AAL1/AAL2 de
-// l'utilisateur, ce qui permet à Supabase d'appliquer ses règles
-// (unenroll d'un facteur vérifié = AAL2 requis, etc.).
+// Un utilisateur "OAuth-only" n'a pas d'identité `provider: "email"`.
+// Il n'a donc pas de mot de passe et peut en SET un sans fournir
+// `currentPassword`. Un utilisateur avec identité "email" a un mot
+// de passe et doit fournir `currentPassword` pour le changer.
+
+function userHasPassword(user) {
+  const identities = Array.isArray(user?.identities) ? user.identities : [];
+  if (identities.length === 0) return true; // fallback prudent
+  return identities.some((i) => i?.provider === "email");
+}
+
+function userPrimaryProvider(user) {
+  const identities = Array.isArray(user?.identities) ? user.identities : [];
+  const external = identities.find((i) => i?.provider && i.provider !== "email");
+  return external?.provider || "email";
+}
+
+// ============================================================
+// MFA — PROXY SUPABASE AUTH (enroll / challenge / verify / unenroll)
+// ============================================================
 
 async function supabaseAuthRequest(pathname, { method = "GET", token, json } = {}) {
   const headers = {
@@ -1635,14 +1639,15 @@ function toPublicFactor(f) {
   return {
     id: f.id,
     friendlyName: f.friendly_name || f.friendlyName || null,
+    friendly_name: f.friendly_name || f.friendlyName || null,
     factorType: f.type || f.factor_type || "totp",
     status: f.status || "unverified",
     createdAt: f.created_at || f.createdAt || null,
+    created_at: f.created_at || f.createdAt || null,
   };
 }
 
 async function verifyMfaCode(factorId, code, token) {
-  // 1. Challenge
   const challenge = await supabaseAuthRequest(
     `/factors/${encodeURIComponent(factorId)}/challenge`,
     { method: "POST", token, json: {} }
@@ -1657,7 +1662,6 @@ async function verifyMfaCode(factorId, code, token) {
     );
   }
 
-  // 2. Verify
   const verify = await supabaseAuthRequest(
     `/factors/${encodeURIComponent(factorId)}/verify`,
     {
@@ -1673,6 +1677,13 @@ async function verifyMfaCode(factorId, code, token) {
       "Supabase did not return a session",
       "MFA_NO_SESSION"
     );
+  }
+
+  // Sanity : après verify, la session doit être AAL2. On log sans throw
+  // pour ne pas bloquer si Supabase change de comportement.
+  const aal = getTokenAal(verify.access_token);
+  if (aal !== "aal2") {
+    console.warn(`[mfa] verify returned aal=${aal} instead of aal2`);
   }
 
   return verify;
@@ -1694,6 +1705,8 @@ function formatUser(user) {
   if (!user) return null;
 
   const metadata = user.user_metadata || {};
+  const hasPassword = userHasPassword(user);
+  const provider = userPrimaryProvider(user);
 
   const fullName = metadata.full_name || metadata.name || "";
   const [guessedFirst, ...guessedRest] = fullName.split(" ").filter(Boolean);
@@ -1719,6 +1732,8 @@ function formatUser(user) {
     created_at: user.created_at || null,
     subscription: user.app_metadata?.subscription || null,
     mfa_enabled: userHasVerifiedMfa(user),
+    hasPassword,
+    provider,
   };
 }
 
@@ -3702,21 +3717,9 @@ route("POST", "/api/auth/resend-verification", async ({ res, user }) => {
 }, { auth: true });
 
 // ============================================================
-// ROUTES — MFA (proxy complet : le frontend ne voit rien de Supabase)
+// ROUTES — MFA (proxy complet)
 // ============================================================
-//
-// ⚠️ Supabase Auth n'expose PAS de `GET /auth/v1/factors`.
-// Les routes GoTrue MFA sont uniquement :
-//   POST   /factors                    → enroll
-//   POST   /factors/{id}/challenge     → challenge
-//   POST   /factors/{id}/verify        → verify (renvoie une session AAL2)
-//   DELETE /factors/{id}               → unenroll
-//
-// La liste des facteurs est renvoyée par `GET /auth/v1/user` (déjà fait
-// par getAuthenticatedUser → supabase.auth.getUser). On lit donc
-// simplement `user.factors`, sans aucun appel supplémentaire.
 
-// ---- GET /api/auth/mfa/status ----
 route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
   const factors = verifiedFactorsOf(user);
   const aal = getTokenAal(token) || "aal1";
@@ -3733,10 +3736,6 @@ route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
   });
 }, { auth: true });
 
-// ---- GET /api/mfa/factors ----
-// Lit `user.factors` (déjà récupéré par getAuthenticatedUser) :
-// AUCUN appel réseau vers Supabase, contrairement à supabase-js qui
-// refait `GET /user` à chaque listFactors().
 route("GET", "/api/mfa/factors", ({ res, user }) => {
   const factors = (Array.isArray(user.factors) ? user.factors : [])
     .filter((f) => isTotp(f) && f.status === "verified")
@@ -3745,15 +3744,9 @@ route("GET", "/api/mfa/factors", ({ res, user }) => {
   sendJson(res, 200, { success: true, factors });
 }, { auth: true });
 
-// ---- POST /api/mfa/enroll ----
-// 1) Purge les facteurs TOTP unverified abandonnés (via user.factors)
-// 2) Enroll un nouveau facteur TOTP
-// 3) Invalide le cache auth → la liste sera à jour au prochain GET
 route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
   enforce(limiterAccount, `mfa-enroll:${user.id}`);
 
-  // Purge des facteurs TOTP unverified (setup abandonné).
-  // `GET /factors` n'existe pas → on lit `user.factors`.
   const stale = (Array.isArray(user.factors) ? user.factors : []).filter(
     (f) => isTotp(f) && f.status === "unverified"
   );
@@ -3780,15 +3773,26 @@ route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
 
   authCacheInvalidateUser(user.id);
 
+  // ── Vérifie que Supabase a bien renvoyé les credentials TOTP ──
+  const factorId = data?.id;
+  const qrCode = data?.totp?.qr_code;
+  const secret = data?.totp?.secret;
+
+  if (!factorId) {
+    throw new HttpError(502, "Supabase did not return a factor id", "MFA_ENROLL_NO_FACTOR");
+  }
+  if (!qrCode || !secret) {
+    throw new HttpError(502, "Supabase did not return TOTP credentials", "MFA_ENROLL_INCOMPLETE");
+  }
+
   sendJson(res, 200, {
     success: true,
-    factorId: data.id,
-    qrCode: data?.totp?.qr_code || "",
-    secret: data?.totp?.secret || "",
+    factorId,
+    qrCode,
+    secret,
   });
 }, { auth: true });
 
-// ---- POST /api/mfa/enroll/verify ----
 route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
   enforce(limiterAccount, `mfa-enroll-verify:${user.id}`);
 
@@ -3812,9 +3816,6 @@ route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
   });
 }, { auth: true });
 
-// ---- POST /api/mfa/verify ----
-// Vérifie un code TOTP (login ou élévation AAL2). Si factorId est omis,
-// on prend le premier facteur TOTP vérifié de `user.factors`.
 route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
   enforce(limiterAccount, `mfa-verify:${user.id}`);
 
@@ -3843,9 +3844,6 @@ route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
   });
 }, { auth: true });
 
-// ---- DELETE /api/mfa/factors?factorId=xxx ----
-// Supprime un facteur. Un facteur VÉRIFIÉ exige AAL2 (comme Supabase).
-// Un facteur unverified (setup abandonné) peut être supprimé sans AAL2.
 route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
   const factorId = url.searchParams.get("factorId");
 
@@ -3897,15 +3895,24 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user }) => {
 
   if (body.bio !== undefined) metadata.bio = limitedString(body.bio, 500);
 
+  // ── Avatar : gère explicitement null ET "" (effacement demandé par le frontend) ──
   if (body.avatarUrl !== undefined || body.avatar_url !== undefined) {
-    const avatarUrl = limitedString(body.avatarUrl ?? body.avatar_url ?? "", 1000);
-    const ownPrefix = `${SUPABASE_BASE_URL}/storage/v1/object/public/${AVATAR_BUCKET}/${user.id}/`;
+    const raw = body.avatarUrl ?? body.avatar_url;
 
-    if (avatarUrl && !avatarUrl.startsWith(ownPrefix)) {
-      throw new HttpError(400, "Invalid avatar URL");
+    if (raw === null || raw === "" || raw === undefined) {
+      // Effacement explicite : on stocke "" pour que resolveAvatar()
+      // ne retombe pas sur l'avatar OAuth (picture).
+      metadata.custom_avatar_url = "";
+    } else {
+      const avatarUrl = limitedString(raw, 1000);
+      const ownPrefix = `${SUPABASE_BASE_URL}/storage/v1/object/public/${AVATAR_BUCKET}/${user.id}/`;
+
+      if (!avatarUrl.startsWith(ownPrefix)) {
+        throw new HttpError(400, "Invalid avatar URL");
+      }
+
+      metadata.custom_avatar_url = avatarUrl;
     }
-
-    metadata.custom_avatar_url = avatarUrl;
   }
 
   const { data, error } = await adminUpdateUser(user.id, { user_metadata: metadata });
@@ -3914,31 +3921,60 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user }) => {
   sendJson(res, 200, { success: true, user: formatUser(data.user) });
 }, { auth: true });
 
+// ============================================================
+// /api/user/password — gestion OAuth-only + AAL2
+// ============================================================
+
 route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) => {
+  // 1. AAL2 requis si l'utilisateur a la 2FA activée
   requireAal2(user, token);
 
   const body = await getJsonBody(req);
-  const currentPassword = String(body.currentPassword ?? body.current_password ?? "");
+  const currentPassword = String(body.currentPassword ?? body.current_password ?? "").trim();
   const newPassword = String(body.newPassword ?? body.new_password ?? "");
 
-  if (!currentPassword || !newPassword) throw new HttpError(400, "Current and new password are required");
+  if (!newPassword) throw new HttpError(400, "New password is required");
   if (newPassword.length < 8) throw new HttpError(400, "New password must contain at least 8 characters");
   if (newPassword.length > 128) throw new HttpError(400, "New password must contain at most 128 characters");
   if (!user.email) throw new HttpError(400, "No email associated with this account");
 
-  enforce(limiterAccount, `password:${user.id}`);
+  // 2. Détecte si l'utilisateur a déjà un mot de passe
+  //    (identité provider === "email"). Sinon, il SET un premier mot de passe
+  //    sans devoir fournir currentPassword.
+  const hasPassword = userHasPassword(user);
 
-  const { error: verifyError } = await supabase.auth.signInWithPassword({
-    email: user.email,
-    password: currentPassword,
-  });
+  if (hasPassword) {
+    if (!currentPassword) {
+      throw new HttpError(400, "Current password is required", "CURRENT_PASSWORD_REQUIRED");
+    }
 
-  if (verifyError) throw new HttpError(401, "Current password is incorrect");
+    enforce(limiterAccount, `password:${user.id}`);
+
+    const { error: verifyError } = await supabase.auth.signInWithPassword({
+      email: user.email,
+      password: currentPassword,
+    });
+
+    if (verifyError) {
+      throw new HttpError(401, "Current password is incorrect", "INVALID_CURRENT_PASSWORD");
+    }
+  } else {
+    // OAuth-only : pas de currentPassword à vérifier.
+    enforce(limiterAccount, `password-set:${user.id}`);
+  }
 
   const { error } = await adminUpdateUser(user.id, { password: newPassword });
-  if (error) throw error;
+  if (error) {
+    if (error.code === "same_password" || error.code === "weak_password") {
+      throw new HttpError(400, error.message || "This password cannot be used.", error.code);
+    }
+    throw error;
+  }
 
-  sendJson(res, 200, { success: true, message: "Password updated successfully" });
+  sendJson(res, 200, {
+    success: true,
+    message: hasPassword ? "Password updated successfully" : "Password set successfully",
+  });
 }, { auth: true });
 
 route("POST", "/api/user/avatar", async ({ req, res, user }) => {
