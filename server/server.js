@@ -30,15 +30,18 @@
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
-//                    - le frontend n'embarque PLUS @supabase/supabase-js
+//                    - le frontend n'embarque PAS @supabase/supabase-js
 //                    - le backend proxifie /auth/v1/factors* de Supabase Auth
-//                      (enroll / challenge / verify / list / unenroll)
+//                      (enroll / challenge / verify / unenroll)
+//                    - ⚠️ Supabase Auth n'expose PAS `GET /auth/v1/factors` :
+//                      la liste des facteurs est lue dans `user.factors`
+//                      (déjà chargé par getAuthenticatedUser)
 //                    - après un verify, Supabase renvoie une session AAL2
 //                      que le backend transmet au frontend pour qu'il la
 //                      stocke (remplace la session AAL1)
-//                    - les opérations sensibles (PUT /api/user/password)
-//                      exigent AAL2 via requireAal2()
-//                    - PAS de clé VITE_* côté frontend, PAS de CORS Supabase
+//                    - les opérations sensibles (PUT /api/user/password,
+//                      suppression d'un facteur vérifié) exigent AAL2 via
+//                      requireAal2()
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -1534,8 +1537,18 @@ function isRecoverySessionToken(token) {
 }
 
 // ============================================================
-// MFA — AAL & FACTEURS
+// MFA — AAL & FACTEURS (helpers)
 // ============================================================
+//
+// ⚠️ Supabase Auth n'expose PAS de `GET /auth/v1/factors`. La liste
+// des facteurs est renvoyée par `GET /auth/v1/user` (déjà appelé par
+// getAuthenticatedUser → supabase.auth.getUser). On lit donc
+// simplement `user.factors` partout.
+
+/** true si le facteur est TOTP (gère `type` ET `factor_type`). */
+function isTotp(f) {
+  return f?.factor_type === "totp" || f?.type === "totp";
+}
 
 function getTokenAal(token) {
   if (!token) return null;
@@ -1545,12 +1558,7 @@ function getTokenAal(token) {
 
 function userHasVerifiedMfa(user) {
   const factors = Array.isArray(user?.factors) ? user.factors : [];
-  return factors.some(
-    (f) =>
-      f?.status === "verified" &&
-      (f.factor_type === "totp" || f.factor_type === "webauthn" ||
-        f.type === "totp" || f.type === "webauthn")
-  );
+  return factors.some((f) => f?.status === "verified" && isTotp(f));
 }
 
 function verifiedFactorsOf(user) {
@@ -1570,7 +1578,7 @@ function requireAal2(user, token) {
 }
 
 // ============================================================
-// MFA — PROXY SUPABASE AUTH (enroll / challenge / verify / list / unenroll)
+// MFA — PROXY SUPABASE AUTH (enroll / challenge / verify / unenroll)
 // ============================================================
 //
 // Le frontend n'a AUCUNE clé Supabase : tout passe par ces routes.
@@ -1621,19 +1629,6 @@ async function supabaseAuthRequest(pathname, { method = "GET", token, json } = {
   }
 
   return data;
-}
-
-function normalizeFactorsResponse(data) {
-  if (Array.isArray(data)) {
-    return { all: data, totp: data.filter((f) => f.type === "totp") };
-  }
-
-  const all = Array.isArray(data?.all) ? data.all : [];
-  const totp = Array.isArray(data?.totp)
-    ? data.totp
-    : all.filter((f) => f.type === "totp");
-
-  return { all, totp };
 }
 
 function toPublicFactor(f) {
@@ -3710,10 +3705,16 @@ route("POST", "/api/auth/resend-verification", async ({ res, user }) => {
 // ROUTES — MFA (proxy complet : le frontend ne voit rien de Supabase)
 // ============================================================
 //
-// Toutes ces routes exigent une session utilisateur (Authorization).
-// Le backend utilise SUPABASE_ANON_KEY + le token utilisateur pour
-// parler à /auth/v1/factors*. Rien n'est stocké côté backend : le
-// frontend reçoit les nouvelles sessions AAL2 et les stocke lui-même.
+// ⚠️ Supabase Auth n'expose PAS de `GET /auth/v1/factors`.
+// Les routes GoTrue MFA sont uniquement :
+//   POST   /factors                    → enroll
+//   POST   /factors/{id}/challenge     → challenge
+//   POST   /factors/{id}/verify        → verify (renvoie une session AAL2)
+//   DELETE /factors/{id}               → unenroll
+//
+// La liste des facteurs est renvoyée par `GET /auth/v1/user` (déjà fait
+// par getAuthenticatedUser → supabase.auth.getUser). On lit donc
+// simplement `user.factors`, sans aucun appel supplémentaire.
 
 // ---- GET /api/auth/mfa/status ----
 route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
@@ -3733,39 +3734,39 @@ route("GET", "/api/auth/mfa/status", ({ res, user, token }) => {
 }, { auth: true });
 
 // ---- GET /api/mfa/factors ----
-route("GET", "/api/mfa/factors", async ({ res, token }) => {
-  const data = await supabaseAuthRequest("/factors", { token });
-  const { totp } = normalizeFactorsResponse(data);
+// Lit `user.factors` (déjà récupéré par getAuthenticatedUser) :
+// AUCUN appel réseau vers Supabase, contrairement à supabase-js qui
+// refait `GET /user` à chaque listFactors().
+route("GET", "/api/mfa/factors", ({ res, user }) => {
+  const factors = (Array.isArray(user.factors) ? user.factors : [])
+    .filter((f) => isTotp(f) && f.status === "verified")
+    .map(toPublicFactor);
 
-  sendJson(res, 200, {
-    success: true,
-    factors: totp.filter((f) => f.status === "verified").map(toPublicFactor),
-  });
+  sendJson(res, 200, { success: true, factors });
 }, { auth: true });
 
 // ---- POST /api/mfa/enroll ----
-// Crée un facteur TOTP (purge d'abord les unverified abandonnés).
+// 1) Purge les facteurs TOTP unverified abandonnés (via user.factors)
+// 2) Enroll un nouveau facteur TOTP
+// 3) Invalide le cache auth → la liste sera à jour au prochain GET
 route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
   enforce(limiterAccount, `mfa-enroll:${user.id}`);
 
-  // Purge des facteurs unverified
-  try {
-    const list = await supabaseAuthRequest("/factors", { token });
-    const { all } = normalizeFactorsResponse(list);
-    const stale = all.filter((f) => (f.type === "totp") && f.status === "unverified");
+  // Purge des facteurs TOTP unverified (setup abandonné).
+  // `GET /factors` n'existe pas → on lit `user.factors`.
+  const stale = (Array.isArray(user.factors) ? user.factors : []).filter(
+    (f) => isTotp(f) && f.status === "unverified"
+  );
 
-    for (const f of stale) {
-      try {
-        await supabaseAuthRequest(`/factors/${encodeURIComponent(f.id)}`, {
-          method: "DELETE",
-          token,
-        });
-      } catch (e) {
-        console.warn("[mfa] purge stale factor failed:", e.message);
-      }
+  for (const f of stale) {
+    try {
+      await supabaseAuthRequest(`/factors/${encodeURIComponent(f.id)}`, {
+        method: "DELETE",
+        token,
+      });
+    } catch (e) {
+      console.warn("[mfa] purge stale factor failed:", e.message);
     }
-  } catch (e) {
-    console.warn("[mfa] list factors before enroll failed:", e.message);
   }
 
   const data = await supabaseAuthRequest("/factors", {
@@ -3777,6 +3778,8 @@ route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
     },
   });
 
+  authCacheInvalidateUser(user.id);
+
   sendJson(res, 200, {
     success: true,
     factorId: data.id,
@@ -3786,7 +3789,6 @@ route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
 }, { auth: true });
 
 // ---- POST /api/mfa/enroll/verify ----
-// Challenge + verify du facteur tout juste créé. Renvoie la session AAL2.
 route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
   enforce(limiterAccount, `mfa-enroll-verify:${user.id}`);
 
@@ -3799,6 +3801,8 @@ route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
 
   const session = await verifyMfaCode(factorId, code, token);
 
+  authCacheInvalidateUser(user.id);
+
   sendJson(res, 200, {
     success: true,
     session: {
@@ -3810,7 +3814,7 @@ route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
 
 // ---- POST /api/mfa/verify ----
 // Vérifie un code TOTP (login ou élévation AAL2). Si factorId est omis,
-// on prend le premier facteur TOTP vérifié. Renvoie la session AAL2.
+// on prend le premier facteur TOTP vérifié de `user.factors`.
 route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
   enforce(limiterAccount, `mfa-verify:${user.id}`);
 
@@ -3821,12 +3825,10 @@ route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
   if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, "Invalid code", "INVALID_CODE");
 
   if (!factorId) {
-    const list = await supabaseAuthRequest("/factors", { token });
-    const { totp } = normalizeFactorsResponse(list);
-    const first = totp.find((f) => f.status === "verified");
-
+    const first = (Array.isArray(user.factors) ? user.factors : []).find(
+      (f) => isTotp(f) && f.status === "verified"
+    );
     if (!first) throw new HttpError(400, "No authenticator found", "NO_MFA_FACTOR");
-
     factorId = first.id;
   }
 
@@ -3842,17 +3844,16 @@ route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
 }, { auth: true });
 
 // ---- DELETE /api/mfa/factors?factorId=xxx ----
-// Supprime un facteur. Un facteur vérifié exige AAL2 (comme Supabase).
+// Supprime un facteur. Un facteur VÉRIFIÉ exige AAL2 (comme Supabase).
 // Un facteur unverified (setup abandonné) peut être supprimé sans AAL2.
 route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
   const factorId = url.searchParams.get("factorId");
 
   if (!factorId || factorId.length > 128) throw new HttpError(400, "Missing factorId");
 
-  const list = await supabaseAuthRequest("/factors", { token });
-  const { all } = normalizeFactorsResponse(list);
-  const factor = all.find((f) => f.id === factorId);
-
+  const factor = (Array.isArray(user.factors) ? user.factors : []).find(
+    (f) => f.id === factorId
+  );
   if (!factor) throw new HttpError(404, "Factor not found", "FACTOR_NOT_FOUND");
 
   if (factor.status === "verified") {
@@ -3863,6 +3864,8 @@ route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
     method: "DELETE",
     token,
   });
+
+  authCacheInvalidateUser(user.id);
 
   sendJson(res, 200, { success: true });
 }, { auth: true });
@@ -4134,7 +4137,7 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
 });
 
 // ============================================================
-// ROUTES — TIKTOK / PINTEREST / YOUTUBE / CANVA
+// ROUTES — TIKTOK
 // ============================================================
 
 route("POST", "/api/tiktok/auth/url", ({ res, user }) => {
