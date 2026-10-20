@@ -1,19 +1,15 @@
 {
   "name": "stone-server",
-  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "index.mjs",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.mjs"
-  },
-  "engines": {
-    "node": ">=22"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.0.0",
+    "@supabase/supabase-js": "^2.45.0",
     "busboy": "^1.6.0",
-    "stripe": "^18.0.0",
-    "ws": "^8.18.0"
+    "stripe": "^16.0.0"
   }
 }
