@@ -7,9 +7,9 @@
 //   Production   : NODE_ENV=production, APP_URL, OAUTH_REDIRECT_URL,
 //                  OAUTH_STATE_SECRET (32+ caractères aléatoires)
 //   Recommandé   : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
-//                  chiffre les tokens TikTok / Pinterest / YouTube / Canva en
-//                  base (AES-256-GCM). Les anciens tokens en clair restent
-//                  lisibles.
+//                  chiffre les tokens TikTok / Pinterest / YouTube / Canva /
+//                  Dropbox en base (AES-256-GCM). Les anciens tokens en
+//                  clair restent lisibles.
 //   Mot de passe oublié :
 //                  PASSWORD_RESET_REDIRECT_URL (optionnel, défaut :
 //                  ${APP_URL}/#/reset-password).
@@ -19,6 +19,7 @@
 //   Pinterest    : PINTEREST_APP_ID, PINTEREST_APP_SECRET.
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
+//   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
 //                    - RECOVERY_CODE_PEPPER (32+ caractères aléatoires)
@@ -603,6 +604,31 @@ const CANVA_AUTH_URL = "https://www.canva.com/api/oauth/authorize";
 const canvaEnabled = Boolean(CANVA_CLIENT_ID && CANVA_CLIENT_SECRET);
 
 // ============================================================
+// CONFIGURATION DROPBOX
+// ============================================================
+
+const DROPBOX_APP_KEY = env("DROPBOX_APP_KEY");
+const DROPBOX_APP_SECRET = env("DROPBOX_APP_SECRET");
+const DROPBOX_REDIRECT_URI =
+  env("DROPBOX_REDIRECT_URI") || `${APP_URL}/dropbox/callback`;
+
+const DROPBOX_SCOPES = (
+  env("DROPBOX_SCOPES") ||
+  "account_info.read files.metadata.read files.content.read files.content.write"
+)
+  .split(/[\s,]+/)
+  .filter(Boolean)
+  .join(" ");
+
+const DROPBOX_AUTH_URL = "https://www.dropbox.com/oauth2/authorize";
+const DROPBOX_TOKEN_URL = "https://api.dropboxapi.com/oauth2/token";
+const DROPBOX_API = "https://api.dropboxapi.com/2";
+const DROPBOX_CONTENT_API = "https://content.dropboxapi.com/2";
+const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024; // upload simple Dropbox : 150 Mo max
+
+const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
+
+// ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
 
@@ -611,7 +637,8 @@ let OAUTH_STATE_SECRET =
   TIKTOK_CLIENT_SECRET ||
   PINTEREST_APP_SECRET ||
   YOUTUBE_CLIENT_SECRET ||
-  CANVA_CLIENT_SECRET;
+  CANVA_CLIENT_SECRET ||
+  DROPBOX_APP_SECRET;
 
 if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
   OAUTH_STATE_SECRET = crypto.randomBytes(32).toString("hex");
@@ -981,6 +1008,7 @@ const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "
 const limiterTiktokWebhook = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "tiktok-webhook" });
 
 const limiterCanva = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 40, label: "canva" });
+const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "dropbox" });
 
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
@@ -1004,7 +1032,7 @@ const STRICT_PATHS = new Set([
   "/api/auth/reset-password",
 ]);
 
-const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva)\/auth\//;
+const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox)\/auth\//;
 
 function pickLimiter(pathname) {
   if (STRICT_PATHS.has(pathname)) return limiterStrict;
@@ -3883,6 +3911,193 @@ async function getValidCanvaToken(userId) {
 }
 
 // ============================================================
+// DROPBOX
+// ============================================================
+
+const DROPBOX_FRIENDLY_ERRORS = {
+  insufficient_space: "Your Dropbox is full.",
+  "path/not_found": "File or folder not found in Dropbox.",
+  "path/conflict": "A file already exists at this path.",
+  "path/malformed_path": "Invalid Dropbox path.",
+  missing_scope: "Dropbox permission missing, please reconnect your Dropbox account.",
+};
+
+// Les en-têtes HTTP doivent être ASCII : on échappe le JSON non-ASCII.
+const dropboxArgHeader = (obj) =>
+  JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) =>
+    "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")
+  );
+
+function dropboxApiError(response, data) {
+  const summary = String(data?.error_summary || "");
+  const tag = data?.error?.[".tag"];
+
+  if (response.status === 401) {
+    return reconnectError("Dropbox", "DROPBOX_REFRESH_EXPIRED");
+  }
+  if (tag === "missing_scope") {
+    return new HttpError(409, DROPBOX_FRIENDLY_ERRORS.missing_scope, "DROPBOX_SCOPE_MISSING");
+  }
+
+  const key = Object.keys(DROPBOX_FRIENDLY_ERRORS).find((k) => summary.startsWith(k) || summary.includes(k));
+
+  const error = new HttpError(
+    response.status === 429 ? 429 : response.status >= 500 ? 502 : 400,
+    (key && DROPBOX_FRIENDLY_ERRORS[key]) || summary || `Dropbox error (HTTP ${response.status})`,
+    key || "DROPBOX_ERROR"
+  );
+  error.upstreamStatus = response.status;
+  return error;
+}
+
+// RPC : POST JSON (ou sans body) sur api.dropboxapi.com
+async function dropboxRpc(pathname, { token, json } = {}) {
+  const headers = { Authorization: `Bearer ${token}` };
+  let body;
+
+  if (json) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(json);
+  }
+
+  let result;
+  try {
+    result = await fetchJson(`${DROPBOX_API}${pathname}`, { method: "POST", headers, body }, 20_000);
+  } catch (error) {
+    throw upstreamError("Dropbox", error);
+  }
+
+  if (!result.response.ok) throw dropboxApiError(result.response, result.data);
+  return result.data;
+}
+
+// Token endpoint OAuth (code → tokens, refresh)
+async function dropboxToken(form) {
+  let result;
+  try {
+    result = await fetchJson(
+      DROPBOX_TOKEN_URL,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: DROPBOX_APP_KEY,
+          client_secret: DROPBOX_APP_SECRET,
+          ...form,
+        }).toString(),
+      },
+      20_000
+    );
+  } catch (error) {
+    throw upstreamError("Dropbox", error);
+  }
+
+  const { response, data } = result;
+
+  if (!response.ok) {
+    const error = new HttpError(
+      upstreamStatus(response.status),
+      data.error_description || (typeof data.error === "string" ? data.error : "") || `Dropbox error (HTTP ${response.status})`,
+      typeof data.error === "string" ? data.error : undefined
+    );
+    error.upstreamStatus = response.status;
+    throw error;
+  }
+
+  return data;
+}
+
+function buildDropboxTokenRow(t) {
+  const accessTtl = Number(t.expires_in) || 4 * 60 * 60;
+
+  const row = {
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: iso(Date.now() + accessTtl * 1000),
+    updated_at: new Date().toISOString(),
+  };
+
+  // Dropbox ne renvoie le refresh_token qu'à la 1re autorisation (et il n'expire pas).
+  if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
+  if (t.scope) row.scope = t.scope;
+  if (t.account_id) row.account_id = t.account_id;
+
+  return row;
+}
+
+async function saveDropboxTokens(userId, t, extra = {}) {
+  const { error } = await supabaseAdmin
+    .from("dropbox_accounts")
+    .upsert({ user_id: userId, ...buildDropboxTokenRow(t), ...extra }, { onConflict: "user_id" });
+
+  if (error) throw dbError("dropbox_accounts upsert", error);
+}
+
+const getDropboxAccount = (userId) => selectTokenRow("dropbox_accounts", userId);
+
+async function getValidDropboxToken(userId) {
+  const load = async () => {
+    const account = await getDropboxAccount(userId);
+    if (!account) throw new HttpError(400, "Dropbox account not connected", "DROPBOX_NOT_CONNECTED");
+    return account;
+  };
+
+  const first = await load();
+  if (isTokenFresh(first)) return first.access_token;
+
+  return withLock(`dropbox-refresh:${userId}`, async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const account = await load();
+
+      if (isTokenFresh(account)) return account.access_token;
+      if (!account.refresh_token) throw reconnectError("Dropbox", "DROPBOX_REFRESH_EXPIRED");
+
+      let refreshed;
+
+      try {
+        refreshed = await dropboxToken({
+          grant_type: "refresh_token",
+          refresh_token: account.refresh_token,
+        });
+      } catch (error) {
+        if (
+          error instanceof HttpError &&
+          (error.code === "invalid_grant" || error.upstreamStatus === 400 || error.upstreamStatus === 401)
+        ) {
+          throw reconnectError("Dropbox", "DROPBOX_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(502, "Dropbox returned an invalid token response", "DROPBOX_BAD_TOKEN_RESPONSE");
+      }
+
+      const applied = await updateTokensIfUnchanged(
+        "dropbox_accounts",
+        userId,
+        account,
+        buildDropboxTokenRow(refreshed)
+      );
+
+      if (applied) return refreshed.access_token;
+    }
+
+    throw new HttpError(409, "Dropbox account changed during token refresh, please retry", "DROPBOX_REFRESH_CONFLICT");
+  });
+}
+
+// Chemin Dropbox : "" (racine) ou "/dossier/fichier". Pas de "..".
+function parseDropboxPath(value, { allowRoot = false } = {}) {
+  const path = String(value ?? "").trim();
+
+  if (allowRoot && (path === "" || path === "/")) return "";
+  if (!path.startsWith("/") || path.length > 1000 || path.includes("..") || /[\u0000-\u001f]/.test(path)) {
+    throw new HttpError(400, "Invalid Dropbox path", "INVALID_DROPBOX_PATH");
+  }
+  return path;
+}
+
+// ============================================================
 // ROUTEUR
 // ============================================================
 
@@ -3908,6 +4123,7 @@ route("GET", "/api/health", ({ res }) => {
     pinterest: pinterestUsable,
     youtube: youtubeEnabled,
     canva: canvaEnabled,
+    dropbox: dropboxEnabled,
   });
 });
 
@@ -5952,6 +6168,202 @@ route("POST", "/api/canva/export", async ({ req, res, user }) => {
 }, { auth: true });
 
 // ============================================================
+// DROPBOX ROUTES
+// ============================================================
+
+route("POST", "/api/dropbox/auth/url", ({ res, user }) => {
+  const params = new URLSearchParams({
+    client_id: DROPBOX_APP_KEY,
+    redirect_uri: DROPBOX_REDIRECT_URI,
+    response_type: "code",
+    token_access_type: "offline", // → refresh_token
+    scope: DROPBOX_SCOPES,
+    state: createOAuthState("dropbox", user.id),
+  });
+
+  sendJson(res, 200, { success: true, url: `${DROPBOX_AUTH_URL}?${params.toString()}` });
+}, { auth: true });
+
+route("POST", "/api/dropbox/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("dropbox", body, user.id);
+
+  const account = await dedupeCallback(`dropbox:${user.id}:${sha256(authCode)}`, async () => {
+    const tokens = await dropboxToken({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: DROPBOX_REDIRECT_URI,
+    });
+
+    if (!tokens?.access_token) {
+      throw new HttpError(502, "Dropbox returned an invalid token response", "DROPBOX_BAD_TOKEN_RESPONSE");
+    }
+
+    let profile = {};
+
+    try {
+      profile = await dropboxRpc("/users/get_current_account", { token: tokens.access_token });
+    } catch (profileError) {
+      console.warn("Dropbox profile error:", profileError.message);
+    }
+
+    const extra = {
+      display_name: profile.name?.display_name || null,
+      email: profile.email || null,
+      avatar_url: profile.profile_photo_url || null,
+    };
+
+    await saveDropboxTokens(user.id, tokens, extra);
+
+    return { display_name: extra.display_name, email: extra.email, avatar_url: extra.avatar_url };
+  });
+
+  sendJson(res, 200, { success: true, connected: true, account });
+}, { auth: true });
+
+route("GET", "/api/dropbox/status", async ({ res, user }) => {
+  const account = await getDropboxAccount(user.id);
+
+  sendJson(res, 200, {
+    success: true,
+    connected: Boolean(account),
+    account: account
+      ? {
+          display_name: account.display_name,
+          email: account.email,
+          avatar_url: account.avatar_url,
+          scope: account.scope,
+        }
+      : null,
+  });
+}, { auth: true });
+
+route("DELETE", "/api/dropbox/disconnect", async ({ res, user }) => {
+  const account = await getDropboxAccount(user.id);
+
+  if (account) {
+    if (account.access_token) {
+      try {
+        await dropboxRpc("/auth/token/revoke", { token: account.access_token });
+      } catch (revokeError) {
+        console.warn("Dropbox revoke error:", revokeError.message);
+      }
+    }
+
+    const { error } = await supabaseAdmin.from("dropbox_accounts").delete().eq("user_id", user.id);
+    if (error) throw error;
+  }
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// Lister un dossier
+route("GET", "/api/dropbox/files", async ({ res, url, user }) => {
+  enforce(limiterDropbox, `dropbox:${user.id}`);
+
+  const path = parseDropboxPath(url.searchParams.get("path"), { allowRoot: true });
+  const cursor = url.searchParams.get("cursor");
+  const token = await getValidDropboxToken(user.id);
+
+  const data = cursor
+    ? await dropboxRpc("/files/list_folder/continue", { token, json: { cursor: String(cursor).slice(0, 2048) } })
+    : await dropboxRpc("/files/list_folder", { token, json: { path, limit: 100, include_deleted: false } });
+
+  sendJson(res, 200, {
+    success: true,
+    entries: (data.entries || []).map((e) => ({
+      type: e[".tag"],
+      id: e.id,
+      name: e.name,
+      path: e.path_display,
+      size: e.size ?? null,
+      modified: e.server_modified ?? null,
+    })),
+    cursor: data.cursor,
+    has_more: Boolean(data.has_more),
+  });
+}, { auth: true });
+
+// Lien de téléchargement temporaire (valable ~4 h)
+route("GET", "/api/dropbox/temporary-link", async ({ res, url, user }) => {
+  enforce(limiterDropbox, `dropbox:${user.id}`);
+
+  const path = parseDropboxPath(url.searchParams.get("path"));
+  const token = await getValidDropboxToken(user.id);
+  const data = await dropboxRpc("/files/get_temporary_link", { token, json: { path } });
+
+  sendJson(res, 200, { success: true, link: data.link, name: data.metadata?.name });
+}, { auth: true });
+
+// Envoyer un fichier vers Dropbox (multipart : champ "file", champ "path" = dossier de destination)
+route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
+  enforce(limiterPublish, `dropbox:${user.id}`);
+
+  const declared = Number(req.headers["content-length"] || 0);
+  if (declared > MAX_DROPBOX_UPLOAD + 1024 * 1024) {
+    throw tooLargeError(`File is too large. Maximum size is ${MAX_DROPBOX_UPLOAD / 1024 / 1024} MB.`);
+  }
+
+  const accessToken = await getValidDropboxToken(user.id);
+  await acquireVideoSlot();
+
+  try {
+    let upload;
+
+    try {
+      upload = await parseMultipart(req, { fileField: "file", maxSize: MAX_DROPBOX_UPLOAD });
+    } catch (error) {
+      if (error?.code === "FILE_TOO_LARGE") throw new HttpError(400, `File is too large. Maximum size is ${MAX_DROPBOX_UPLOAD / 1024 / 1024} MB.`);
+      if (error?.code === "NO_FILE") throw new HttpError(400, "No 'file' was provided.");
+      throw error instanceof HttpError ? error : new HttpError(400, "Could not read the uploaded file.");
+    }
+
+    const folder = parseDropboxPath(upload.fields.path, { allowRoot: true });
+    const safeName = (upload.fileName || "file").replace(/[\\/\u0000-\u001f]/g, "_").slice(0, 200) || "file";
+    const destination = `${folder}/${safeName}`;
+
+    let result;
+
+    try {
+      result = await fetchJson(
+        `${DROPBOX_CONTENT_API}/files/upload`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/octet-stream",
+            "Dropbox-API-Arg": dropboxArgHeader({
+              path: destination,
+              mode: "add",
+              autorename: true,
+              mute: true,
+            }),
+          },
+          body: upload.buffer,
+        },
+        120_000
+      );
+    } catch (error) {
+      throw upstreamError("Dropbox", error);
+    }
+
+    if (!result.response.ok) throw dropboxApiError(result.response, result.data);
+
+    sendJson(res, 200, {
+      success: true,
+      file: {
+        id: result.data.id,
+        name: result.data.name,
+        path: result.data.path_display,
+        size: result.data.size,
+      },
+    });
+  } finally {
+    releaseVideoSlot();
+  }
+}, { auth: true });
+
+// ============================================================
 // SERVER
 // ============================================================
 
@@ -5960,6 +6372,7 @@ const providerGuards = [
   ["/api/pinterest/", pinterestEnabled, "Pinterest"],
   ["/api/youtube/", youtubeEnabled, "YouTube"],
   ["/api/canva/", canvaEnabled, "Canva"],
+  ["/api/dropbox/", dropboxEnabled, "Dropbox"],
 ];
 
 const server = createServer(async (req, res) => {
@@ -6104,6 +6517,7 @@ server.listen(PORT, () => {
   console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
   console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
+  console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
 });
 
