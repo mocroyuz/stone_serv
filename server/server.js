@@ -4343,9 +4343,15 @@ route("POST", "/api/mfa/recovery-codes/verify", async ({ req, res, user, token }
   });
 }, { auth: true });
 
-route("POST", "/api/mfa/passkeys/register/options", async ({ res, user, token }) => {
+route("POST", "/api/mfa/passkeys/register/options", async ({ req, res, user, token }) => {
   requireTotpForPasskey(user);
   await requireAal2(user, token);
+
+  const body = await getJsonBody(req).catch(() => ({}));
+  const attachment =
+    body.attachment === "platform" || body.attachment === "cross-platform"
+      ? body.attachment
+      : undefined;
 
   const sessionId = getTokenSessionId(token);
   if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
@@ -4374,6 +4380,7 @@ route("POST", "/api/mfa/passkeys/register/options", async ({ res, user, token })
     authenticatorSelection: {
       residentKey: "required",
       userVerification: "required",
+      ...(attachment ? { authenticatorAttachment: attachment } : {}),
     },
   });
 
