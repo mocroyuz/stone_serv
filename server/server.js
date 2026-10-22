@@ -15,6 +15,7 @@
 //                  ${APP_URL}/#/reset-password).
 //   Photos TikTok: URL publique de CE serveur :
 //                  PUBLIC_API_URL → VITE_API_BASE_URL → RAILWAY_PUBLIC_DOMAIN
+//                  → RENDER_EXTERNAL_URL
 //   TikTok       : TIKTOK_AUDITED=1 une fois l'app auditée par TikTok.
 //   Pinterest    : PINTEREST_APP_ID, PINTEREST_APP_SECRET.
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
@@ -250,11 +251,6 @@ function dbError(context, error) {
 // ============================================================
 // DÉTECTION DES OBJETS POSTGRES ABSENTS (migration manquante)
 // ============================================================
-//
-// Utilisé pour basculer sur des fallbacks mémoire quand la base n'a pas
-// encore reçu les tables / fonctions de la migration MFA & rate limiting.
-// Ce n'est PAS un contournement permanent : la migration SQL doit être
-// appliquée pour que les endpoints recovery-codes / passkeys fonctionnent.
 
 function isSchemaCacheMissingError(error) {
   const msg = String(error?.message || "");
@@ -267,8 +263,17 @@ function isSchemaCacheMissingError(error) {
 // ============================================================
 // CONFIGURATION
 // ============================================================
+//
+// PORT :
+//  - Sur Render (et la plupart des PaaS), le port d'écoute est injecté
+//    via $PORT (Render utilise 10000 par défaut). En production, on ne
+//    retombe JAMAIS sur 3002, sinon le scanner de ports de Render ne
+//    trouve aucun service à l'écoute → "Port scan timeout".
+//  - En dev, on garde 3002 pour la parité avec l'historique local.
 
-const PORT = Number(env("PORT") || 3002);
+const PORT = Number(
+  env("PORT") || (IS_PRODUCTION ? 10000 : 3002)
+);
 
 const SUPABASE_URL = env("SUPABASE_URL");
 const SUPABASE_ANON_KEY = env("SUPABASE_ANON_KEY");
@@ -442,6 +447,8 @@ function resolvePublicApiUrl() {
         ? `https://${env("RAILWAY_PUBLIC_DOMAIN")}`
         : undefined,
     ],
+    // Render expose l'URL publique via $RENDER_EXTERNAL_URL
+    ["RENDER_EXTERNAL_URL", env("RENDER_EXTERNAL_URL")],
   ];
 
   for (const [source, raw] of candidates) {
@@ -649,7 +656,7 @@ const DROPBOX_AUTH_URL = "https://www.dropbox.com/oauth2/authorize";
 const DROPBOX_TOKEN_URL = "https://api.dropboxapi.com/oauth2/token";
 const DROPBOX_API = "https://api.dropboxapi.com/2";
 const DROPBOX_CONTENT_API = "https://content.dropboxapi.com/2";
-const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024; // upload simple Dropbox : 150 Mo max
+const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024;
 
 const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
 
@@ -860,7 +867,6 @@ function authAttemptRateLimitError(retryAfter) {
 
 // ------------------------------------------------------------
 // Fallback mémoire : rate limiting des tentatives d'authentification
-// (utilisé uniquement si les RPC `auth_attempts_*` n'existent pas encore)
 // ------------------------------------------------------------
 
 const authAttemptsMemory = new Map();
@@ -1774,11 +1780,6 @@ function isRecoverySessionToken(token) {
 // ============================================================
 // MFA — AAL & FACTEURS (helpers)
 // ============================================================
-//
-// ⚠️ Supabase Auth n'expose PAS de `GET /auth/v1/factors`. La liste
-// des facteurs est renvoyée par `GET /auth/v1/user` (déjà appelé par
-// getAuthenticatedUser → supabase.auth.getUser). On lit donc
-// simplement `user.factors` partout.
 
 function isTotp(f) {
   return f?.factor_type === "totp" || f?.type === "totp";
@@ -2077,15 +2078,10 @@ async function getWebAuthnCredentials(userId) {
 // ============================================================
 // MFA — DETECTION PASSWORD VS OAUTH
 // ============================================================
-//
-// Un utilisateur "OAuth-only" n'a pas d'identité `provider: "email"`.
-// Il n'a donc pas de mot de passe et peut en SET un sans fournir
-// `currentPassword`. Un utilisateur avec identité "email" a un mot
-// de passe et doit fournir `currentPassword` pour le changer.
 
 function userHasPassword(user) {
   const identities = Array.isArray(user?.identities) ? user.identities : [];
-  if (identities.length === 0) return true; // fallback prudent
+  if (identities.length === 0) return true;
   return identities.some((i) => i?.provider === "email");
 }
 
@@ -2188,8 +2184,6 @@ async function verifyMfaCode(factorId, code, token) {
     );
   }
 
-  // Sanity : après verify, la session doit être AAL2. On log sans throw
-  // pour ne pas bloquer si Supabase change de comportement.
   const aal = getTokenAal(verify.access_token);
   if (aal !== "aal2") {
     console.warn(`[mfa] verify returned aal=${aal} instead of aal2`);
@@ -3791,7 +3785,6 @@ function buildGDriveTokenRow(t) {
     updated_at: new Date().toISOString(),
   };
 
-  // Google ne renvoie le refresh_token qu'à l'autorisation (il n'expire pas).
   if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
   if (t.scope) row.scope = t.scope;
 
@@ -4078,7 +4071,6 @@ const DROPBOX_FRIENDLY_ERRORS = {
   missing_scope: "Dropbox permission missing, please reconnect your Dropbox account.",
 };
 
-// Les en-têtes HTTP doivent être ASCII : on échappe le JSON non-ASCII.
 const dropboxArgHeader = (obj) =>
   JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) =>
     "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")
@@ -4106,7 +4098,6 @@ function dropboxApiError(response, data) {
   return error;
 }
 
-// RPC : POST JSON (ou sans body) sur api.dropboxapi.com
 async function dropboxRpc(pathname, { token, json } = {}) {
   const headers = { Authorization: `Bearer ${token}` };
   let body;
@@ -4127,7 +4118,6 @@ async function dropboxRpc(pathname, { token, json } = {}) {
   return result.data;
 }
 
-// Token endpoint OAuth (code → tokens, refresh)
 async function dropboxToken(form) {
   let result;
   try {
@@ -4172,7 +4162,6 @@ function buildDropboxTokenRow(t) {
     updated_at: new Date().toISOString(),
   };
 
-  // Dropbox ne renvoie le refresh_token qu'à la 1re autorisation (et il n'expire pas).
   if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
   if (t.scope) row.scope = t.scope;
   if (t.account_id) row.account_id = t.account_id;
@@ -4242,7 +4231,6 @@ async function getValidDropboxToken(userId) {
   });
 }
 
-// Chemin Dropbox : "" (racine) ou "/dossier/fichier". Pas de "..".
 function parseDropboxPath(value, { allowRoot = false } = {}) {
   const path = String(value ?? "").trim();
 
@@ -5009,7 +4997,6 @@ route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
 
   authCacheInvalidateUser(user.id);
 
-  // ── Vérifie que Supabase a bien renvoyé les credentials TOTP ──
   const factorId = data?.id;
   const qrCode = data?.totp?.qr_code;
   const secret = data?.totp?.secret;
@@ -5099,7 +5086,7 @@ route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
 
   const verifiedTotpCount = verifiedFactorsOf(user).filter(isTotp).length;
   if (factor.status === "verified") {
-    await requireAal2(user, token); // 403 MFA_REQUIRED si AAL1
+    await requireAal2(user, token);
   }
 
   await supabaseAuthRequest(`/factors/${encodeURIComponent(factorId)}`, {
@@ -5144,13 +5131,10 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user, token }) =
 
   if (body.bio !== undefined) metadata.bio = limitedString(body.bio, 500);
 
-  // ── Avatar : gère explicitement null ET "" (effacement demandé par le frontend) ──
   if (body.avatarUrl !== undefined || body.avatar_url !== undefined) {
     const raw = body.avatarUrl ?? body.avatar_url;
 
     if (raw === null || raw === "" || raw === undefined) {
-      // Effacement explicite : on stocke "" pour que resolveAvatar()
-      // ne retombe pas sur l'avatar OAuth (picture).
       metadata.custom_avatar_url = "";
     } else {
       const avatarUrl = limitedString(raw, 1000);
@@ -5175,7 +5159,6 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user, token }) =
 // ============================================================
 
 route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) => {
-  // 1. AAL2 requis si l'utilisateur a la 2FA activée
   await requireAal2(user, token);
 
   const body = await getJsonBody(req);
@@ -5187,9 +5170,6 @@ route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) =
   if (newPassword.length > 128) throw new HttpError(400, "New password must contain at most 128 characters");
   if (!user.email) throw new HttpError(400, "No email associated with this account");
 
-  // 2. Détecte si l'utilisateur a déjà un mot de passe
-  //    (identité provider === "email"). Sinon, il SET un premier mot de passe
-  //    sans devoir fournir currentPassword.
   const hasPassword = userHasPassword(user);
 
   if (hasPassword) {
@@ -5208,7 +5188,6 @@ route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) =
       throw new HttpError(401, "Current password is incorrect", "INVALID_CURRENT_PASSWORD");
     }
   } else {
-    // OAuth-only : pas de currentPassword à vérifier.
     enforce(limiterAccount, `password-set:${user.id}`);
   }
 
@@ -6245,7 +6224,6 @@ route("DELETE", "/api/googledrive/disconnect", async ({ res, user }) => {
   sendJson(res, 200, { success: true });
 }, { auth: true });
 
-// Lister un dossier (?folderId=root|<id>&pageToken=...)
 route("GET", "/api/googledrive/files", async ({ res, url, user }) => {
   enforce(limiterGDrive, `gdrive:${user.id}`);
 
@@ -6279,7 +6257,6 @@ route("GET", "/api/googledrive/files", async ({ res, url, user }) => {
   });
 }, { auth: true });
 
-// Envoyer un fichier (multipart : champ "file", champ "folder_id" optionnel)
 route("POST", "/api/googledrive/upload", async ({ req, res, user }) => {
   enforce(limiterPublish, `gdrive:${user.id}`);
 
@@ -6540,7 +6517,7 @@ route("POST", "/api/dropbox/auth/url", ({ res, user }) => {
     client_id: DROPBOX_APP_KEY,
     redirect_uri: DROPBOX_REDIRECT_URI,
     response_type: "code",
-    token_access_type: "offline", // → refresh_token
+    token_access_type: "offline",
     scope: DROPBOX_SCOPES,
     state: createOAuthState("dropbox", user.id),
   });
@@ -6584,15 +6561,6 @@ route("POST", "/api/dropbox/auth/callback", async ({ req, res, user }) => {
 
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
-
-// ────────────────────────────────────────────────────────────
-// Complétion / rafraîchissement du profil Dropbox à la volée
-// ────────────────────────────────────────────────────────────
-//
-// Un compte connecté avant l'ajout de avatar_url / email / display_name
-// dans la base n'a jamais ces colonnes renseignées : on les récupère
-// depuis Dropbox au premier /status, avec throttling pour éviter de
-// spammer l'API à chaque requête.
 
 const dropboxProfileCheckedAt = new Map();
 const DROPBOX_PROFILE_REFRESH_MS = 30 * 60 * 1000;
@@ -6661,8 +6629,6 @@ route("DELETE", "/api/dropbox/disconnect", async ({ res, user }) => {
   const account = await getDropboxAccount(user.id);
 
   if (account) {
-    // On révoque avec un token VALIDE (refresh automatique si expiré).
-    // Dropbox révoque aussi le refresh_token associé.
     try {
       const accessToken = await getValidDropboxToken(user.id);
       await dropboxRpc("/auth/token/revoke", { token: accessToken });
@@ -6682,7 +6648,6 @@ route("DELETE", "/api/dropbox/disconnect", async ({ res, user }) => {
   sendJson(res, 200, { success: true });
 }, { auth: true });
 
-// Lister un dossier
 route("GET", "/api/dropbox/files", async ({ res, url, user }) => {
   enforce(limiterDropbox, `dropbox:${user.id}`);
 
@@ -6709,7 +6674,6 @@ route("GET", "/api/dropbox/files", async ({ res, url, user }) => {
   });
 }, { auth: true });
 
-// Lien de téléchargement temporaire (valable ~4 h)
 route("GET", "/api/dropbox/temporary-link", async ({ res, url, user }) => {
   enforce(limiterDropbox, `dropbox:${user.id}`);
 
@@ -6720,7 +6684,6 @@ route("GET", "/api/dropbox/temporary-link", async ({ res, url, user }) => {
   sendJson(res, 200, { success: true, link: data.link, name: data.metadata?.name });
 }, { auth: true });
 
-// Envoyer un fichier vers Dropbox (multipart : champ "file", champ "path" = dossier de destination)
 route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
   enforce(limiterPublish, `dropbox:${user.id}`);
 
@@ -6930,7 +6893,16 @@ server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
 server.requestTimeout = 5 * 60_000;
 
-server.listen(PORT, () => {
+// ────────────────────────────────────────────────────────────
+// ÉCOUTE
+// ────────────────────────────────────────────────────────────
+//
+// Bind explicite sur 0.0.0.0 (IPv4, toutes interfaces) :
+//   - Render scanne les ports sur l'IPv4 de l'instance
+//   - Un bind IPv6-only (::) rend le service invisible au port scanner
+//   - "localhost" ne fonctionne pas non plus (n'écoute pas sur l'extérieur)
+
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Stone server running on port ${PORT}`);
   console.log(`  NODE_ENV        : ${env("NODE_ENV") || "(non défini)"}`);
   console.log(`  TRUST_PROXY     : ${TRUST_PROXY ? `1 (${TRUST_PROXY_HOPS} hop)` : "0"}`);
@@ -6939,7 +6911,7 @@ server.listen(PORT, () => {
   console.log(`  MFA policy      : AAL2 requis pour profil, avatar, mot de passe et gestion MFA`);
   console.log(`  Video uploads   : max ${MAX_VIDEO_UPLOADS} concurrent(s)`);
   console.log(`  TikTok mode     : ${TIKTOK_SANDBOX ? "SANDBOX" : "auditée"}${TIKTOK_FORCE_DRAFT ? " + FORCE_DRAFT" : ""}`);
-  console.log(`  TikTok photos   : ${PUBLIC_API_URL ? PUBLIC_API_URL : "désactivé"}`);
+  console.log(`  TikTok photos   : ${PUBLIC_API_URL ? PUBLIC_API_URL : "désactivé"}${PUBLIC_API_URL_SOURCE ? ` (via ${publicApiSourceLabel(PUBLIC_API_URL_SOURCE)})` : ""}`);
   console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
   console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
   console.log(`  Google Drive    : ${gdriveEnabled ? "activé" : "désactivé"}`);
