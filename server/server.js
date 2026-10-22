@@ -8,8 +8,8 @@
 //                  OAUTH_STATE_SECRET (32+ caractères aléatoires)
 //   Recommandé   : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
 //                  chiffre les tokens TikTok / Pinterest / YouTube / Canva /
-//                  Dropbox en base (AES-256-GCM). Les anciens tokens en
-//                  clair restent lisibles.
+//                  Dropbox / Google Drive en base (AES-256-GCM). Les anciens
+//                  tokens en clair restent lisibles.
 //   Mot de passe oublié :
 //                  PASSWORD_RESET_REDIRECT_URL (optionnel, défaut :
 //                  ${APP_URL}/#/reset-password).
@@ -18,6 +18,8 @@
 //   TikTok       : TIKTOK_AUDITED=1 une fois l'app auditée par TikTok.
 //   Pinterest    : PINTEREST_APP_ID, PINTEREST_APP_SECRET.
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
+//   Google Drive : GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET
+//                  (fallback sur les identifiants YouTube si absents).
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
@@ -586,6 +588,29 @@ const YOUTUBE_DESCRIPTION_MAX_BYTES = 5000;
 const YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload";
 
 // ============================================================
+// CONFIGURATION GOOGLE DRIVE
+// ============================================================
+
+const GDRIVE_CLIENT_ID = env("GOOGLE_DRIVE_CLIENT_ID") || YOUTUBE_CLIENT_ID;
+const GDRIVE_CLIENT_SECRET = env("GOOGLE_DRIVE_CLIENT_SECRET") || YOUTUBE_CLIENT_SECRET;
+const GDRIVE_REDIRECT_URI =
+  env("GOOGLE_DRIVE_REDIRECT_URI") || `${APP_URL}/googledrive/callback`;
+
+const GDRIVE_SCOPES = (
+  env("GOOGLE_DRIVE_SCOPES") ||
+  "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.readonly"
+)
+  .split(/[\s,]+/)
+  .filter(Boolean)
+  .join(" ");
+
+const GDRIVE_API = "https://www.googleapis.com/drive/v3";
+const GDRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files";
+const MAX_GDRIVE_UPLOAD = 100 * 1024 * 1024;
+
+const gdriveEnabled = Boolean(GDRIVE_CLIENT_ID && GDRIVE_CLIENT_SECRET);
+
+// ============================================================
 // CONFIGURATION CANVA
 // ============================================================
 
@@ -1009,6 +1034,7 @@ const limiterTiktokWebhook = createRateLimiter({ windowMs: 60 * 1000, max: 600, 
 
 const limiterCanva = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 40, label: "canva" });
 const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "dropbox" });
+const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "gdrive" });
 
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
@@ -1032,7 +1058,7 @@ const STRICT_PATHS = new Set([
   "/api/auth/reset-password",
 ]);
 
-const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox)\/auth\//;
+const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox|googledrive)\/auth\//;
 
 function pickLimiter(pathname) {
   if (STRICT_PATHS.has(pathname)) return limiterStrict;
@@ -3753,6 +3779,136 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 }
 
 // ============================================================
+// GOOGLE DRIVE
+// ============================================================
+
+function buildGDriveTokenRow(t) {
+  const accessTtl = Number(t.expires_in) || 3600;
+
+  const row = {
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: iso(Date.now() + accessTtl * 1000),
+    updated_at: new Date().toISOString(),
+  };
+
+  // Google ne renvoie le refresh_token qu'à l'autorisation (il n'expire pas).
+  if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
+  if (t.scope) row.scope = t.scope;
+
+  return row;
+}
+
+async function saveGDriveTokens(userId, t, extra = {}) {
+  const { error } = await supabaseAdmin
+    .from("google_drive_accounts")
+    .upsert({ user_id: userId, ...buildGDriveTokenRow(t), ...extra }, { onConflict: "user_id" });
+
+  if (error) throw dbError("google_drive_accounts upsert", error);
+}
+
+const getGDriveAccount = (userId) => selectTokenRow("google_drive_accounts", userId);
+
+async function getValidGDriveToken(userId) {
+  const load = async () => {
+    const account = await getGDriveAccount(userId);
+    if (!account) throw new HttpError(400, "Google Drive account not connected", "GDRIVE_NOT_CONNECTED");
+    return account;
+  };
+
+  const first = await load();
+  if (isTokenFresh(first)) return first.access_token;
+
+  return withLock(`gdrive-refresh:${userId}`, async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const account = await load();
+
+      if (isTokenFresh(account)) return account.access_token;
+      if (!account.refresh_token) throw reconnectError("Google Drive", "GDRIVE_REFRESH_EXPIRED");
+
+      let refreshed;
+
+      try {
+        refreshed = await googleRequest(GOOGLE_TOKEN_URL, {
+          method: "POST",
+          form: {
+            client_id: GDRIVE_CLIENT_ID,
+            client_secret: GDRIVE_CLIENT_SECRET,
+            grant_type: "refresh_token",
+            refresh_token: account.refresh_token,
+          },
+        });
+      } catch (error) {
+        if (error instanceof HttpError && error.code === "invalid_grant") {
+          throw reconnectError("Google Drive", "GDRIVE_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(502, "Google returned an invalid token response", "GDRIVE_BAD_TOKEN_RESPONSE");
+      }
+
+      const applied = await updateTokensIfUnchanged(
+        "google_drive_accounts",
+        userId,
+        account,
+        buildGDriveTokenRow(refreshed)
+      );
+
+      if (applied) return refreshed.access_token;
+    }
+
+    throw new HttpError(409, "Google Drive account changed during token refresh, please retry", "GDRIVE_REFRESH_CONFLICT");
+  });
+}
+
+async function gdriveRequest(requestUrl, { method = "GET", token, headers = {}, body, timeoutMs = 20_000 } = {}) {
+  let result;
+
+  try {
+    result = await fetchJson(
+      requestUrl,
+      { method, headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...headers }, body },
+      timeoutMs
+    );
+  } catch (error) {
+    throw upstreamError("Google Drive", error);
+  }
+
+  const { response, data } = result;
+
+  if (!response.ok) {
+    const reason = data?.error?.errors?.[0]?.reason || data?.error?.status;
+
+    if (response.status === 401) throw reconnectError("Google Drive", "GDRIVE_REFRESH_EXPIRED");
+    if (reason === "insufficientPermissions" || reason === "ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
+      throw new HttpError(409, "Google Drive permission missing, please reconnect your Google Drive account.", "GDRIVE_SCOPE_MISSING");
+    }
+    if (reason === "storageQuotaExceeded") throw new HttpError(400, "Your Google Drive is full.", reason);
+    if (reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+      throw new HttpError(429, "Google Drive rate limit reached. Please try again shortly.", reason);
+    }
+
+    throw new HttpError(
+      upstreamStatus(response.status),
+      data?.error?.message || `Google Drive error (HTTP ${response.status})`,
+      reason
+    );
+  }
+
+  return data;
+}
+
+const GDRIVE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+function parseGDriveFolderId(value) {
+  const id = String(value ?? "").trim();
+  if (!id || id === "root") return "root";
+  if (!GDRIVE_ID_PATTERN.test(id)) throw new HttpError(400, "Invalid Google Drive folder id", "INVALID_GDRIVE_ID");
+  return id;
+}
+
+// ============================================================
 // CANVA
 // ============================================================
 
@@ -4122,6 +4278,7 @@ route("GET", "/api/health", ({ res }) => {
     tiktok: tiktokEnabled ? { enabled: true, ...tiktokCapabilities() } : { enabled: false },
     pinterest: pinterestUsable,
     youtube: youtubeEnabled,
+    googledrive: gdriveEnabled,
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
   });
@@ -5981,6 +6138,213 @@ route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
 }, { auth: true });
 
 // ============================================================
+// GOOGLE DRIVE ROUTES
+// ============================================================
+
+route("POST", "/api/googledrive/auth/url", ({ res, user }) => {
+  const params = new URLSearchParams({
+    client_id: GDRIVE_CLIENT_ID,
+    redirect_uri: GDRIVE_REDIRECT_URI,
+    response_type: "code",
+    scope: GDRIVE_SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+    include_granted_scopes: "true",
+    state: createOAuthState("googledrive", user.id),
+  });
+
+  sendJson(res, 200, { success: true, url: `${GOOGLE_AUTH_URL}?${params.toString()}` });
+}, { auth: true });
+
+route("POST", "/api/googledrive/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("googledrive", body, user.id);
+
+  const account = await dedupeCallback(`googledrive:${user.id}:${sha256(authCode)}`, async () => {
+    const tokens = await googleRequest(GOOGLE_TOKEN_URL, {
+      method: "POST",
+      form: {
+        client_id: GDRIVE_CLIENT_ID,
+        client_secret: GDRIVE_CLIENT_SECRET,
+        code: authCode,
+        grant_type: "authorization_code",
+        redirect_uri: GDRIVE_REDIRECT_URI,
+      },
+    });
+
+    if (!tokens?.access_token) {
+      throw new HttpError(502, "Google returned an invalid token response", "GDRIVE_BAD_TOKEN_RESPONSE");
+    }
+
+    const grantedScopes = String(tokens.scope || "").split(/[\s,]+/);
+    if (!grantedScopes.some((s) => s.startsWith("https://www.googleapis.com/auth/drive"))) {
+      throw new HttpError(400, "Google Drive access was not granted. Please accept the Drive permission.", "GDRIVE_SCOPE_MISSING");
+    }
+
+    let profile = {};
+
+    try {
+      const about = await gdriveRequest(
+        `${GDRIVE_API}/about?fields=user(displayName,emailAddress,photoLink)`,
+        { token: tokens.access_token }
+      );
+      profile = about.user || {};
+    } catch (profileError) {
+      console.warn("Google Drive profile error:", profileError.message);
+    }
+
+    const extra = {
+      display_name: profile.displayName || null,
+      email: profile.emailAddress || null,
+      avatar_url: profile.photoLink || null,
+    };
+
+    await saveGDriveTokens(user.id, tokens, extra);
+
+    return { display_name: extra.display_name, email: extra.email, avatar_url: extra.avatar_url };
+  });
+
+  sendJson(res, 200, { success: true, connected: true, account });
+}, { auth: true });
+
+route("GET", "/api/googledrive/status", async ({ res, user }) => {
+  const account = await getGDriveAccount(user.id);
+
+  sendJson(res, 200, {
+    success: true,
+    connected: Boolean(account),
+    account: account
+      ? {
+          display_name: account.display_name,
+          email: account.email,
+          avatar_url: account.avatar_url,
+          scope: account.scope,
+        }
+      : null,
+  });
+}, { auth: true });
+
+route("DELETE", "/api/googledrive/disconnect", async ({ res, user }) => {
+  const account = await getGDriveAccount(user.id);
+
+  if (account) {
+    const tokenToRevoke = account.refresh_token || account.access_token;
+
+    if (tokenToRevoke) {
+      try {
+        await googleRequest(GOOGLE_REVOKE_URL, { method: "POST", form: { token: tokenToRevoke } });
+      } catch (revokeError) {
+        console.warn("Google Drive revoke error:", revokeError.message);
+      }
+    }
+
+    const { error } = await supabaseAdmin.from("google_drive_accounts").delete().eq("user_id", user.id);
+    if (error) throw error;
+  }
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// Lister un dossier (?folderId=root|<id>&pageToken=...)
+route("GET", "/api/googledrive/files", async ({ res, url, user }) => {
+  enforce(limiterGDrive, `gdrive:${user.id}`);
+
+  const folderId = parseGDriveFolderId(url.searchParams.get("folderId"));
+  const pageToken = url.searchParams.get("pageToken");
+  const token = await getValidGDriveToken(user.id);
+
+  const params = new URLSearchParams({
+    q: `'${folderId}' in parents and trashed = false`,
+    fields: "nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,iconLink)",
+    orderBy: "folder,name",
+    pageSize: "100",
+  });
+  if (pageToken) params.set("pageToken", String(pageToken).slice(0, 2048));
+
+  const data = await gdriveRequest(`${GDRIVE_API}/files?${params.toString()}`, { token });
+
+  sendJson(res, 200, {
+    success: true,
+    entries: (data.files || []).map((f) => ({
+      type: f.mimeType === "application/vnd.google-apps.folder" ? "folder" : "file",
+      id: f.id,
+      name: f.name,
+      mime_type: f.mimeType,
+      size: f.size ? Number(f.size) : null,
+      modified: f.modifiedTime ?? null,
+      link: f.webViewLink ?? null,
+    })),
+    next_page_token: data.nextPageToken || null,
+    has_more: Boolean(data.nextPageToken),
+  });
+}, { auth: true });
+
+// Envoyer un fichier (multipart : champ "file", champ "folder_id" optionnel)
+route("POST", "/api/googledrive/upload", async ({ req, res, user }) => {
+  enforce(limiterPublish, `gdrive:${user.id}`);
+
+  const declared = Number(req.headers["content-length"] || 0);
+  if (declared > MAX_GDRIVE_UPLOAD + 1024 * 1024) {
+    throw tooLargeError(`File is too large. Maximum size is ${MAX_GDRIVE_UPLOAD / 1024 / 1024} MB.`);
+  }
+
+  const accessToken = await getValidGDriveToken(user.id);
+  await acquireVideoSlot();
+
+  try {
+    let upload;
+
+    try {
+      upload = await parseMultipart(req, { fileField: "file", maxSize: MAX_GDRIVE_UPLOAD });
+    } catch (error) {
+      if (error?.code === "FILE_TOO_LARGE") throw new HttpError(400, `File is too large. Maximum size is ${MAX_GDRIVE_UPLOAD / 1024 / 1024} MB.`);
+      if (error?.code === "NO_FILE") throw new HttpError(400, "No 'file' was provided.");
+      throw error instanceof HttpError ? error : new HttpError(400, "Could not read the uploaded file.");
+    }
+
+    const folderId = parseGDriveFolderId(upload.fields.folder_id);
+    const safeName = (upload.fileName || "file").replace(/[\\/\u0000-\u001f]/g, "_").slice(0, 200) || "file";
+    const mime = /^[\w.+-]+\/[\w.+-]+$/.test(upload.mimeType) ? upload.mimeType : "application/octet-stream";
+
+    const boundary = `stone-${crypto.randomBytes(12).toString("hex")}`;
+    const metadata = { name: safeName, ...(folderId !== "root" ? { parents: [folderId] } : {}) };
+
+    const multipartBody = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+          `--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`
+      ),
+      upload.buffer,
+      Buffer.from(`\r\n--${boundary}--`),
+    ]);
+
+    const data = await gdriveRequest(
+      `${GDRIVE_UPLOAD_URL}?uploadType=multipart&fields=id,name,mimeType,size,webViewLink`,
+      {
+        method: "POST",
+        token: accessToken,
+        headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
+        body: multipartBody,
+        timeoutMs: 120_000,
+      }
+    );
+
+    sendJson(res, 200, {
+      success: true,
+      file: {
+        id: data.id,
+        name: data.name,
+        mime_type: data.mimeType,
+        size: data.size ? Number(data.size) : null,
+        link: data.webViewLink || null,
+      },
+    });
+  } finally {
+    releaseVideoSlot();
+  }
+}, { auth: true });
+
+// ============================================================
 // CANVA ROUTES
 // ============================================================
 
@@ -6432,6 +6796,7 @@ const providerGuards = [
   ["/api/tiktok/", tiktokEnabled, "TikTok"],
   ["/api/pinterest/", pinterestEnabled, "Pinterest"],
   ["/api/youtube/", youtubeEnabled, "YouTube"],
+  ["/api/googledrive/", gdriveEnabled, "Google Drive"],
   ["/api/canva/", canvaEnabled, "Canva"],
   ["/api/dropbox/", dropboxEnabled, "Dropbox"],
 ];
@@ -6577,6 +6942,7 @@ server.listen(PORT, () => {
   console.log(`  TikTok photos   : ${PUBLIC_API_URL ? PUBLIC_API_URL : "désactivé"}`);
   console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
   console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
+  console.log(`  Google Drive    : ${gdriveEnabled ? "activé" : "désactivé"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
