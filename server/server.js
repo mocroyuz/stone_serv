@@ -6221,8 +6221,63 @@ route("POST", "/api/dropbox/auth/callback", async ({ req, res, user }) => {
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
 
+// ────────────────────────────────────────────────────────────
+// Complétion / rafraîchissement du profil Dropbox à la volée
+// ────────────────────────────────────────────────────────────
+//
+// Un compte connecté avant l'ajout de avatar_url / email / display_name
+// dans la base n'a jamais ces colonnes renseignées : on les récupère
+// depuis Dropbox au premier /status, avec throttling pour éviter de
+// spammer l'API à chaque requête.
+
+const dropboxProfileCheckedAt = new Map();
+const DROPBOX_PROFILE_REFRESH_MS = 30 * 60 * 1000;
+const DROPBOX_PROFILE_RETRY_MS = 60 * 1000;
+
+async function refreshDropboxProfile(userId, account) {
+  const incomplete = !account.avatar_url || !account.display_name || !account.email;
+  const interval = incomplete ? DROPBOX_PROFILE_RETRY_MS : DROPBOX_PROFILE_REFRESH_MS;
+  const now = Date.now();
+
+  if (now - (dropboxProfileCheckedAt.get(userId) || 0) < interval) return account;
+
+  if (dropboxProfileCheckedAt.size > 10_000) {
+    dropboxProfileCheckedAt.delete(dropboxProfileCheckedAt.keys().next().value);
+  }
+  dropboxProfileCheckedAt.set(userId, now);
+
+  try {
+    const token = await getValidDropboxToken(userId);
+    const profile = await dropboxRpc("/users/get_current_account", { token });
+
+    if (!profile?.account_id) return account;
+
+    const update = {
+      display_name: profile.name?.display_name || null,
+      email: profile.email || null,
+      avatar_url: profile.profile_photo_url || null,
+    };
+
+    const { error } = await supabaseAdmin
+      .from("dropbox_accounts")
+      .update(update)
+      .eq("user_id", userId);
+
+    if (error) {
+      console.warn("Dropbox profile update error:", error.message);
+      return account;
+    }
+
+    return { ...account, ...update };
+  } catch (error) {
+    console.warn("Dropbox profile refresh error:", error?.message || error);
+    return account;
+  }
+}
+
 route("GET", "/api/dropbox/status", async ({ res, user }) => {
-  const account = await getDropboxAccount(user.id);
+  let account = await getDropboxAccount(user.id);
+  if (account) account = await refreshDropboxProfile(user.id, account);
 
   sendJson(res, 200, {
     success: true,
@@ -6242,16 +6297,22 @@ route("DELETE", "/api/dropbox/disconnect", async ({ res, user }) => {
   const account = await getDropboxAccount(user.id);
 
   if (account) {
-    if (account.access_token) {
-      try {
-        await dropboxRpc("/auth/token/revoke", { token: account.access_token });
-      } catch (revokeError) {
-        console.warn("Dropbox revoke error:", revokeError.message);
-      }
+    // On révoque avec un token VALIDE (refresh automatique si expiré).
+    // Dropbox révoque aussi le refresh_token associé.
+    try {
+      const accessToken = await getValidDropboxToken(user.id);
+      await dropboxRpc("/auth/token/revoke", { token: accessToken });
+    } catch (revokeError) {
+      console.warn("Dropbox revoke error:", revokeError.message);
     }
 
-    const { error } = await supabaseAdmin.from("dropbox_accounts").delete().eq("user_id", user.id);
+    const { error } = await supabaseAdmin
+      .from("dropbox_accounts")
+      .delete()
+      .eq("user_id", user.id);
     if (error) throw error;
+
+    dropboxProfileCheckedAt.delete(user.id);
   }
 
   sendJson(res, 200, { success: true });
