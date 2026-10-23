@@ -45,6 +45,7 @@
 //                    - un code de secours valide vérifie le session_id du JWT
 //                      pendant la fenêtre configurée
 //   Tags         : MAX_TAGS_PER_USER (défaut : 100)
+//   Saved replies: MAX_SAVED_REPLIES_PER_USER (défaut : 100)
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -682,6 +683,18 @@ const TAG_NAME_MAX = 50;
 const TAG_COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 const TAG_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+// ------------------------------------------------------------
+// BLOC 1 — Configuration des saved replies
+// ------------------------------------------------------------
+
+const MAX_SAVED_REPLIES_PER_USER = Math.max(
+  1,
+  Number(env("MAX_SAVED_REPLIES_PER_USER") || 100)
+);
+const SAVED_REPLY_NAME_MAX = 100;
+const SAVED_REPLY_CONTENT_MAX = 1000;
+const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN; // même format UUID
+
 // ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
@@ -1068,6 +1081,16 @@ const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, l
 const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "gdrive" });
 const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
 const limiterTags = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "tags" });
+
+// ------------------------------------------------------------
+// BLOC 2 — Rate limiter saved replies
+// ------------------------------------------------------------
+
+const limiterSavedReplies = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 60,
+  label: "saved-replies",
+});
 
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
@@ -4426,6 +4449,7 @@ route("GET", "/api/health", ({ res }) => {
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
     tags: true,
+    saved_replies: true,
   });
 });
 
@@ -5430,6 +5454,184 @@ route("DELETE", "/api/tags", async ({ req, res, url, user }) => {
   }
 
   if (!data) throw new HttpError(404, "Tag not found", "TAG_NOT_FOUND");
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// ============================================================
+// BLOC 3 — ROUTES — SAVED REPLIES
+// ============================================================
+
+const SAVED_REPLY_COLUMNS = "id,name,content,created_at,updated_at";
+
+function parseSavedReplyInput(body) {
+  const name = String(body.name ?? body.title ?? body.label ?? "").trim();
+  const content = String(body.content ?? body.text ?? body.body ?? "").trim();
+
+  if (!name) {
+    throw new HttpError(400, "Saved reply name is required", "SAVED_REPLY_NAME_REQUIRED");
+  }
+  if (name.length > SAVED_REPLY_NAME_MAX) {
+    throw new HttpError(
+      400,
+      `Saved reply name must be at most ${SAVED_REPLY_NAME_MAX} characters`,
+      "SAVED_REPLY_NAME_TOO_LONG"
+    );
+  }
+  if (/[\u0000-\u001f\u007f]/.test(name)) {
+    throw new HttpError(400, "Invalid saved reply name", "SAVED_REPLY_NAME_INVALID");
+  }
+
+  if (!content) {
+    throw new HttpError(400, "Saved reply content is required", "SAVED_REPLY_CONTENT_REQUIRED");
+  }
+  if (content.length > SAVED_REPLY_CONTENT_MAX) {
+    throw new HttpError(
+      400,
+      `Saved reply content must be at most ${SAVED_REPLY_CONTENT_MAX} characters`,
+      "SAVED_REPLY_CONTENT_TOO_LONG"
+    );
+  }
+  // Autorise \n et \t, refuse les autres caractères de contrôle.
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(content)) {
+    throw new HttpError(400, "Invalid saved reply content", "SAVED_REPLY_CONTENT_INVALID");
+  }
+
+  return { name, content };
+}
+
+function formatSavedReply(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    content: row.content,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+route("GET", "/api/saved-replies", async ({ res, user }) => {
+  const { data, error } = await supabaseAdmin
+    .from("saved_replies")
+    .select(SAVED_REPLY_COLUMNS)
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      console.warn("[saved_replies] table manquante — retourne []");
+      sendJson(res, 200, { success: true, replies: [] });
+      return;
+    }
+    throw dbError("saved_replies.list", error);
+  }
+
+  sendJson(res, 200, { success: true, replies: (data || []).map(formatSavedReply) });
+}, { auth: true });
+
+route(["POST", "PUT"], "/api/saved-replies", async ({ req, res, user }) => {
+  enforce(limiterSavedReplies, `saved-replies:${user.id}`);
+
+  const body = await getJsonBody(req);
+  const { name, content } = parseSavedReplyInput(body);
+
+  const idInput = body.id ?? body.reply_id;
+  const hasId = idInput !== undefined && idInput !== null && idInput !== "";
+  let id = null;
+
+  if (hasId) {
+    id = String(idInput);
+    if (!SAVED_REPLY_ID_PATTERN.test(id)) {
+      throw new HttpError(400, "Invalid saved reply id", "SAVED_REPLY_ID_INVALID");
+    }
+  } else {
+    const { count, error: countError } = await supabaseAdmin
+      .from("saved_replies")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", user.id);
+
+    if (countError) {
+      if (isSchemaCacheMissingError(countError)) {
+        throw new HttpError(503, "Saved replies are not available yet", "SAVED_REPLIES_UNAVAILABLE");
+      }
+      throw dbError("saved_replies.count", countError);
+    }
+    if (Number(count) >= MAX_SAVED_REPLIES_PER_USER) {
+      throw new HttpError(
+        400,
+        `You can have at most ${MAX_SAVED_REPLIES_PER_USER} saved replies.`,
+        "SAVED_REPLIES_LIMIT_REACHED"
+      );
+    }
+  }
+
+  const row = {
+    user_id: user.id,
+    name,
+    content,
+    updated_at: new Date().toISOString(),
+  };
+
+  const query = hasId
+    ? supabaseAdmin
+        .from("saved_replies")
+        .update(row)
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .select(SAVED_REPLY_COLUMNS)
+        .maybeSingle()
+    : supabaseAdmin
+        .from("saved_replies")
+        .insert(row)
+        .select(SAVED_REPLY_COLUMNS)
+        .maybeSingle();
+
+  const { data, error } = await query;
+
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      throw new HttpError(503, "Saved replies are not available yet", "SAVED_REPLIES_UNAVAILABLE");
+    }
+    throw dbError("saved_replies.save", error);
+  }
+
+  if (!data) {
+    if (hasId) throw new HttpError(404, "Saved reply not found", "SAVED_REPLY_NOT_FOUND");
+    throw dbError("saved_replies.save", new Error("No row returned"));
+  }
+
+  sendJson(res, 200, { success: true, reply: formatSavedReply(data) });
+}, { auth: true });
+
+route("DELETE", "/api/saved-replies", async ({ req, res, url, user }) => {
+  enforce(limiterSavedReplies, `saved-replies:${user.id}`);
+
+  let id = url.searchParams.get("id");
+  if (!id) {
+    const body = await getJsonBody(req).catch(() => ({}));
+    id = body.id ?? body.reply_id ?? null;
+  }
+
+  if (!id || !SAVED_REPLY_ID_PATTERN.test(String(id))) {
+    throw new HttpError(400, "Invalid saved reply id", "SAVED_REPLY_ID_INVALID");
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("saved_replies")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", user.id)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      sendJson(res, 200, { success: true });
+      return;
+    }
+    throw dbError("saved_replies.delete", error);
+  }
+
+  if (!data) throw new HttpError(404, "Saved reply not found", "SAVED_REPLY_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
 
@@ -7436,6 +7638,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
+  console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
 
   if (tiktokEnabled) {
