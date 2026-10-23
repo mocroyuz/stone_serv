@@ -44,6 +44,7 @@
 //                    - les opérations sensibles exigent AAL2 via requireAal2()
 //                    - un code de secours valide vérifie le session_id du JWT
 //                      pendant la fenêtre configurée
+//   Tags         : MAX_TAGS_PER_USER (défaut : 100)
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -267,13 +268,6 @@ function isSchemaCacheMissingError(error) {
 // ============================================================
 // CONFIGURATION
 // ============================================================
-//
-// PORT :
-//  - Sur Render (et la plupart des PaaS), le port d'écoute est injecté
-//    via $PORT (Render utilise 10000 par défaut). En production, on ne
-//    retombe JAMAIS sur 3002, sinon le scanner de ports de Render ne
-//    trouve aucun service à l'écoute → "Port scan timeout".
-//  - En dev, on garde 3002 pour la parité avec l'historique local.
 
 const PORT = Number(
   env("PORT") || (IS_PRODUCTION ? 10000 : 3002)
@@ -451,7 +445,6 @@ function resolvePublicApiUrl() {
         ? `https://${env("RAILWAY_PUBLIC_DOMAIN")}`
         : undefined,
     ],
-    // Render expose l'URL publique via $RENDER_EXTERNAL_URL
     ["RENDER_EXTERNAL_URL", env("RENDER_EXTERNAL_URL")],
   ];
 
@@ -681,6 +674,15 @@ const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024;
 const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
 
 // ============================================================
+// CONFIGURATION TAGS
+// ============================================================
+
+const MAX_TAGS_PER_USER = Math.max(1, Number(env("MAX_TAGS_PER_USER") || 100));
+const TAG_NAME_MAX = 50;
+const TAG_COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
+const TAG_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
 
@@ -849,7 +851,10 @@ const supabaseOAuth = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 // ============================================================
 
 const TRUST_PROXY = env("TRUST_PROXY") === "1" || IS_PRODUCTION;
-const TRUST_PROXY_HOPS = Math.max(1, Number(env("TRUST_PROXY_HOPS") || 1));
+const TRUST_PROXY_HOPS = (() => {
+  const n = Number(env("TRUST_PROXY_HOPS"));
+  return Number.isSafeInteger(n) && n >= 1 ? n : 1;
+})();
 
 function getClientIp(req) {
   const forwarded = req.headers["x-forwarded-for"];
@@ -1062,6 +1067,7 @@ const limiterCanva = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 40, labe
 const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "dropbox" });
 const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "gdrive" });
 const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
+const limiterTags = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "tags" });
 
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
@@ -2113,7 +2119,7 @@ function userPrimaryProvider(user) {
 }
 
 // ============================================================
-// MFA — PROXY SUPABASE AUTH (enroll / challenge / verify / unenroll)
+// MFA — PROXY SUPABASE AUTH
 // ============================================================
 
 async function supabaseAuthRequest(pathname, { method = "GET", token, json } = {}) {
@@ -2951,7 +2957,7 @@ function computeChunking(size) {
   if (size <= 64 * MB) return { chunkSize: size, totalChunks: 1 };
 
   const chunkSize = 10 * MB;
-  return { chunkSize, totalChunks: Math.floor(size / chunkSize) };
+  return { chunkSize, totalChunks: Math.ceil(size / chunkSize) };
 }
 
 async function putChunk(uploadUrl, part, mimeType, start, end, total) {
@@ -3155,6 +3161,17 @@ async function storeTikTokPhotos(photos) {
 }
 
 async function serveTikTokMedia(req, res, fileName) {
+  if (req.method === "HEAD") {
+    res.writeHead(200, {
+      "Content-Type": fileName.endsWith(".webp") ? "image/webp" : "image/jpeg",
+      "Content-Disposition": "inline",
+      "Accept-Ranges": "none",
+      "Cache-Control": "public, max-age=3600",
+    });
+    res.end();
+    return;
+  }
+
   const { data, error } = await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).download(fileName);
 
   if (error || !data) {
@@ -3172,7 +3189,7 @@ async function serveTikTokMedia(req, res, fileName) {
     "Cache-Control": "public, max-age=3600",
   });
 
-  res.end(req.method === "HEAD" ? undefined : buffer);
+  res.end(buffer);
 }
 
 async function probePublicPhoto(imageUrl, index = 1, total = 1) {
@@ -4408,6 +4425,7 @@ route("GET", "/api/health", ({ res }) => {
     googlephotos: gphotosEnabled,
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
+    tags: true,
   });
 });
 
@@ -5242,6 +5260,180 @@ route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
 }, { auth: true });
 
 // ============================================================
+// ROUTES — TAGS
+// ============================================================
+
+function parseTagInput(body) {
+  const name = String(body.name ?? "").trim();
+
+  if (!name) {
+    throw new HttpError(400, "Tag name is required", "TAG_NAME_REQUIRED");
+  }
+  if (name.length > TAG_NAME_MAX) {
+    throw new HttpError(
+      400,
+      `Tag name must be at most ${TAG_NAME_MAX} characters`,
+      "TAG_NAME_TOO_LONG"
+    );
+  }
+  if (/[\u0000-\u001f\u007f]/.test(name)) {
+    throw new HttpError(400, "Invalid tag name", "TAG_NAME_INVALID");
+  }
+
+  let color = null;
+  if (body.color !== undefined && body.color !== null && body.color !== "") {
+    const raw = String(body.color).trim();
+    if (!TAG_COLOR_PATTERN.test(raw)) {
+      throw new HttpError(400, "Invalid tag color (expected #RRGGBB)", "TAG_COLOR_INVALID");
+    }
+    color = raw.toLowerCase();
+  }
+
+  return { name, color };
+}
+
+function formatTag(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    color: row.color || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+route("GET", "/api/tags", async ({ res, user }) => {
+  const { data, error } = await supabaseAdmin
+    .from("tags")
+    .select("id,name,color,created_at,updated_at")
+    .eq("user_id", user.id)
+    .order("name", { ascending: true });
+
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      console.warn("[tags] table manquante — retourne []");
+      sendJson(res, 200, { success: true, tags: [] });
+      return;
+    }
+    throw dbError("tags.list", error);
+  }
+
+  sendJson(res, 200, { success: true, tags: (data || []).map(formatTag) });
+}, { auth: true });
+
+route(["POST", "PUT"], "/api/tags", async ({ req, res, user }) => {
+  enforce(limiterTags, `tags:${user.id}`);
+
+  const body = await getJsonBody(req);
+  const { name, color } = parseTagInput(body);
+
+  const idInput = body.id ?? body.tag_id;
+  const hasId = idInput !== undefined && idInput !== null && idInput !== "";
+  let id = null;
+
+  if (hasId) {
+    id = String(idInput);
+    if (!TAG_ID_PATTERN.test(id)) {
+      throw new HttpError(400, "Invalid tag id", "TAG_ID_INVALID");
+    }
+  }
+
+  if (!hasId) {
+    const { count, error: countError } = await supabaseAdmin
+      .from("tags")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", user.id);
+
+    if (countError) {
+      if (isSchemaCacheMissingError(countError)) {
+        throw new HttpError(503, "Tags are not available yet", "TAGS_UNAVAILABLE");
+      }
+      throw dbError("tags.count", countError);
+    }
+    if (Number(count) >= MAX_TAGS_PER_USER) {
+      throw new HttpError(
+        400,
+        `You can have at most ${MAX_TAGS_PER_USER} tags.`,
+        "TAGS_LIMIT_REACHED"
+      );
+    }
+  }
+
+  const row = {
+    user_id: user.id,
+    name,
+    color,
+    updated_at: new Date().toISOString(),
+  };
+
+  const query = hasId
+    ? supabaseAdmin
+        .from("tags")
+        .update(row)
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .select("id,name,color,created_at,updated_at")
+        .maybeSingle()
+    : supabaseAdmin
+        .from("tags")
+        .insert(row)
+        .select("id,name,color,created_at,updated_at")
+        .maybeSingle();
+
+  const { data, error } = await query;
+
+  if (error) {
+    if (error.code === "23505" || /duplicate key/i.test(error.message || "")) {
+      throw new HttpError(409, "A tag with this name already exists", "TAG_DUPLICATE");
+    }
+    if (isSchemaCacheMissingError(error)) {
+      throw new HttpError(503, "Tags are not available yet", "TAGS_UNAVAILABLE");
+    }
+    throw dbError("tags.save", error);
+  }
+
+  if (!data) {
+    if (hasId) throw new HttpError(404, "Tag not found", "TAG_NOT_FOUND");
+    throw dbError("tags.save", new Error("No row returned"));
+  }
+
+  sendJson(res, 200, { success: true, tag: formatTag(data) });
+}, { auth: true });
+
+route("DELETE", "/api/tags", async ({ req, res, url, user }) => {
+  enforce(limiterTags, `tags:${user.id}`);
+
+  let id = url.searchParams.get("id");
+  if (!id) {
+    const body = await getJsonBody(req).catch(() => ({}));
+    id = body.id ?? body.tag_id ?? null;
+  }
+
+  if (!id || !TAG_ID_PATTERN.test(String(id))) {
+    throw new HttpError(400, "Invalid tag id", "TAG_ID_INVALID");
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("tags")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", user.id)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      sendJson(res, 200, { success: true });
+      return;
+    }
+    throw dbError("tags.delete", error);
+  }
+
+  if (!data) throw new HttpError(404, "Tag not found", "TAG_NOT_FOUND");
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// ============================================================
 // ROUTES — UTILISATEUR
 // ============================================================
 
@@ -5292,10 +5484,6 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user, token }) =
 
   sendJson(res, 200, { success: true, user: formatUser(data.user) });
 }, { auth: true });
-
-// ============================================================
-// /api/user/password — gestion OAuth-only + AAL2
-// ============================================================
 
 route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) => {
   await requireAal2(user, token);
@@ -6502,7 +6690,6 @@ route("POST", "/api/googlephotos/auth/callback", async ({ req, res, user }) => {
       throw new HttpError(400, "Google Photos access was not granted. Please accept the permission.", "GPHOTOS_SCOPE_MISSING");
     }
 
-    // Le scope Picker ne donne pas accès au profil : on garde juste le compte lié.
     await saveGPhotosTokens(user.id, tokens);
     return { display_name: null, email: null, avatar_url: null };
   });
@@ -6536,7 +6723,6 @@ route("DELETE", "/api/googlephotos/disconnect", async ({ res, user }) => {
   sendJson(res, 200, { success: true });
 }, { auth: true });
 
-// --- Picker : créer une session ---
 route("POST", "/api/googlephotos/picker/session", async ({ res, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const token = await getValidGPhotosToken(user.id);
@@ -6555,7 +6741,6 @@ route("POST", "/api/googlephotos/picker/session", async ({ res, user }) => {
   });
 }, { auth: true });
 
-// --- Picker : sélection terminée ? ---
 route("GET", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
@@ -6565,7 +6750,6 @@ route("GET", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
   sendJson(res, 200, { success: true, media_items_set: Boolean(session.mediaItemsSet) });
 }, { auth: true });
 
-// --- Picker : lister la sélection ---
 route("GET", "/api/googlephotos/picker/items", async ({ res, url, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
@@ -6581,10 +6765,10 @@ route("GET", "/api/googlephotos/picker/items", async ({ res, url, user }) => {
     success: true,
     items: (data.mediaItems || []).map((m) => ({
       id: m.id,
-      type: m.type, // PHOTO | VIDEO
+      type: m.type,
       name: m.mediaFile?.filename || m.id,
       mime_type: m.mediaFile?.mimeType || null,
-      base_url: m.mediaFile?.baseUrl || null, // valide ~60 min
+      base_url: m.mediaFile?.baseUrl || null,
       width: m.mediaFile?.mediaFileMetadata?.width ?? null,
       height: m.mediaFile?.mediaFileMetadata?.height ?? null,
     })),
@@ -6592,7 +6776,6 @@ route("GET", "/api/googlephotos/picker/items", async ({ res, url, user }) => {
   });
 }, { auth: true });
 
-// --- Picker : télécharger un média (le baseUrl exige le Bearer, donc via le serveur) ---
 route("POST", "/api/googlephotos/picker/download", async ({ req, res, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
 
@@ -6652,7 +6835,6 @@ route("POST", "/api/googlephotos/picker/download", async ({ req, res, user }) =>
   res.end(buffer);
 }, { auth: true });
 
-// --- Picker : supprimer la session ---
 route("DELETE", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
   const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
   const token = await getValidGPhotosToken(user.id);
@@ -7237,16 +7419,7 @@ server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
 server.requestTimeout = 5 * 60_000;
 
-// ────────────────────────────────────────────────────────────
-// ÉCOUTE
-// ────────────────────────────────────────────────────────────
-//
-// Bind explicite sur 0.0.0.0 (IPv4, toutes interfaces) :
-//   - Render scanne les ports sur l'IPv4 de l'instance
-//   - Un bind IPv6-only (::) rend le service invisible au port scanner
-//   - "localhost" ne fonctionne pas non plus (n'écoute pas sur l'extérieur)
-
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", async () => {
   console.log(`Stone server running on port ${PORT}`);
   console.log(`  NODE_ENV        : ${env("NODE_ENV") || "(non défini)"}`);
   console.log(`  TRUST_PROXY     : ${TRUST_PROXY ? `1 (${TRUST_PROXY_HOPS} hop)` : "0"}`);
@@ -7262,7 +7435,22 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Google Photos   : ${gphotosEnabled ? "activé" : "désactivé"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
+  console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
+
+  if (tiktokEnabled) {
+    try {
+      await ensureTikTokMediaBucket();
+      console.log(`  TikTok bucket   : ${TIKTOK_MEDIA_BUCKET} prêt`);
+    } catch (error) {
+      console.warn(`  TikTok bucket   : initialisation échouée (${error?.message || error})`);
+    }
+    const sweepTimer = setInterval(() => {
+      void sweepTikTokMedia();
+    }, 30 * 60 * 1000);
+    sweepTimer.unref?.();
+    setTimeout(() => void sweepTikTokMedia(), 5 * 60 * 1000).unref?.();
+  }
 });
 
 server.on("error", (error) => {
