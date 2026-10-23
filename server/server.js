@@ -8,8 +8,8 @@
 //                  OAUTH_STATE_SECRET (32+ caractères aléatoires)
 //   Recommandé   : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
 //                  chiffre les tokens TikTok / Pinterest / YouTube / Canva /
-//                  Dropbox / Google Drive en base (AES-256-GCM). Les anciens
-//                  tokens en clair restent lisibles.
+//                  Dropbox / Google Drive / Google Photos en base
+//                  (AES-256-GCM). Les anciens tokens en clair restent lisibles.
 //   Mot de passe oublié :
 //                  PASSWORD_RESET_REDIRECT_URL (optionnel, défaut :
 //                  ${APP_URL}/#/reset-password).
@@ -21,6 +21,10 @@
 //   YouTube      : YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET.
 //   Google Drive : GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET
 //                  (fallback sur les identifiants YouTube si absents).
+//   Google Photos: GOOGLE_PHOTOS_CLIENT_ID, GOOGLE_PHOTOS_CLIENT_SECRET
+//                  (fallback sur Google Drive / YouTube si absents).
+//                  GOOGLE_PHOTOS_REDIRECT_URI
+//                  (défaut : ${APP_URL}/googlephotos/callback).
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
@@ -618,6 +622,22 @@ const MAX_GDRIVE_UPLOAD = 100 * 1024 * 1024;
 const gdriveEnabled = Boolean(GDRIVE_CLIENT_ID && GDRIVE_CLIENT_SECRET);
 
 // ============================================================
+// CONFIGURATION GOOGLE PHOTOS (Picker API)
+// ============================================================
+
+const GPHOTOS_CLIENT_ID = env("GOOGLE_PHOTOS_CLIENT_ID") || GDRIVE_CLIENT_ID;
+const GPHOTOS_CLIENT_SECRET = env("GOOGLE_PHOTOS_CLIENT_SECRET") || GDRIVE_CLIENT_SECRET;
+const GPHOTOS_REDIRECT_URI =
+  env("GOOGLE_PHOTOS_REDIRECT_URI") || `${APP_URL}/googlephotos/callback`;
+
+const GPHOTOS_SCOPES = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly";
+const GPHOTOS_PICKER_API = "https://photospicker.googleapis.com/v1";
+const MAX_GPHOTOS_DOWNLOAD = 100 * 1024 * 1024;
+const GPHOTOS_SESSION_ID = /^[\w.~-]{1,256}$/;
+
+const gphotosEnabled = Boolean(GPHOTOS_CLIENT_ID && GPHOTOS_CLIENT_SECRET);
+
+// ============================================================
 // CONFIGURATION CANVA
 // ============================================================
 
@@ -1041,6 +1061,7 @@ const limiterTiktokWebhook = createRateLimiter({ windowMs: 60 * 1000, max: 600, 
 const limiterCanva = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 40, label: "canva" });
 const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "dropbox" });
 const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "gdrive" });
+const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
 
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
@@ -1064,7 +1085,7 @@ const STRICT_PATHS = new Set([
   "/api/auth/reset-password",
 ]);
 
-const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox|googledrive)\/auth\//;
+const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox|googledrive|googlephotos)\/auth\//;
 
 function pickLimiter(pathname) {
   if (STRICT_PATHS.has(pathname)) return limiterStrict;
@@ -3902,6 +3923,123 @@ function parseGDriveFolderId(value) {
 }
 
 // ============================================================
+// GOOGLE PHOTOS
+// ============================================================
+
+function buildGPhotosTokenRow(t) {
+  const row = {
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: iso(Date.now() + (Number(t.expires_in) || 3600) * 1000),
+    updated_at: new Date().toISOString(),
+  };
+  if (t.refresh_token) row.refresh_token = encryptSecret(t.refresh_token);
+  if (t.scope) row.scope = t.scope;
+  return row;
+}
+
+async function saveGPhotosTokens(userId, t, extra = {}) {
+  const { error } = await supabaseAdmin
+    .from("google_photos_accounts")
+    .upsert({ user_id: userId, ...buildGPhotosTokenRow(t), ...extra }, { onConflict: "user_id" });
+  if (error) throw dbError("google_photos_accounts upsert", error);
+}
+
+const getGPhotosAccount = (userId) => selectTokenRow("google_photos_accounts", userId);
+
+async function getValidGPhotosToken(userId) {
+  const load = async () => {
+    const account = await getGPhotosAccount(userId);
+    if (!account) throw new HttpError(400, "Google Photos account not connected", "GPHOTOS_NOT_CONNECTED");
+    return account;
+  };
+
+  const first = await load();
+  if (isTokenFresh(first)) return first.access_token;
+
+  return withLock(`gphotos-refresh:${userId}`, async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const account = await load();
+      if (isTokenFresh(account)) return account.access_token;
+      if (!account.refresh_token) throw reconnectError("Google Photos", "GPHOTOS_REFRESH_EXPIRED");
+
+      let refreshed;
+      try {
+        refreshed = await googleRequest(GOOGLE_TOKEN_URL, {
+          method: "POST",
+          form: {
+            client_id: GPHOTOS_CLIENT_ID,
+            client_secret: GPHOTOS_CLIENT_SECRET,
+            grant_type: "refresh_token",
+            refresh_token: account.refresh_token,
+          },
+        });
+      } catch (error) {
+        if (error instanceof HttpError && error.code === "invalid_grant") {
+          throw reconnectError("Google Photos", "GPHOTOS_REFRESH_EXPIRED");
+        }
+        throw error;
+      }
+
+      if (!refreshed?.access_token) {
+        throw new HttpError(502, "Google returned an invalid token response", "GPHOTOS_BAD_TOKEN_RESPONSE");
+      }
+
+      const applied = await updateTokensIfUnchanged(
+        "google_photos_accounts", userId, account, buildGPhotosTokenRow(refreshed)
+      );
+      if (applied) return refreshed.access_token;
+    }
+    throw new HttpError(409, "Google Photos account changed during token refresh, please retry", "GPHOTOS_REFRESH_CONFLICT");
+  });
+}
+
+async function gphotosPicker(pathname, { method = "GET", token, json } = {}) {
+  let result;
+  try {
+    result = await fetchJson(
+      `${GPHOTOS_PICKER_API}${pathname}`,
+      {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          ...(json ? { "Content-Type": "application/json" } : {}),
+        },
+        body: json ? JSON.stringify(json) : undefined,
+      },
+      20_000
+    );
+  } catch (error) {
+    throw upstreamError("Google Photos", error);
+  }
+
+  const { response, data } = result;
+  if (!response.ok) {
+    if (response.status === 401) throw reconnectError("Google Photos", "GPHOTOS_REFRESH_EXPIRED");
+    if (response.status === 403) {
+      throw new HttpError(409, "Google Photos permission missing, please reconnect.", "GPHOTOS_SCOPE_MISSING");
+    }
+    throw new HttpError(
+      upstreamStatus(response.status),
+      data?.error?.message || `Google Photos error (HTTP ${response.status})`,
+      data?.error?.status
+    );
+  }
+  return data;
+}
+
+function parseGPhotosSessionId(value) {
+  const id = String(value ?? "").trim();
+  if (!GPHOTOS_SESSION_ID.test(id)) throw new HttpError(400, "Invalid session id", "INVALID_GPHOTOS_SESSION");
+  return id;
+}
+
+function isGoogleMediaHost(hostname) {
+  const h = hostname.toLowerCase();
+  return h === "googleusercontent.com" || h.endsWith(".googleusercontent.com");
+}
+
+// ============================================================
 // CANVA
 // ============================================================
 
@@ -4267,6 +4405,7 @@ route("GET", "/api/health", ({ res }) => {
     pinterest: pinterestUsable,
     youtube: youtubeEnabled,
     googledrive: gdriveEnabled,
+    googlephotos: gphotosEnabled,
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
   });
@@ -6322,6 +6461,210 @@ route("POST", "/api/googledrive/upload", async ({ req, res, user }) => {
 }, { auth: true });
 
 // ============================================================
+// GOOGLE PHOTOS ROUTES
+// ============================================================
+
+route("POST", "/api/googlephotos/auth/url", ({ res, user }) => {
+  const params = new URLSearchParams({
+    client_id: GPHOTOS_CLIENT_ID,
+    redirect_uri: GPHOTOS_REDIRECT_URI,
+    response_type: "code",
+    scope: GPHOTOS_SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+    state: createOAuthState("googlephotos", user.id),
+  });
+  sendJson(res, 200, { success: true, url: `${GOOGLE_AUTH_URL}?${params.toString()}` });
+}, { auth: true });
+
+route("POST", "/api/googlephotos/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const authCode = assertValidOAuthCallback("googlephotos", body, user.id);
+
+  const account = await dedupeCallback(`googlephotos:${user.id}:${sha256(authCode)}`, async () => {
+    const tokens = await googleRequest(GOOGLE_TOKEN_URL, {
+      method: "POST",
+      form: {
+        client_id: GPHOTOS_CLIENT_ID,
+        client_secret: GPHOTOS_CLIENT_SECRET,
+        code: authCode,
+        grant_type: "authorization_code",
+        redirect_uri: GPHOTOS_REDIRECT_URI,
+      },
+    });
+
+    if (!tokens?.access_token) {
+      throw new HttpError(502, "Google returned an invalid token response", "GPHOTOS_BAD_TOKEN_RESPONSE");
+    }
+
+    const granted = String(tokens.scope || "").split(/[\s,]+/);
+    if (!granted.includes(GPHOTOS_SCOPES)) {
+      throw new HttpError(400, "Google Photos access was not granted. Please accept the permission.", "GPHOTOS_SCOPE_MISSING");
+    }
+
+    // Le scope Picker ne donne pas accès au profil : on garde juste le compte lié.
+    await saveGPhotosTokens(user.id, tokens);
+    return { display_name: null, email: null, avatar_url: null };
+  });
+
+  sendJson(res, 200, { success: true, connected: true, account });
+}, { auth: true });
+
+route("GET", "/api/googlephotos/status", async ({ res, user }) => {
+  const account = await getGPhotosAccount(user.id);
+  sendJson(res, 200, {
+    success: true,
+    connected: Boolean(account),
+    account: account ? { display_name: account.display_name, scope: account.scope } : null,
+  });
+}, { auth: true });
+
+route("DELETE", "/api/googlephotos/disconnect", async ({ res, user }) => {
+  const account = await getGPhotosAccount(user.id);
+  if (account) {
+    const tokenToRevoke = account.refresh_token || account.access_token;
+    if (tokenToRevoke) {
+      try {
+        await googleRequest(GOOGLE_REVOKE_URL, { method: "POST", form: { token: tokenToRevoke } });
+      } catch (e) {
+        console.warn("Google Photos revoke error:", e.message);
+      }
+    }
+    const { error } = await supabaseAdmin.from("google_photos_accounts").delete().eq("user_id", user.id);
+    if (error) throw error;
+  }
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// --- Picker : créer une session ---
+route("POST", "/api/googlephotos/picker/session", async ({ res, user }) => {
+  enforce(limiterGPhotos, `gphotos:${user.id}`);
+  const token = await getValidGPhotosToken(user.id);
+
+  const session = await gphotosPicker("/sessions", { method: "POST", token, json: {} });
+  if (!session?.id || !session?.pickerUri) {
+    throw new HttpError(502, "Google Photos did not return a session", "GPHOTOS_NO_SESSION");
+  }
+
+  sendJson(res, 200, {
+    success: true,
+    session_id: session.id,
+    picker_uri: `${String(session.pickerUri).replace(/\/+$/, "")}/autoclose`,
+    poll_interval_ms: Number.parseInt(session.pollingConfig?.pollInterval, 10) * 1000 || 3000,
+    timeout_ms: Number.parseInt(session.pollingConfig?.timeoutIn, 10) * 1000 || 5 * 60 * 1000,
+  });
+}, { auth: true });
+
+// --- Picker : sélection terminée ? ---
+route("GET", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
+  enforce(limiterGPhotos, `gphotos:${user.id}`);
+  const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
+  const token = await getValidGPhotosToken(user.id);
+
+  const session = await gphotosPicker(`/sessions/${encodeURIComponent(sessionId)}`, { token });
+  sendJson(res, 200, { success: true, media_items_set: Boolean(session.mediaItemsSet) });
+}, { auth: true });
+
+// --- Picker : lister la sélection ---
+route("GET", "/api/googlephotos/picker/items", async ({ res, url, user }) => {
+  enforce(limiterGPhotos, `gphotos:${user.id}`);
+  const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
+  const pageToken = url.searchParams.get("pageToken");
+  const token = await getValidGPhotosToken(user.id);
+
+  const params = new URLSearchParams({ sessionId, pageSize: "100" });
+  if (pageToken) params.set("pageToken", String(pageToken).slice(0, 2048));
+
+  const data = await gphotosPicker(`/mediaItems?${params.toString()}`, { token });
+
+  sendJson(res, 200, {
+    success: true,
+    items: (data.mediaItems || []).map((m) => ({
+      id: m.id,
+      type: m.type, // PHOTO | VIDEO
+      name: m.mediaFile?.filename || m.id,
+      mime_type: m.mediaFile?.mimeType || null,
+      base_url: m.mediaFile?.baseUrl || null, // valide ~60 min
+      width: m.mediaFile?.mediaFileMetadata?.width ?? null,
+      height: m.mediaFile?.mediaFileMetadata?.height ?? null,
+    })),
+    next_page_token: data.nextPageToken || null,
+  });
+}, { auth: true });
+
+// --- Picker : télécharger un média (le baseUrl exige le Bearer, donc via le serveur) ---
+route("POST", "/api/googlephotos/picker/download", async ({ req, res, user }) => {
+  enforce(limiterGPhotos, `gphotos:${user.id}`);
+
+  const body = await getJsonBody(req);
+  let baseUrl;
+  try {
+    baseUrl = new URL(String(body.baseUrl || ""));
+  } catch {
+    throw new HttpError(400, "Invalid baseUrl", "INVALID_GPHOTOS_URL");
+  }
+  if (baseUrl.protocol !== "https:" || !isGoogleMediaHost(baseUrl.hostname)) {
+    throw new HttpError(400, "Invalid baseUrl", "INVALID_GPHOTOS_URL");
+  }
+
+  const isVideo = body.type === "VIDEO";
+  const token = await getValidGPhotosToken(user.id);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120_000);
+  let upstream;
+  let buffer;
+
+  try {
+    upstream = await fetch(`${baseUrl.toString()}${isVideo ? "=dv" : "=d"}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    });
+
+    if (!upstream.ok) {
+      throw new HttpError(
+        upstream.status === 401 ? 409 : 502,
+        "Could not download this media from Google Photos",
+        "GPHOTOS_DOWNLOAD_FAILED"
+      );
+    }
+
+    const declared = Number(upstream.headers.get("content-length") || 0);
+    if (declared > MAX_GPHOTOS_DOWNLOAD) throw tooLargeError("This media is too large.");
+
+    buffer = Buffer.from(await upstream.arrayBuffer());
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw upstreamError("Google Photos", error);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (buffer.length > MAX_GPHOTOS_DOWNLOAD) throw tooLargeError("This media is too large.");
+
+  const type = sniffImageType(buffer) || sniffVideoType(buffer) || "application/octet-stream";
+
+  res.writeHead(200, {
+    "Content-Type": type,
+    "Content-Length": buffer.length,
+    "Cache-Control": "no-store",
+  });
+  res.end(buffer);
+}, { auth: true });
+
+// --- Picker : supprimer la session ---
+route("DELETE", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
+  const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
+  const token = await getValidGPhotosToken(user.id);
+  try {
+    await gphotosPicker(`/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE", token });
+  } catch (e) {
+    console.warn("Google Photos session delete:", e.message);
+  }
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// ============================================================
 // CANVA ROUTES
 // ============================================================
 
@@ -6760,6 +7103,7 @@ const providerGuards = [
   ["/api/pinterest/", pinterestEnabled, "Pinterest"],
   ["/api/youtube/", youtubeEnabled, "YouTube"],
   ["/api/googledrive/", gdriveEnabled, "Google Drive"],
+  ["/api/googlephotos/", gphotosEnabled, "Google Photos"],
   ["/api/canva/", canvaEnabled, "Canva"],
   ["/api/dropbox/", dropboxEnabled, "Dropbox"],
 ];
@@ -6915,6 +7259,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
   console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
   console.log(`  Google Drive    : ${gdriveEnabled ? "activé" : "désactivé"}`);
+  console.log(`  Google Photos   : ${gphotosEnabled ? "activé" : "désactivé"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
