@@ -3722,28 +3722,32 @@ function buildYouTubeMetadata(fields) {
 
   const tags = parseYouTubeTags(fields.tags);
   const categoryId = /^\d{1,3}$/.test(String(fields.category_id || "")) ? String(fields.category_id) : "22";
+  const license = fields.license === "creativeCommon" ? "creativeCommon" : "youtube";
+  const notifySubscribers = fields.notify_subscribers !== "false";
 
   return {
     privacy,
     publishAt,
+    notifySubscribers,
     metadata: {
       snippet: { title, description, categoryId, ...(tags.length > 0 ? { tags } : {}) },
       status: {
         privacyStatus: privacy,
         selfDeclaredMadeForKids: fields.made_for_kids === "true",
-        embeddable: true,
+        embeddable: fields.allow_embedding !== "false",
+        license,
         ...(publishAt ? { publishAt } : {}),
       },
     },
   };
 }
 
-async function initYouTubeUpload(accessToken, metadata, size, mimeType) {
+async function initYouTubeUpload(accessToken, metadata, size, mimeType, notifySubscribers = true) {
   let result;
 
   try {
     result = await fetchJson(
-      `${YOUTUBE_UPLOAD_URL}?uploadType=resumable&part=snippet,status`,
+      `${YOUTUBE_UPLOAD_URL}?uploadType=resumable&part=snippet,status&notifySubscribers=${notifySubscribers}`,
       {
         method: "POST",
         headers: {
@@ -6578,9 +6582,9 @@ route("POST", "/api/youtube/publish", async ({ req, res, user }) => {
     const mimeType = sniffVideoType(upload.buffer);
     if (!mimeType) throw new HttpError(400, "Unsupported format. Use MP4, MOV or WebM.");
 
-    const { privacy, publishAt, metadata } = buildYouTubeMetadata(upload.fields);
+    const { privacy, publishAt, metadata, notifySubscribers } = buildYouTubeMetadata(upload.fields);
 
-    const uploadUrl = await initYouTubeUpload(accessToken, metadata, upload.buffer.length, mimeType);
+    const uploadUrl = await initYouTubeUpload(accessToken, metadata, upload.buffer.length, mimeType, notifySubscribers);
     const video = await uploadVideoToYouTube(uploadUrl, upload.buffer, mimeType);
 
     if (!video?.id) throw new HttpError(502, "YouTube did not confirm the upload", "YOUTUBE_NO_VIDEO_ID");
