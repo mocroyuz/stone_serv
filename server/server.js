@@ -3043,7 +3043,7 @@ function resolvePrivacy(requested) {
 }
 
 function resolveVideoMode(requested) {
-  if (TIKTOK_FORCE_DRAFT) return "draft";
+  if (TIKTOK_SANDBOX || TIKTOK_FORCE_DRAFT) return "draft";
   return requested === "draft" ? "draft" : "direct";
 }
 
