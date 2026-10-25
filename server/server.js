@@ -46,6 +46,10 @@
 //                      pendant la fenêtre configurée
 //   Tags         : MAX_TAGS_PER_USER (défaut : 100)
 //   Saved replies: MAX_SAVED_REPLIES_PER_USER (défaut : 100)
+//   Feed proxy   : FEED_MAX_BYTES (défaut : 5 MB),
+//                  FEED_TIMEOUT_MS (défaut : 15000),
+//                  FEED_MAX_REDIRECTS (défaut : 3),
+//                  FEED_RATE_LIMIT_PER_MIN (défaut : 30)
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -53,6 +57,7 @@ import path from "node:path";
 import { createServer } from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import dns from "node:dns/promises";
 import { createClient } from "@supabase/supabase-js";
 import {
   generateAuthenticationOptions,
@@ -696,6 +701,31 @@ const SAVED_REPLY_CONTENT_MAX = 1000;
 const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN; // même format UUID
 
 // ============================================================
+// CONFIGURATION FEED PROXY (RSS / Atom)
+// ============================================================
+
+const FEED_MAX_BYTES = Math.max(
+  256 * 1024,
+  Number(env("FEED_MAX_BYTES") || 5 * 1024 * 1024)
+);
+const FEED_TIMEOUT_MS = Math.max(
+  1000,
+  Number(env("FEED_TIMEOUT_MS") || 15_000)
+);
+const FEED_MAX_REDIRECTS = Math.max(
+  0,
+  Math.min(10, Number(env("FEED_MAX_REDIRECTS") || 3))
+);
+const FEED_RATE_LIMIT_PER_MIN = Math.max(
+  1,
+  Number(env("FEED_RATE_LIMIT_PER_MIN") || 30)
+);
+const FEED_URL_MAX = 2048;
+
+const FEED_USER_AGENT =
+  "Mozilla/5.0 (compatible; StoneFeedReader/1.0; +https://stone-prod.vercel.app)";
+
+// ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
 
@@ -1092,6 +1122,16 @@ const limiterSavedReplies = createRateLimiter({
   label: "saved-replies",
 });
 
+// ------------------------------------------------------------
+// Rate limiter feed proxy
+// ------------------------------------------------------------
+
+const limiterFeed = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: FEED_RATE_LIMIT_PER_MIN,
+  label: "feed",
+});
+
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
 
@@ -1269,6 +1309,23 @@ function sendJson(res, statusCode, data, extraHeaders) {
   });
 
   res.end(payload);
+}
+
+function sendXml(res, statusCode, buffer, extraHeaders) {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+
+  res.writeHead(statusCode, {
+    "Content-Type": "application/xml; charset=utf-8",
+    "Content-Length": buffer.length,
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "public, max-age=300",
+    ...(extraHeaders || {}),
+  });
+
+  res.end(buffer);
 }
 
 function internalErrorResponse(res, requestId, error, context) {
@@ -4424,6 +4481,222 @@ function parseDropboxPath(value, { allowRoot = false } = {}) {
 }
 
 // ============================================================
+// FEED PROXY — PROTECTION SSRF
+// ============================================================
+
+/**
+ * Vérifie qu'une adresse IP n'est pas privée / réservée / loopback.
+ * Couvre IPv4 + IPv6 (y compris IPv4-mapped).
+ */
+function isPrivateOrReservedIp(ip) {
+  const s = String(ip).trim().toLowerCase();
+
+  // IPv4-mapped IPv6 (::ffff:1.2.3.4)
+  if (s.startsWith("::ffff:")) {
+    return isPrivateOrReservedIp(s.slice(7));
+  }
+
+  // IPv4
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) {
+    const parts = s.split(".").map(Number);
+    if (parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+
+    const [a, b, c] = parts;
+
+    if (a === 0) return true; // 0.0.0.0/8
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 127) return true; // loopback
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a === 169 && b === 254) return true; // link-local (incl. metadata 169.254.169.254)
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 198 && (b === 18 || b === 19)) return true; // benchmark
+    if (a >= 224) return true; // multicast + reserved + broadcast
+
+    return false;
+  }
+
+  // IPv6
+  if (s === "::1" || s === "::") return true;
+  if (s.startsWith("fc") || s.startsWith("fd")) return true; // ULA fc00::/7
+  if (/^fe[89ab]/.test(s)) return true; // link-local fe80::/10
+  if (s.startsWith("ff")) return true; // multicast
+  if (s === "2001:db8" || s.startsWith("2001:db8:")) return true; // docs
+
+  return false;
+}
+
+function assertHttpProtocol(parsed) {
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new HttpError(400, "Only http and https are allowed", "INVALID_FEED_URL");
+  }
+}
+
+function assertHostNotBlocked(hostname) {
+  const h = String(hostname).toLowerCase();
+  if (
+    h === "localhost" ||
+    h === "0.0.0.0" ||
+    h.endsWith(".localhost") ||
+    h.endsWith(".internal") ||
+    h.endsWith(".lan") ||
+    h === "[::1]"
+  ) {
+    throw new HttpError(400, "This URL is not allowed", "FEED_URL_BLOCKED");
+  }
+}
+
+async function assertSafeFeedUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl));
+  } catch {
+    throw new HttpError(400, "Invalid feed URL", "INVALID_FEED_URL");
+  }
+
+  assertHttpProtocol(parsed);
+
+  if (!parsed.hostname) {
+    throw new HttpError(400, "Invalid feed URL", "INVALID_FEED_URL");
+  }
+
+  assertHostNotBlocked(parsed.hostname);
+
+  let records;
+  try {
+    records = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+  } catch {
+    throw new HttpError(502, "Could not resolve this hostname", "FEED_DNS_FAILED");
+  }
+
+  if (!Array.isArray(records) || records.length === 0) {
+    throw new HttpError(502, "Could not resolve this hostname", "FEED_DNS_FAILED");
+  }
+
+  for (const record of records) {
+    if (isPrivateOrReservedIp(record.address)) {
+      throw new HttpError(400, "This URL is not allowed", "FEED_URL_BLOCKED");
+    }
+  }
+
+  return parsed;
+}
+
+/**
+ * Télécharge un feed en limitant strictement :
+ *  - protocole (http/https)
+ *  - hostname (pas de localhost / .internal / .lan)
+ *  - résolution DNS (pas d'IP privée / loopback / link-local / CGNAT / metadata)
+ *  - chaque redirection est revalidée
+ *  - taille max (streaming + coupure)
+ *  - timeout global
+ */
+async function fetchFeedBuffer(rawUrl) {
+  let current = await assertSafeFeedUrl(rawUrl);
+
+  for (let hop = 0; hop <= FEED_MAX_REDIRECTS; hop++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
+
+    let response;
+    try {
+      response = await fetch(current.toString(), {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          "User-Agent": FEED_USER_AGENT,
+          Accept:
+            "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        },
+        signal: controller.signal,
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      if (error?.name === "AbortError") {
+        throw new HttpError(504, "Feed source timed out", "FEED_TIMEOUT");
+      }
+      throw new HttpError(502, "Could not reach the feed source", "FEED_UNREACHABLE");
+    }
+
+    // Redirection manuelle → on revalide l'URL cible
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      clearTimeout(timer);
+
+      if (!location) {
+        throw new HttpError(502, "Feed source returned an invalid redirect", "FEED_BAD_REDIRECT");
+      }
+
+      try {
+        current = new URL(location, current);
+      } catch {
+        throw new HttpError(502, "Feed source returned an invalid redirect", "FEED_BAD_REDIRECT");
+      }
+
+      current = await assertSafeFeedUrl(current.toString());
+      continue;
+    }
+
+    if (!response.ok) {
+      clearTimeout(timer);
+      throw new HttpError(
+        response.status === 404 ? 404 : 502,
+        `Feed source returned HTTP ${response.status}`,
+        "FEED_UPSTREAM_ERROR"
+      );
+    }
+
+    const declared = Number(response.headers.get("content-length") || 0);
+    if (declared > FEED_MAX_BYTES) {
+      clearTimeout(timer);
+      throw tooLargeError("Feed is too large");
+    }
+
+    let buffer;
+    try {
+      const reader = response.body?.getReader();
+
+      if (!reader) {
+        buffer = Buffer.from(await response.arrayBuffer());
+      } else {
+        const chunks = [];
+        let total = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          total += value.length;
+          if (total > FEED_MAX_BYTES) {
+            try { await reader.cancel(); } catch { /* ignore */ }
+            throw tooLargeError("Feed is too large");
+          }
+
+          chunks.push(Buffer.from(value));
+        }
+
+        buffer = Buffer.concat(chunks);
+      }
+    } catch (error) {
+      clearTimeout(timer);
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(502, "Could not read the feed", "FEED_READ_FAILED");
+    }
+
+    clearTimeout(timer);
+
+    if (buffer.length === 0) {
+      throw new HttpError(502, "Feed source returned an empty body", "FEED_EMPTY");
+    }
+
+    return buffer;
+  }
+
+  throw new HttpError(502, "Too many redirects", "FEED_TOO_MANY_REDIRECTS");
+}
+
+// ============================================================
 // ROUTEUR
 // ============================================================
 
@@ -4454,8 +4727,27 @@ route("GET", "/api/health", ({ res }) => {
     dropbox: dropboxEnabled,
     tags: true,
     saved_replies: true,
+    feed: true,
   });
 });
+
+// ============================================================
+// ROUTES — FEED PROXY (RSS / Atom)
+// ============================================================
+
+route("GET", "/api/feed", async ({ req, res, url }) => {
+  enforce(limiterFeed, `feed:${getClientIp(req)}`);
+
+  const target = url.searchParams.get("url");
+
+  if (!target || target.length > FEED_URL_MAX) {
+    throw new HttpError(400, "Missing or invalid url parameter", "INVALID_FEED_URL");
+  }
+
+  const buffer = await fetchFeedBuffer(target);
+
+  sendXml(res, 200, buffer);
+}, { auth: true });
 
 // ============================================================
 // ROUTES — AUTH
@@ -7643,6 +7935,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
+  console.log(`  Feed proxy      : /api/feed (max ${FEED_MAX_BYTES / 1024 / 1024} MB, timeout ${FEED_TIMEOUT_MS} ms, ${FEED_RATE_LIMIT_PER_MIN}/min)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
 
   if (tiktokEnabled) {
