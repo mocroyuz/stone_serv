@@ -50,6 +50,10 @@
 //                  FEED_TIMEOUT_MS (défaut : 15000),
 //                  FEED_MAX_REDIRECTS (défaut : 3),
 //                  FEED_RATE_LIMIT_PER_MIN (défaut : 30)
+//
+// ⚠️ La route /api/feed est PUBLIQUE (pas d'auth), protégée par :
+//    - rate limit par IP (limiterFeed, FEED_RATE_LIMIT_PER_MIN/min)
+//    - protection SSRF (fetchFeedBuffer : DNS + IP checks + redirects revalidés)
 // ============================================================
 
 import { fileURLToPath } from "node:url";
@@ -4734,7 +4738,13 @@ route("GET", "/api/health", ({ res }) => {
 // ============================================================
 // ROUTES — FEED PROXY (RSS / Atom)
 // ============================================================
-// Pas d'auth : rate limit par IP (limiterFeed) + protection SSRF (fetchFeedBuffer).
+// ⚠️ Route PUBLIQUE — pas d'auth requise.
+// Protections actives :
+//   • rate limit par IP via limiterFeed (enforce(limiterFeed, `feed:${ip}`))
+//   • protection SSRF via fetchFeedBuffer (DNS + IP checks + redirects revalidés)
+//   • timeout, taille max, content-type allowlist
+// Le frontend peut désormais appeler rss2json.com directement ; cette route
+// reste disponible comme fallback serveur (proxy SSRF-safe).
 
 route("GET", "/api/feed", async ({ req, res, url }) => {
   enforce(limiterFeed, `feed:${getClientIp(req)}`);
@@ -7936,7 +7946,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
-  console.log(`  Feed proxy      : /api/feed (public, rate limit par IP · max ${FEED_MAX_BYTES / 1024 / 1024} MB, timeout ${FEED_TIMEOUT_MS} ms, ${FEED_RATE_LIMIT_PER_MIN}/min)`);
+  console.log(`  Feed proxy      : /api/feed PUBLIC · rate limit par IP (${FEED_RATE_LIMIT_PER_MIN}/min) · SSRF-safe · max ${FEED_MAX_BYTES / 1024 / 1024} MB · timeout ${FEED_TIMEOUT_MS} ms`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
 
   if (tiktokEnabled) {
