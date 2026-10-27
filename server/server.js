@@ -4734,6 +4734,7 @@ route("GET", "/api/health", ({ res }) => {
 // ============================================================
 // ROUTES — FEED PROXY (RSS / Atom)
 // ============================================================
+// Pas d'auth : rate limit par IP (limiterFeed) + protection SSRF (fetchFeedBuffer).
 
 route("GET", "/api/feed", async ({ req, res, url }) => {
   enforce(limiterFeed, `feed:${getClientIp(req)}`);
@@ -4747,7 +4748,7 @@ route("GET", "/api/feed", async ({ req, res, url }) => {
   const buffer = await fetchFeedBuffer(target);
 
   sendXml(res, 200, buffer);
-}, { auth: true });
+});
 
 // ============================================================
 // ROUTES — AUTH
@@ -7935,7 +7936,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
-  console.log(`  Feed proxy      : /api/feed (max ${FEED_MAX_BYTES / 1024 / 1024} MB, timeout ${FEED_TIMEOUT_MS} ms, ${FEED_RATE_LIMIT_PER_MIN}/min)`);
+  console.log(`  Feed proxy      : /api/feed (public, rate limit par IP · max ${FEED_MAX_BYTES / 1024 / 1024} MB, timeout ${FEED_TIMEOUT_MS} ms, ${FEED_RATE_LIMIT_PER_MIN}/min)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
 
   if (tiktokEnabled) {
