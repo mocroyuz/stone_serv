@@ -479,6 +479,16 @@ const MAX_TIKTOK_PHOTOS = 35;
 const MAX_PHOTO_SIZE = 10 * 1024 * 1024;
 const MAX_PHOTOS_TOTAL = 80 * 1024 * 1024;
 
+// ============================================================
+// ✅ NOUVEAU — CONFIGURATION POST MEDIA (intégration /api/posts)
+// ============================================================
+
+const POST_MEDIA_BUCKET = "post-media";
+const MAX_POST_FILES = 60;
+const MAX_POST_FILE_SIZE = 100 * 1024 * 1024;
+const MAX_POST_UPLOAD_TOTAL = 500 * 1024 * 1024;
+const POSTS_PUBLISH_INTERVAL_MS = 30_000;
+
 function publicApiLooksLikeFrontend() {
   if (!PUBLIC_API_URL) return false;
 
@@ -1071,6 +1081,9 @@ const limiterApi = createRateLimiter({ windowMs: 60 * 1000, max: 240, label: "ap
 const limiterAccount = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "account" });
 const limiterPublish = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, label: "publish" });
 
+// ✅ NOUVEAU — rate limiter dédié à la création de posts planifiés
+const limiterPosts = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 60, label: "posts" });
+
 const limiterPasswordReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 3, label: "password-reset" });
 
 const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "media" });
@@ -1534,6 +1547,118 @@ function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
       }
 
       if (files.length === 0) {
+        settle(reject, new HttpError(400, "No file", "NO_FILE"));
+        return;
+      }
+
+      settle(resolve, { files, fields });
+    });
+
+    bb.on("error", () =>
+      settle(reject, new HttpError(400, "Could not read the uploaded files."))
+    );
+
+    req.on("close", () => {
+      if (!req.complete) {
+        settle(reject, new HttpError(400, "Upload aborted"));
+      }
+    });
+    req.on("error", () => settle(reject, new HttpError(400, "Upload aborted")));
+
+    req.pipe(bb);
+  });
+}
+
+// ------------------------------------------------------------
+// ✅ NOUVEAU — parseMultipartAny : équivalent `multer.any()`
+//
+// Accepte n'importe quel `fieldname` (media, media_tiktok,
+// media_youtube, etc.) et retourne tous les fichiers avec leur
+// `fieldname`. Utilisé par POST /api/posts.
+// ------------------------------------------------------------
+function parseMultipartAny(
+  req,
+  {
+    maxFiles = MAX_POST_FILES,
+    maxFileSize = MAX_POST_FILE_SIZE,
+    maxFieldSize = 1024 * 1024, // 1 Mo pour le champ `data` (JSON)
+    requireFile = false,
+  } = {}
+) {
+  return new Promise((resolve, reject) => {
+    let bb;
+
+    try {
+      bb = busboy({
+        headers: req.headers,
+        limits: {
+          fileSize: maxFileSize,
+          files: maxFiles,
+          fields: 20,
+          fieldSize: maxFieldSize,
+          parts: maxFiles + 40,
+        },
+      });
+    } catch {
+      reject(new HttpError(400, "Invalid multipart request"));
+      return;
+    }
+
+    const fields = {};
+    const files = [];
+    let tooLarge = false;
+    let tooMany = false;
+    let settled = false;
+
+    const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      fn(arg);
+    };
+
+    bb.on("file", (fieldname, file, info) => {
+      const chunks = [];
+
+      file.on("data", (chunk) => chunks.push(chunk));
+      file.on("limit", () => {
+        tooLarge = true;
+      });
+      file.on("end", () => {
+        if (tooLarge) return; // ignore le fichier tronqué
+        files.push({
+          fieldname,
+          buffer: Buffer.concat(chunks),
+          mimeType: info?.mimeType || "",
+          fileName: info?.filename || "",
+        });
+      });
+    });
+
+    bb.on("field", (name, value) => {
+      // dernier gagne si plusieurs valeurs (comportement multer classique)
+      fields[name] = value;
+    });
+
+    bb.on("filesLimit", () => {
+      tooMany = true;
+    });
+
+    bb.on("partsLimit", () =>
+      settle(reject, new HttpError(400, "Too many fields", "TOO_MANY_FIELDS"))
+    );
+
+    bb.on("close", () => {
+      if (tooLarge) {
+        settle(reject, new HttpError(400, "File too large", "FILE_TOO_LARGE"));
+        return;
+      }
+
+      if (tooMany) {
+        settle(reject, new HttpError(400, "Too many files", "TOO_MANY_FILES"));
+        return;
+      }
+
+      if (requireFile && files.length === 0) {
         settle(reject, new HttpError(400, "No file", "NO_FILE"));
         return;
       }
@@ -3114,6 +3239,17 @@ async function ensureTikTokMediaBucket() {
   }
 }
 
+// ------------------------------------------------------------
+// ✅ NOUVEAU — bucket public pour les médias de posts planifiés
+// ------------------------------------------------------------
+async function ensurePostMediaBucket() {
+  const { error } = await supabaseAdmin.storage.createBucket(POST_MEDIA_BUCKET, { public: true });
+
+  if (error && !/already exists|duplicate/i.test(error.message || "")) {
+    console.warn("Post media bucket:", error.message);
+  }
+}
+
 async function sweepTikTokMedia() {
   try {
     const { data, error } = await supabaseAdmin.storage
@@ -4454,6 +4590,7 @@ route("GET", "/api/health", ({ res }) => {
     dropbox: dropboxEnabled,
     tags: true,
     saved_replies: true,
+    posts: true,
   });
 });
 
@@ -5638,6 +5775,205 @@ route("DELETE", "/api/saved-replies", async ({ req, res, url, user }) => {
   if (!data) throw new HttpError(404, "Saved reply not found", "SAVED_REPLY_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
+// ============================================================
+// ✅ NOUVEAU — ROUTES — SCHEDULED POSTS
+// ============================================================
+//
+// Équivalent natif du fichier multer :
+//   POST   /api/posts   (multipart, `upload.any()`)
+//   GET    /api/posts
+//   DELETE /api/posts
+//
+// Le champ `data` contient le JSON de configuration, les fichiers
+// sont nommés `media` (partagés) ou `media_<network>` (par réseau).
+// Les médias sont stockés dans le bucket public `post-media`.
+// ------------------------------------------------------------
+
+function sanitizePostExtension(fileName) {
+  const raw = String(fileName || "").split(".").pop() || "";
+  const ext = raw.toLowerCase();
+  return /^[a-z0-9]{1,10}$/.test(ext) ? ext : "bin";
+}
+
+async function uploadPostFile(userId, file) {
+  const ext = sanitizePostExtension(file.fileName);
+  const objectPath = `${userId}/${crypto.randomUUID()}.${ext}`;
+  const mimeType = file.mimeType || "application/octet-stream";
+
+  const { error } = await supabaseAdmin.storage
+    .from(POST_MEDIA_BUCKET)
+    .upload(objectPath, file.buffer, { contentType: mimeType });
+
+  if (error) throw error;
+
+  const { data: pub } = supabaseAdmin.storage.from(POST_MEDIA_BUCKET).getPublicUrl(objectPath);
+
+  return {
+    url: pub.publicUrl,
+    path: objectPath,
+    kind: mimeType.startsWith("video/") ? "video" : "image",
+  };
+}
+
+route("POST", "/api/posts", async ({ req, res, user }) => {
+  enforce(limiterPosts, `posts:${user.id}`);
+
+  const declared = Number(req.headers["content-length"] || 0);
+  if (declared > MAX_POST_UPLOAD_TOTAL + 2 * 1024 * 1024) {
+    throw tooLargeError("Post media is too large.");
+  }
+
+  let upload;
+  try {
+    upload = await parseMultipartAny(req, {
+      maxFiles: MAX_POST_FILES,
+      maxFileSize: MAX_POST_FILE_SIZE,
+    });
+  } catch (error) {
+    if (error?.code === "FILE_TOO_LARGE") {
+      throw new HttpError(
+        400,
+        `Each file must be under ${MAX_POST_FILE_SIZE / 1024 / 1024} MB.`,
+        "FILE_TOO_LARGE"
+      );
+    }
+    if (error?.code === "TOO_MANY_FILES") {
+      throw new HttpError(
+        400,
+        `Posts are limited to ${MAX_POST_FILES} files.`,
+        "TOO_MANY_FILES"
+      );
+    }
+    throw error instanceof HttpError ? error : new HttpError(400, "Could not read the uploaded files.");
+  }
+
+  let data;
+  try {
+    data = JSON.parse(upload.fields.data || "{}");
+  } catch {
+    throw new HttpError(400, "Invalid data JSON", "INVALID_DATA_JSON");
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new HttpError(400, "Invalid data payload", "INVALID_DATA_PAYLOAD");
+  }
+
+  const userId = user.id;
+  const files = upload.files;
+  const external = Array.isArray(data.externalNetworks) ? data.externalNetworks : [];
+  const networks = [
+    ...(Array.isArray(data.networks) ? data.networks : []),
+    ...external,
+  ];
+
+  if (networks.length === 0) {
+    throw new HttpError(400, "At least one network is required", "NO_NETWORK");
+  }
+
+  // Upload des médias partagés (fieldname === "media") une seule fois
+  const shared = await Promise.all(
+    files.filter((f) => f.fieldname === "media").map((f) => uploadPostFile(userId, f))
+  );
+
+  const contents = data.contents && typeof data.contents === "object" ? data.contents : {};
+  const channelKeys = data.channelKeys && typeof data.channelKeys === "object" ? data.channelKeys : {};
+
+  let scheduledAt = null;
+  if (data.scheduleMode === "later") {
+    const parsed = new Date(data.scheduledAt);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new HttpError(400, "Invalid scheduledAt", "INVALID_SCHEDULED_AT");
+    }
+    scheduledAt = parsed.toISOString();
+  } else if (data.scheduleMode === "now") {
+    scheduledAt = new Date().toISOString();
+  }
+
+  const rows = [];
+  for (const network of networks) {
+    const own = files.filter((f) => f.fieldname === `media_${network}`);
+    const media = own.length
+      ? await Promise.all(own.map((f) => uploadPostFile(userId, f)))
+      : shared;
+
+    rows.push({
+      user_id: userId,
+      network,
+      channel_key: channelKeys[network] ?? null,
+      title: String(data.title || "").slice(0, 500),
+      content: String(contents[network] ?? ""),
+      scheduled_at: scheduledAt,
+      status:
+        data.scheduleMode === "save_in_folder"
+          ? "draft"
+          : external.includes(network)
+          ? "external"
+          : "scheduled",
+      media,
+      tag_ids: Array.isArray(data.tagIds) ? data.tagIds : [],
+      options: network === "youtube" ? data.youtube ?? null : null,
+    });
+  }
+
+  const { data: inserted, error } = await supabaseAdmin
+    .from("scheduled_posts")
+    .insert(rows)
+    .select();
+
+  if (error) throw dbError("scheduled_posts.insert", error);
+
+  sendJson(res, 200, { success: true, posts: inserted });
+}, { auth: true });
+
+route("GET", "/api/posts", async ({ res, url, user }) => {
+  let q = supabaseAdmin
+    .from("scheduled_posts")
+    .select("*")
+    .eq("user_id", user.id) // service role : filtrer explicitement par user
+    .not("scheduled_at", "is", null)
+    .order("scheduled_at");
+
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+  if (from) q = q.gte("scheduled_at", from);
+  if (to) q = q.lt("scheduled_at", to);
+
+  const { data, error } = await q;
+  if (error) throw dbError("scheduled_posts.list", error);
+
+  sendJson(res, 200, { success: true, posts: data });
+}, { auth: true });
+
+route("DELETE", "/api/posts", async ({ res, url, user }) => {
+  const id = url.searchParams.get("id");
+  if (!id) throw new HttpError(400, "Missing post id", "POST_ID_REQUIRED");
+
+  const { error } = await supabaseAdmin
+    .from("scheduled_posts")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", user.id);
+
+  if (error) throw dbError("scheduled_posts.delete", error);
+
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
+// ------------------------------------------------------------
+// ✅ NOUVEAU — transition périodique scheduled/external → published
+// ------------------------------------------------------------
+async function publishDueScheduledPosts() {
+  const nowIso = new Date().toISOString();
+  const { error } = await supabaseAdmin
+    .from("scheduled_posts")
+    .update({ status: "published" })
+    .in("status", ["scheduled", "external"])
+    .lte("scheduled_at", nowIso);
+
+  if (error) {
+    console.warn("[posts] status refresh failed:", error.message);
+  }
+}
 
 // ============================================================
 // ROUTES — UTILISATEUR
@@ -7643,7 +7979,24 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
+  console.log(`  Scheduled posts : activé (${MAX_POST_FILES} fichiers max / post, ${MAX_POST_FILE_SIZE / 1024 / 1024} MB par fichier)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
+
+  // ✅ NOUVEAU — initialisation du bucket pour les posts
+  try {
+    await ensurePostMediaBucket();
+    console.log(`  Post media      : bucket "${POST_MEDIA_BUCKET}" prêt`);
+  } catch (error) {
+    console.warn(`  Post media      : initialisation échouée (${error?.message || error})`);
+  }
+
+  // ✅ NOUVEAU — timer de transition scheduled/external → published
+  const postsTimer = setInterval(() => {
+    void publishDueScheduledPosts();
+  }, POSTS_PUBLISH_INTERVAL_MS);
+  postsTimer.unref?.();
+  // premier passage rapide (5 s après démarrage)
+  setTimeout(() => void publishDueScheduledPosts(), 5_000).unref?.();
 
   if (tiktokEnabled) {
     try {
