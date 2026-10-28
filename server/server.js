@@ -602,6 +602,14 @@ const YOUTUBE_TITLE_MAX = 100;
 const YOUTUBE_DESCRIPTION_MAX_BYTES = 5000;
 const YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload";
 
+// ✅ NOUVEAU — lecture YouTube (vidéos + commentaires)
+const YOUTUBE_READ_SCOPES = [
+  "https://www.googleapis.com/auth/youtube.readonly",
+  "https://www.googleapis.com/auth/youtube.force-ssl",
+];
+const YOUTUBE_ID_PATTERN = /^[\w-]{1,64}$/;
+const YOUTUBE_COMMENT_FILTERS = new Set(["all", "unanswered", "answered"]);
+
 // ============================================================
 // CONFIGURATION GOOGLE DRIVE
 // ============================================================
@@ -1094,6 +1102,13 @@ const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, l
 const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "gdrive" });
 const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
 const limiterTags = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "tags" });
+
+// ✅ NOUVEAU — rate limiter dédié à la lecture YouTube (vidéos + commentaires)
+const limiterYouTubeRead = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 60,
+  label: "youtube-read",
+});
 
 // ------------------------------------------------------------
 // BLOC 2 — Rate limiter saved replies
@@ -3971,6 +3986,72 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
       }
     }
   }
+}
+
+// ------------------------------------------------------------
+// ✅ NOUVEAU — YOUTUBE — LECTURE DES VIDÉOS & COMMENTAIRES
+// ------------------------------------------------------------
+
+async function youtubeGet(pathname, params, token) {
+  const query = new URLSearchParams(params).toString();
+  let result;
+
+  try {
+    result = await fetchJson(
+      `${YOUTUBE_API_BASE}${pathname}?${query}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } },
+      20_000
+    );
+  } catch (error) {
+    throw upstreamError("YouTube", error);
+  }
+
+  if (!result.response.ok) throw youtubeApiError(result.response.status, result.data);
+  return result.data;
+}
+
+async function getYouTubeReader(userId) {
+  const account = await getYouTubeAccount(userId);
+  if (!account) {
+    throw new HttpError(400, "YouTube account not connected", "YOUTUBE_NOT_CONNECTED");
+  }
+
+  const scopes = String(account.scope || "").split(/[\s,]+/);
+  if (!scopes.some((s) => YOUTUBE_READ_SCOPES.includes(s))) {
+    throw new HttpError(
+      409,
+      "YouTube permission missing, please reconnect your YouTube account.",
+      "YOUTUBE_SCOPE_MISSING"
+    );
+  }
+  if (!account.channel_id) {
+    throw new HttpError(409, "YouTube channel unknown, please reconnect.", "YOUTUBE_CHANNEL_MISSING");
+  }
+
+  const token = await getValidYouTubeToken(userId);
+  return { token, channelId: account.channel_id };
+}
+
+function formatYouTubeThread(item, channelId) {
+  const top = item.snippet?.topLevelComment?.snippet || {};
+  const replies = item.replies?.comments || [];
+  const authorChannelId = top.authorChannelId?.value || null;
+
+  return {
+    id: item.id,
+    video_id: item.snippet?.videoId || top.videoId || null,
+    text: top.textDisplay || top.textOriginal || "",
+    author_name: top.authorDisplayName || "",
+    author_avatar: top.authorProfileImageUrl || null,
+    author_channel_id: authorChannelId,
+    published_at: top.publishedAt || null,
+    like_count: Number(top.likeCount || 0),
+    reply_count: Number(item.snippet?.totalReplyCount || 0),
+    // « répondu » = la chaîne a répondu dans les réponses renvoyées par l'API
+    answered: replies.some((r) => r.snippet?.authorChannelId?.value === channelId),
+    is_own: authorChannelId === channelId,
+    can_reply: Boolean(item.snippet?.canReply),
+  };
 }
 
 // ============================================================
@@ -6985,6 +7066,111 @@ route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
   sendJson(res, 200, { success: true });
 }, { auth: true });
 
+// ------------------------------------------------------------
+// ✅ NOUVEAU — YOUTUBE — ROUTES DE LECTURE (vidéos + commentaires)
+// ------------------------------------------------------------
+
+// Liste des vidéos de la chaîne (panneau « Posts »)
+route("GET", "/api/youtube/videos", async ({ res, url, user }) => {
+  enforce(limiterYouTubeRead, `youtube-read:${user.id}`);
+
+  const { token, channelId } = await getYouTubeReader(user.id);
+  const pageToken = url.searchParams.get("pageToken");
+
+  // La playlist « uploads » d'une chaîne = "UU" + channelId sans le "UC"
+  const uploadsPlaylistId = `UU${channelId.slice(2)}`;
+
+  const playlist = await youtubeGet(
+    "/playlistItems",
+    {
+      part: "contentDetails",
+      playlistId: uploadsPlaylistId,
+      maxResults: "50",
+      ...(pageToken ? { pageToken: String(pageToken).slice(0, 2048) } : {}),
+    },
+    token
+  );
+
+  const ids = (playlist.items || [])
+    .map((i) => i.contentDetails?.videoId)
+    .filter((id) => typeof id === "string" && YOUTUBE_ID_PATTERN.test(id));
+
+  let videos = [];
+  if (ids.length > 0) {
+    const data = await youtubeGet(
+      "/videos",
+      { part: "snippet,statistics", id: ids.join(","), maxResults: "50" },
+      token
+    );
+    videos = (data.items || []).map((v) => ({
+      id: v.id,
+      title: v.snippet?.title || "",
+      thumbnail:
+        v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
+      published_at: v.snippet?.publishedAt || null,
+      comment_count: Number(v.statistics?.commentCount || 0),
+    }));
+  }
+
+  sendJson(res, 200, {
+    success: true,
+    videos,
+    next_page_token: playlist.nextPageToken || null,
+  });
+}, { auth: true });
+
+// Commentaires (toute la chaîne, ou une vidéo si videoId est fourni)
+route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
+  enforce(limiterYouTubeRead, `youtube-read:${user.id}`);
+
+  const filter = url.searchParams.get("filter") || "all";
+  if (!YOUTUBE_COMMENT_FILTERS.has(filter)) {
+    throw new HttpError(400, "Invalid filter", "INVALID_FILTER");
+  }
+
+  const videoId = url.searchParams.get("videoId");
+  if (videoId && !YOUTUBE_ID_PATTERN.test(videoId)) {
+    throw new HttpError(400, "Invalid videoId", "INVALID_VIDEO_ID");
+  }
+
+  const pageToken = url.searchParams.get("pageToken");
+  const { token, channelId } = await getYouTubeReader(user.id);
+
+  const params = {
+    part: "snippet,replies",
+    maxResults: "50",
+    order: "time",
+    textFormat: "plainText",
+    ...(videoId ? { videoId } : { allThreadsRelatedToChannelId: channelId }),
+    ...(pageToken ? { pageToken: String(pageToken).slice(0, 2048) } : {}),
+  };
+
+  let data;
+  try {
+    data = await youtubeGet("/commentThreads", params, token);
+  } catch (error) {
+    // Vidéo dont les commentaires sont désactivés → liste vide, pas une erreur
+    if (error instanceof HttpError && error.code === "commentsDisabled") {
+      sendJson(res, 200, { success: true, comments: [], next_page_token: null });
+      return;
+    }
+    throw error;
+  }
+
+  const comments = (data.items || [])
+    .map((item) => formatYouTubeThread(item, channelId))
+    .filter((c) => !c.is_own)
+    .filter((c) =>
+      filter === "all" ? true : filter === "answered" ? c.answered : !c.answered
+    );
+
+  sendJson(res, 200, {
+    success: true,
+    comments,
+    next_page_token: data.nextPageToken || null,
+  });
+}, { auth: true });
+
 // ============================================================
 // GOOGLE DRIVE ROUTES
 // ============================================================
@@ -7973,6 +8159,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  TikTok photos   : ${PUBLIC_API_URL ? PUBLIC_API_URL : "désactivé"}${PUBLIC_API_URL_SOURCE ? ` (via ${publicApiSourceLabel(PUBLIC_API_URL_SOURCE)})` : ""}`);
   console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
   console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
+  console.log(`  YouTube read    : ${youtubeEnabled ? "vidéos + commentaires activés" : "désactivé"}`);
   console.log(`  Google Drive    : ${gdriveEnabled ? "activé" : "désactivé"}`);
   console.log(`  Google Photos   : ${gphotosEnabled ? "activé" : "désactivé"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
