@@ -580,9 +580,12 @@ const YOUTUBE_CLIENT_SECRET = env("YOUTUBE_CLIENT_SECRET");
 const YOUTUBE_REDIRECT_URI =
   env("YOUTUBE_REDIRECT_URI") || `${APP_URL}/youtube/callback`;
 
+// ✅ force-ssl est désormais demandé par défaut : il est requis pour
+// répondre aux commentaires et pour toute opération d'écriture
+// (insert/update/delete de commentThreads).
 const YOUTUBE_SCOPES = (
   env("YOUTUBE_SCOPES") ||
-  "https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload"
+  "https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl"
 )
   .split(/[\s,]+/)
   .filter(Boolean)
@@ -607,6 +610,8 @@ const YOUTUBE_READ_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
   "https://www.googleapis.com/auth/youtube.force-ssl",
 ];
+const YOUTUBE_FORCE_SSL_SCOPE =
+  "https://www.googleapis.com/auth/youtube.force-ssl";
 const YOUTUBE_ID_PATTERN = /^[\w-]{1,64}$/;
 const YOUTUBE_COMMENT_FILTERS = new Set(["all", "unanswered", "answered"]);
 
@@ -3794,7 +3799,7 @@ function youtubeApiError(status, data) {
     return reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
   }
 
-  // ✅ NOUVEAU — log l'erreur Google brute pour distinguer
+  // ✅ Log de l'erreur Google brute pour distinguer
   // « scope non stocké en base » de « scope refusé par Google ».
   console.warn("[youtube] erreur Google :", status, JSON.stringify(data?.error || data).slice(0, 400));
 
@@ -3991,7 +3996,7 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 }
 
 // ------------------------------------------------------------
-// ✅ NOUVEAU — YOUTUBE — LECTURE DES VIDÉOS & COMMENTAIRES
+// ✅ YOUTUBE — LECTURE DES VIDÉOS & COMMENTAIRES
 // ------------------------------------------------------------
 
 async function youtubeGet(pathname, params, token) {
@@ -4012,21 +4017,24 @@ async function youtubeGet(pathname, params, token) {
   return result.data;
 }
 
-async function getYouTubeReader(userId) {
+// ✅ `comments: true` → exige explicitement le scope force-ssl
+// (nécessaire pour lire les commentaires ET pour y répondre).
+async function getYouTubeReader(userId, { comments = false } = {}) {
   const account = await getYouTubeAccount(userId);
   if (!account) {
     throw new HttpError(400, "YouTube account not connected", "YOUTUBE_NOT_CONNECTED");
   }
 
-const scopes = String(account.scope || "").split(/[\s,]+/).filter(Boolean);
-if (!scopes.some((s) => YOUTUBE_READ_SCOPES.includes(s))) {
-  console.warn("[youtube] scope en base :", JSON.stringify(account.scope));
-  throw new HttpError(
-    409,
-    `DB scopes sans lecture (stockés : ${scopes.join(", ") || "aucun"})`,
-    "YOUTUBE_SCOPE_NOT_STORED"
-  );
-}
+  const scopes = String(account.scope || "").split(/[\s,]+/).filter(Boolean);
+  const needed = comments ? [YOUTUBE_FORCE_SSL_SCOPE] : YOUTUBE_READ_SCOPES;
+
+  if (!scopes.some((s) => needed.includes(s))) {
+    throw new HttpError(
+      409,
+      "YouTube permission missing, please reconnect your YouTube account.",
+      "YOUTUBE_SCOPE_MISSING"
+    );
+  }
   if (!account.channel_id) {
     throw new HttpError(409, "YouTube channel unknown, please reconnect.", "YOUTUBE_CHANNEL_MISSING");
   }
@@ -7070,7 +7078,7 @@ route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
 }, { auth: true });
 
 // ------------------------------------------------------------
-// ✅ NOUVEAU — YOUTUBE — ROUTES DE LECTURE (vidéos + commentaires)
+// ✅ YOUTUBE — ROUTES DE LECTURE (vidéos + commentaires)
 // ------------------------------------------------------------
 
 // Liste des vidéos de la chaîne (panneau « Posts »)
@@ -7123,6 +7131,7 @@ route("GET", "/api/youtube/videos", async ({ res, url, user }) => {
 }, { auth: true });
 
 // Commentaires (toute la chaîne, ou une vidéo si videoId est fourni)
+// → exige explicitement le scope force-ssl (comments: true).
 route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
   enforce(limiterYouTubeRead, `youtube-read:${user.id}`);
 
@@ -7137,7 +7146,7 @@ route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
   }
 
   const pageToken = url.searchParams.get("pageToken");
-  const { token, channelId } = await getYouTubeReader(user.id);
+  const { token, channelId } = await getYouTubeReader(user.id, { comments: true });
 
   const params = {
     part: "snippet,replies",
@@ -8174,6 +8183,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Pinterest       : ${pinterestUsable ? PINTEREST_ENVIRONMENT.toUpperCase() : "désactivé"}`);
   console.log(`  YouTube publish : ${youtubeEnabled && YOUTUBE_SCOPES.split(" ").includes(YOUTUBE_UPLOAD_SCOPE) ? "activée" : "désactivée"}`);
   console.log(`  YouTube read    : ${youtubeEnabled ? "vidéos + commentaires activés" : "désactivé"}`);
+  console.log(`  YouTube scopes  : ${YOUTUBE_SCOPES}`);
   console.log(`  Google Drive    : ${gdriveEnabled ? "activé" : "désactivé"}`);
   console.log(`  Google Photos   : ${gphotosEnabled ? "activé" : "désactivé"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
