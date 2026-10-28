@@ -1211,7 +1211,7 @@ function setCorsHeaders(req, res) {
     if (isOriginAllowed(origin)) {
       res.setHeader("Access-Control-Allow-Origin", normalizeOrigin(origin));
       res.setHeader("Access-Control-Allow-Credentials", "true");
-      res.setHeader("Access-Control-Expose-Headers", "Retry-After");
+      res.setHeader("Access-Control-Expose-Headers", "Retry-After, X-Stone-Server");
     } else if (
       warnedRejectedOrigins.size < 100 &&
       !warnedRejectedOrigins.has(origin)
@@ -1234,6 +1234,9 @@ function setSecurityHeaders(res) {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Cache-Control", "no-store");
+  // ✅ NOUVEAU — diagnostic : permet de vérifier depuis le frontend
+  // que la réponse vient bien de CE serveur (et pas d'un SPA fallback).
+  res.setHeader("X-Stone-Server", "1");
   res.setHeader(
     "Content-Security-Policy",
     "default-src 'none'; frame-ancestors 'none'"
@@ -1586,10 +1589,6 @@ function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
 
 // ------------------------------------------------------------
 // ✅ NOUVEAU — parseMultipartAny : équivalent `multer.any()`
-//
-// Accepte n'importe quel `fieldname` (media, media_tiktok,
-// media_youtube, etc.) et retourne tous les fichiers avec leur
-// `fieldname`. Utilisé par POST /api/posts.
 // ------------------------------------------------------------
 function parseMultipartAny(
   req,
@@ -1650,7 +1649,6 @@ function parseMultipartAny(
     });
 
     bb.on("field", (name, value) => {
-      // dernier gagne si plusieurs valeurs (comportement multer classique)
       fields[name] = value;
     });
 
@@ -8021,6 +8019,17 @@ const providerGuards = [
 const server = createServer(async (req, res) => {
   const requestId = newRequestId();
 
+  // ✅ NOUVEAU — diagnostic : prouve dans les logs que la requête
+  // atteint bien CE serveur. Si la ligne n'apparaît pas quand le
+  // frontend appelle /api/youtube/videos, c'est que la requête est
+  // interceptée ailleurs (SPA fallback, proxy mal configuré…).
+  console.log(
+    `[${requestId}] → ${req.method} ${req.url} origin=${req.headers.origin || "-"} host=${req.headers.host || "-"}`
+  );
+  res.on("finish", () => {
+    console.log(`[${requestId}] ← ${res.statusCode} ${req.method} ${req.url}`);
+  });
+
   setSecurityHeaders(res);
 
   try {
@@ -8168,6 +8177,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
   console.log(`  Scheduled posts : activé (${MAX_POST_FILES} fichiers max / post, ${MAX_POST_FILE_SIZE / 1024 / 1024} MB par fichier)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
+  console.log(`  Diagnostic      : en-tête X-Stone-Server: 1 ajouté à toutes les réponses`);
 
   // ✅ NOUVEAU — initialisation du bucket pour les posts
   try {
