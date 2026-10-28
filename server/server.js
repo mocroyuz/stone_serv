@@ -580,7 +580,7 @@ const YOUTUBE_CLIENT_SECRET = env("YOUTUBE_CLIENT_SECRET");
 const YOUTUBE_REDIRECT_URI =
   env("YOUTUBE_REDIRECT_URI") || `${APP_URL}/youtube/callback`;
 
-// ✅ force-ssl est désormais demandé par défaut : il est requis pour
+// force-ssl est désormais demandé par défaut : il est requis pour
 // répondre aux commentaires et pour toute opération d'écriture
 // (insert/update/delete de commentThreads).
 const YOUTUBE_SCOPES = (
@@ -605,15 +605,18 @@ const YOUTUBE_TITLE_MAX = 100;
 const YOUTUBE_DESCRIPTION_MAX_BYTES = 5000;
 const YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload";
 
-// ✅ NOUVEAU — lecture YouTube (vidéos + commentaires)
+// ✅ Lecture YouTube (vidéos + commentaires)
 const YOUTUBE_READ_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
   "https://www.googleapis.com/auth/youtube.force-ssl",
 ];
 const YOUTUBE_FORCE_SSL_SCOPE =
   "https://www.googleapis.com/auth/youtube.force-ssl";
+
+// ✅ Patterns / filtres mis à jour
 const YOUTUBE_ID_PATTERN = /^[\w-]{1,64}$/;
-const YOUTUBE_COMMENT_FILTERS = new Set(["all", "unanswered", "answered"]);
+const YOUTUBE_COMMENT_ID_PATTERN = /^[\w.-]{1,128}$/;
+const YOUTUBE_COMMENT_FILTERS = new Set(["all", "unanswered", "answered", "unread"]);
 
 // ============================================================
 // CONFIGURATION GOOGLE DRIVE
@@ -1094,7 +1097,7 @@ const limiterApi = createRateLimiter({ windowMs: 60 * 1000, max: 240, label: "ap
 const limiterAccount = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "account" });
 const limiterPublish = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, label: "publish" });
 
-// ✅ NOUVEAU — rate limiter dédié à la création de posts planifiés
+// ✅ rate limiter dédié à la création de posts planifiés
 const limiterPosts = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 60, label: "posts" });
 
 const limiterPasswordReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 3, label: "password-reset" });
@@ -1108,11 +1111,18 @@ const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, la
 const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
 const limiterTags = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "tags" });
 
-// ✅ NOUVEAU — rate limiter dédié à la lecture YouTube (vidéos + commentaires)
+// ✅ rate limiter dédié à la lecture YouTube (vidéos + commentaires)
 const limiterYouTubeRead = createRateLimiter({
   windowMs: 60 * 1000,
   max: 60,
   label: "youtube-read",
+});
+
+// ✅ NOUVEAU — rate limiter dédié aux écritures YouTube (réponses, marquage lu)
+const limiterYouTubeWrite = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 30,
+  label: "youtube-write",
 });
 
 // ------------------------------------------------------------
@@ -1239,8 +1249,8 @@ function setSecurityHeaders(res) {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Cache-Control", "no-store");
-  // ✅ NOUVEAU — diagnostic : permet de vérifier depuis le frontend
-  // que la réponse vient bien de CE serveur (et pas d'un SPA fallback).
+  // ✅ diagnostic : permet de vérifier depuis le frontend que la réponse
+  // vient bien de CE serveur (et pas d'un SPA fallback).
   res.setHeader("X-Stone-Server", "1");
   res.setHeader(
     "Content-Security-Policy",
@@ -1593,7 +1603,7 @@ function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
 }
 
 // ------------------------------------------------------------
-// ✅ NOUVEAU — parseMultipartAny : équivalent `multer.any()`
+// ✅ parseMultipartAny : équivalent `multer.any()`
 // ------------------------------------------------------------
 function parseMultipartAny(
   req,
@@ -3258,7 +3268,7 @@ async function ensureTikTokMediaBucket() {
 }
 
 // ------------------------------------------------------------
-// ✅ NOUVEAU — bucket public pour les médias de posts planifiés
+// bucket public pour les médias de posts planifiés
 // ------------------------------------------------------------
 async function ensurePostMediaBucket() {
   const { error } = await supabaseAdmin.storage.createBucket(POST_MEDIA_BUCKET, { public: true });
@@ -3799,7 +3809,7 @@ function youtubeApiError(status, data) {
     return reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
   }
 
-  // ✅ Log de l'erreur Google brute pour distinguer
+  // Log de l'erreur Google brute pour distinguer
   // « scope non stocké en base » de « scope refusé par Google ».
   console.warn("[youtube] erreur Google :", status, JSON.stringify(data?.error || data).slice(0, 400));
 
@@ -3996,7 +4006,7 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
 }
 
 // ------------------------------------------------------------
-// ✅ YOUTUBE — LECTURE DES VIDÉOS & COMMENTAIRES
+// YOUTUBE — LECTURE DES VIDÉOS & COMMENTAIRES
 // ------------------------------------------------------------
 
 async function youtubeGet(pathname, params, token) {
@@ -4017,7 +4027,7 @@ async function youtubeGet(pathname, params, token) {
   return result.data;
 }
 
-// ✅ `comments: true` → exige explicitement le scope force-ssl
+// `comments: true` → exige explicitement le scope force-ssl
 // (nécessaire pour lire les commentaires ET pour y répondre).
 async function getYouTubeReader(userId, { comments = false } = {}) {
   const account = await getYouTubeAccount(userId);
@@ -4043,6 +4053,20 @@ async function getYouTubeReader(userId, { comments = false } = {}) {
   return { token, channelId: account.channel_id };
 }
 
+// ✅ Formatage d'une réponse (commentaire enfant)
+function formatYouTubeReply(comment, channelId) {
+  const s = comment?.snippet || {};
+  return {
+    id: comment?.id,
+    text: s.textDisplay || s.textOriginal || "",
+    author_name: s.authorDisplayName || "",
+    author_avatar: s.authorProfileImageUrl || null,
+    published_at: s.publishedAt || null,
+    is_own: (s.authorChannelId?.value || null) === channelId,
+  };
+}
+
+// ✅ Formatage d'un thread (renvoie aussi les réponses)
 function formatYouTubeThread(item, channelId) {
   const top = item.snippet?.topLevelComment?.snippet || {};
   const replies = item.replies?.comments || [];
@@ -4058,11 +4082,33 @@ function formatYouTubeThread(item, channelId) {
     published_at: top.publishedAt || null,
     like_count: Number(top.likeCount || 0),
     reply_count: Number(item.snippet?.totalReplyCount || 0),
-    // « répondu » = la chaîne a répondu dans les réponses renvoyées par l'API
     answered: replies.some((r) => r.snippet?.authorChannelId?.value === channelId),
     is_own: authorChannelId === channelId,
+    is_read: false,
     can_reply: Boolean(item.snippet?.canReply),
+    replies: replies.map((r) => formatYouTubeReply(r, channelId)),
   };
+}
+
+// IDs de commentaires déjà marqués comme lus par cet utilisateur
+async function getReadCommentIds(userId, ids) {
+  if (ids.length === 0) return new Set();
+
+  const { data, error } = await supabaseAdmin
+    .from("youtube_comment_reads")
+    .select("comment_id")
+    .eq("user_id", userId)
+    .in("comment_id", ids);
+
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      console.warn("[youtube] table youtube_comment_reads manquante");
+      return new Set();
+    }
+    throw dbError("youtube_comment_reads.select", error);
+  }
+
+  return new Set((data || []).map((row) => row.comment_id));
 }
 
 // ============================================================
@@ -5869,7 +5915,7 @@ route("DELETE", "/api/saved-replies", async ({ req, res, url, user }) => {
 }, { auth: true });
 
 // ============================================================
-// ✅ NOUVEAU — ROUTES — SCHEDULED POSTS
+// ROUTES — SCHEDULED POSTS
 // ============================================================
 //
 // Équivalent natif du fichier multer :
@@ -6052,7 +6098,7 @@ route("DELETE", "/api/posts", async ({ res, url, user }) => {
 }, { auth: true });
 
 // ------------------------------------------------------------
-// ✅ NOUVEAU — transition périodique scheduled/external → published
+// transition périodique scheduled/external → published
 // ------------------------------------------------------------
 async function publishDueScheduledPosts() {
   const nowIso = new Date().toISOString();
@@ -7078,7 +7124,7 @@ route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
 }, { auth: true });
 
 // ------------------------------------------------------------
-// ✅ YOUTUBE — ROUTES DE LECTURE (vidéos + commentaires)
+// YOUTUBE — ROUTES DE LECTURE (vidéos + commentaires)
 // ------------------------------------------------------------
 
 // Liste des vidéos de la chaîne (panneau « Posts »)
@@ -7169,18 +7215,127 @@ route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
     throw error;
   }
 
-  const comments = (data.items || [])
-    .map((item) => formatYouTubeThread(item, channelId))
-    .filter((c) => !c.is_own)
-    .filter((c) =>
-      filter === "all" ? true : filter === "answered" ? c.answered : !c.answered
-    );
+  const threads = (data.items || []).map((item) => formatYouTubeThread(item, channelId));
+  const readSet = await getReadCommentIds(user.id, threads.map((t) => t.id));
+
+  const comments = threads
+    .map((c) => ({ ...c, is_read: c.is_own || readSet.has(c.id) }))
+    .filter((c) => {
+      if (filter === "all") return true;
+      if (filter === "unread") return !c.is_read;
+      if (c.is_own) return false;
+      return filter === "answered" ? c.answered : !c.answered;
+    });
 
   sendJson(res, 200, {
     success: true,
     comments,
     next_page_token: data.nextPageToken || null,
   });
+}, { auth: true });
+
+// Répondre à un commentaire
+route("POST", "/api/youtube/comments/reply", async ({ req, res, user }) => {
+  enforce(limiterYouTubeWrite, `youtube-write:${user.id}`);
+
+  const body = await getJsonBody(req);
+  const parentId = String(body.parentId ?? "").trim();
+  const text = String(body.text ?? "").trim();
+
+  if (!YOUTUBE_COMMENT_ID_PATTERN.test(parentId)) {
+    throw new HttpError(400, "Invalid comment id", "INVALID_COMMENT_ID");
+  }
+  if (!text) throw new HttpError(400, "Reply cannot be empty", "REPLY_EMPTY");
+  if (text.length > 10_000) throw new HttpError(400, "Reply is too long", "REPLY_TOO_LONG");
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
+    throw new HttpError(400, "Invalid reply", "REPLY_INVALID");
+  }
+
+  // Écrire exige le scope force-ssl, comme la lecture des commentaires
+  const { token, channelId } = await getYouTubeReader(user.id, { comments: true });
+
+  let result;
+  try {
+    result = await fetchJson(
+      `${YOUTUBE_API_BASE}/comments?part=snippet`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "Content-Type": "application/json; charset=UTF-8",
+        },
+        body: JSON.stringify({ snippet: { parentId, textOriginal: text } }),
+      },
+      20_000
+    );
+  } catch (error) {
+    throw upstreamError("YouTube", error);
+  }
+
+  if (!result.response.ok) throw youtubeApiError(result.response.status, result.data);
+
+  // Un commentaire auquel on répond est forcément lu (échec ignoré)
+  try {
+    await supabaseAdmin
+      .from("youtube_comment_reads")
+      .upsert(
+        { user_id: user.id, comment_id: parentId, read_at: new Date().toISOString() },
+        { onConflict: "user_id,comment_id" }
+      );
+  } catch {
+    // ignore
+  }
+
+  sendJson(res, 200, { success: true, reply: formatYouTubeReply(result.data, channelId) });
+}, { auth: true });
+
+// Marquer des commentaires comme lus / non lus
+route("POST", "/api/youtube/comments/read", async ({ req, res, user }) => {
+  enforce(limiterYouTubeWrite, `youtube-write:${user.id}`);
+
+  const body = await getJsonBody(req);
+  const ids = Array.isArray(body.ids) ? [...new Set(body.ids.map(String))] : [];
+
+  if (
+    ids.length === 0 ||
+    ids.length > 200 ||
+    !ids.every((id) => YOUTUBE_COMMENT_ID_PATTERN.test(id))
+  ) {
+    throw new HttpError(400, "Invalid comment ids", "INVALID_COMMENT_IDS");
+  }
+
+  const read = body.read !== false;
+  const unavailable = () =>
+    new HttpError(503, "Read state is not available yet (missing table)", "COMMENT_READS_UNAVAILABLE");
+
+  if (read) {
+    const now = new Date().toISOString();
+    const { error } = await supabaseAdmin
+      .from("youtube_comment_reads")
+      .upsert(
+        ids.map((comment_id) => ({ user_id: user.id, comment_id, read_at: now })),
+        { onConflict: "user_id,comment_id" }
+      );
+
+    if (error) {
+      if (isSchemaCacheMissingError(error)) throw unavailable();
+      throw dbError("youtube_comment_reads.upsert", error);
+    }
+  } else {
+    const { error } = await supabaseAdmin
+      .from("youtube_comment_reads")
+      .delete()
+      .eq("user_id", user.id)
+      .in("comment_id", ids);
+
+    if (error) {
+      if (isSchemaCacheMissingError(error)) throw unavailable();
+      throw dbError("youtube_comment_reads.delete", error);
+    }
+  }
+
+  sendJson(res, 200, { success: true });
 }, { auth: true });
 
 // ============================================================
@@ -8033,7 +8188,7 @@ const providerGuards = [
 const server = createServer(async (req, res) => {
   const requestId = newRequestId();
 
-  // ✅ NOUVEAU — diagnostic : prouve dans les logs que la requête
+  // ✅ diagnostic : prouve dans les logs que la requête
   // atteint bien CE serveur. Si la ligne n'apparaît pas quand le
   // frontend appelle /api/youtube/videos, c'est que la requête est
   // interceptée ailleurs (SPA fallback, proxy mal configuré…).
@@ -8194,7 +8349,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
   console.log(`  Diagnostic      : en-tête X-Stone-Server: 1 ajouté à toutes les réponses`);
 
-  // ✅ NOUVEAU — initialisation du bucket pour les posts
+  // initialisation du bucket pour les posts
   try {
     await ensurePostMediaBucket();
     console.log(`  Post media      : bucket "${POST_MEDIA_BUCKET}" prêt`);
@@ -8202,7 +8357,7 @@ server.listen(PORT, "0.0.0.0", async () => {
     console.warn(`  Post media      : initialisation échouée (${error?.message || error})`);
   }
 
-  // ✅ NOUVEAU — timer de transition scheduled/external → published
+  // timer de transition scheduled/external → published
   const postsTimer = setInterval(() => {
     void publishDueScheduledPosts();
   }, POSTS_PUBLISH_INTERVAL_MS);
