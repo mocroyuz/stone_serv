@@ -4018,15 +4018,15 @@ async function getYouTubeReader(userId) {
     throw new HttpError(400, "YouTube account not connected", "YOUTUBE_NOT_CONNECTED");
   }
 
-  const scopes = String(account.scope || "").split(/[\s,]+/).filter(Boolean);
-  if (!scopes.some((s) => YOUTUBE_READ_SCOPES.includes(s))) {
-    console.warn("[youtube] scope en base :", JSON.stringify(account.scope));
-    throw new HttpError(
-      409,
-      `Stored YouTube scopes do not include read access (stored: ${scopes.length ? scopes.join(", ") : "none"}). Disconnect and reconnect YouTube.`,
-      "YOUTUBE_SCOPE_NOT_STORED"
-    );
-  }
+const scopes = String(account.scope || "").split(/[\s,]+/).filter(Boolean);
+if (!scopes.some((s) => YOUTUBE_READ_SCOPES.includes(s))) {
+  console.warn("[youtube] scope en base :", JSON.stringify(account.scope));
+  throw new HttpError(
+    409,
+    `DB scopes sans lecture (stockés : ${scopes.join(", ") || "aucun"})`,
+    "YOUTUBE_SCOPE_NOT_STORED"
+  );
+}
   if (!account.channel_id) {
     throw new HttpError(409, "YouTube channel unknown, please reconnect.", "YOUTUBE_CHANNEL_MISSING");
   }
