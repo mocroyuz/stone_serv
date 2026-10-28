@@ -3794,6 +3794,10 @@ function youtubeApiError(status, data) {
     return reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
   }
 
+  // ✅ NOUVEAU — log l'erreur Google brute pour distinguer
+  // « scope non stocké en base » de « scope refusé par Google ».
+  console.warn("[youtube] erreur Google :", status, JSON.stringify(data?.error || data).slice(0, 400));
+
   if (reason === "insufficientPermissions") {
     return new HttpError(409, "YouTube permission missing, please reconnect your YouTube account.", "YOUTUBE_SCOPE_MISSING");
   }
@@ -4014,12 +4018,13 @@ async function getYouTubeReader(userId) {
     throw new HttpError(400, "YouTube account not connected", "YOUTUBE_NOT_CONNECTED");
   }
 
-  const scopes = String(account.scope || "").split(/[\s,]+/);
+  const scopes = String(account.scope || "").split(/[\s,]+/).filter(Boolean);
   if (!scopes.some((s) => YOUTUBE_READ_SCOPES.includes(s))) {
+    console.warn("[youtube] scope en base :", JSON.stringify(account.scope));
     throw new HttpError(
       409,
-      "YouTube permission missing, please reconnect your YouTube account.",
-      "YOUTUBE_SCOPE_MISSING"
+      `Stored YouTube scopes do not include read access (stored: ${scopes.length ? scopes.join(", ") : "none"}). Disconnect and reconnect YouTube.`,
+      "YOUTUBE_SCOPE_NOT_STORED"
     );
   }
   if (!account.channel_id) {
