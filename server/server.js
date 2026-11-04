@@ -6138,19 +6138,36 @@ route("GET", "/api/youtube/videos", async ({ res, url, user }) => {
     .filter((id) => typeof id === "string" && YOUTUBE_ID_PATTERN.test(id));
   let videos = [];
   if (ids.length > 0) {
-    const data = await youtubeGet(
-      "/videos",
-      { part: "snippet,statistics", id: ids.join(","), maxResults: "50" },
-      token
-    );
-    videos = (data.items || []).map((v) => ({
-      id: v.id,
-      title: v.snippet?.title || "",
-      thumbnail:
-        v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
-      published_at: v.snippet?.publishedAt || null,
-      comment_count: Number(v.statistics?.commentCount || 0),
-    }));
+const data = await youtubeGet(
+  "/videos",
+  { part: "snippet,statistics,status", id: ids.join(","), maxResults: "50" },
+  token
+);
+videos = (data.items || []).map((v) => {
+  const publishAt = v.status?.publishAt || null;
+  const privacyStatus = v.status?.privacyStatus || null;
+
+  // `publishAt` dans le futur → YouTube va publier la vidéo plus tard
+  // (c'est le cas des vidéos programmées depuis Stone via `publishAt`).
+  let status;
+  if (publishAt && new Date(publishAt).getTime() > Date.now()) {
+    status = "scheduled";
+  } else if (privacyStatus === "private") {
+    status = "private";
+  } else {
+    status = "published";
+  }
+
+  return {
+    id: v.id,
+    title: v.snippet?.title || "",
+    thumbnail:
+      v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
+    published_at: v.snippet?.publishedAt || null,
+    comment_count: Number(v.statistics?.commentCount || 0),
+    status,
+  };
+});
   }
   sendJson(res, 200, {
     success: true,
