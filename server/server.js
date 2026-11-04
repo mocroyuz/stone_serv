@@ -3424,19 +3424,25 @@ async function fetchVideosInPeriod(ytToken, uploadsPlaylistId, startDate, endDat
   const detailsMap = new Map();
   for (let i = 0; i < videoIds.length; i += 50) {
     const batchIds = videoIds.slice(i, i + 50);
-    const params = new URLSearchParams({
-      part: "snippet,contentDetails",
-      id: batchIds.join(","),
-    });
+const params = new URLSearchParams({
+  part: "snippet,contentDetails,status",
+  id: batchIds.join(","),
+});
     const data = await googleRequest(`${YOUTUBE_API_BASE}/videos?${params.toString()}`, { token: ytToken });
     
-    for (const v of (data.items || [])) {
-      detailsMap.set(v.id, {
-        title: v.snippet?.title || "Sans titre",
-        thumbnail: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
-        duration: v.contentDetails?.duration || "PT0S",
-      });
-    }
+for (const v of (data.items || [])) {
+  const publishAt = v.status?.publishAt || null;
+  const isScheduled = Boolean(
+    publishAt && new Date(publishAt).getTime() > Date.now()
+  );
+  detailsMap.set(v.id, {
+    title: v.snippet?.title || "Sans titre",
+    thumbnail: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
+    duration: v.contentDetails?.duration || "PT0S",
+    status: isScheduled ? "scheduled" : "published",
+    publish_at: publishAt,
+  });
+}
   }
 
   // 3. Récupérer les stats Analytics pour ces vidéos sur la période
@@ -3486,21 +3492,22 @@ async function fetchVideosInPeriod(ytToken, uploadsPlaylistId, startDate, endDat
     }
   }
 
-  // 4. Assembler le résultat
-  return videoIds.map(id => {
-    const info = videosMap.get(id);
-    const details = detailsMap.get(id) || {};
-    const stats = statsMap.get(id) || { views: 0, likes: 0, comments: 0, shares: 0 };
-    
-    return {
-      id,
-      title: details.title,
-      thumbnail: details.thumbnail,
-      published_at: info.published_at,
-      is_short: isShortVideo(details.duration),
-      ...stats,
-    };
-  });
+return videoIds.map(id => {
+  const info = videosMap.get(id);
+  const details = detailsMap.get(id) || {};
+  const stats = statsMap.get(id) || { views: 0, likes: 0, comments: 0, shares: 0 };
+
+  return {
+    id,
+    title: details.title,
+    thumbnail: details.thumbnail,
+    published_at: info.published_at,
+    is_short: isShortVideo(details.duration),
+    status: details.status || "published",    // ← NOUVEAU
+    publish_at: details.publish_at || null,   // ← NOUVEAU
+    ...stats,
+  };
+});
 }
 
 // ============================================================
