@@ -45,6 +45,7 @@
 //                    - un code de secours valide vérifie le session_id du JWT
 //                      pendant la fenêtre configurée
 //   Tags         : MAX_TAGS_PER_USER (défaut : 100)
+//   Groups       : MAX_GROUPS_PER_USER (défaut : 50)
 //   Saved replies: MAX_SAVED_REPLIES_PER_USER (défaut : 100)
 // ============================================================
 import { fileURLToPath } from "node:url";
@@ -577,6 +578,13 @@ const MAX_TAGS_PER_USER = Math.max(1, Number(env("MAX_TAGS_PER_USER") || 100));
 const TAG_NAME_MAX = 50;
 const TAG_COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 const TAG_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// ============================================================
+// CONFIGURATION GROUPES (colonnes du board Create)
+// ============================================================
+const MAX_GROUPS_PER_USER = Math.max(1, Number(env("MAX_GROUPS_PER_USER") || 50));
+const GROUP_NAME_MAX = 50;
+// "Unassigned" est le groupe système géré côté front : nom réservé.
+const GROUP_RESERVED_NAMES = new Set(["unassigned"]);
 // ------------------------------------------------------------
 // BLOC 1 — Configuration des saved replies
 // ------------------------------------------------------------
@@ -896,6 +904,7 @@ const limiterDropbox = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, l
 const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, label: "gdrive" });
 const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
 const limiterTags = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "tags" });
+const limiterGroups = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "groups" });
 // ✅ rate limiter dédié à la lecture YouTube (vidéos + commentaires)
 const limiterYouTubeRead = createRateLimiter({
   windowMs: 60 * 1000,
@@ -4010,6 +4019,7 @@ route("GET", "/api/health", ({ res }) => {
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
     tags: true,
+    groups: true,
     saved_replies: true,
     posts: true,
   });
@@ -4832,6 +4842,174 @@ route("DELETE", "/api/tags", async ({ req, res, url, user }) => {
     throw dbError("tags.delete", error);
   }
   if (!data) throw new HttpError(404, "Tag not found", "TAG_NOT_FOUND");
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+// ============================================================
+// ROUTES — GROUPS (colonnes du board : To Do, In Progress, …)
+// ============================================================
+//
+//   GET    /api/groups          → { success, groups: [{ id, name, color, … }] }
+//   POST   /api/groups          → { success, group }   body: { name, color }
+//   PUT    /api/groups          → { success, group }   body: { id, name, color }
+//   DELETE /api/groups?id=<id>  → { success }
+//
+// Même contrat que /api/tags, mais dans la table `groups`.
+// Les tags (étiquettes libres) et les groupes (colonnes) sont indépendants.
+// ------------------------------------------------------------
+const GROUP_COLUMNS = "id,name,color,created_at,updated_at";
+
+function parseGroupInput(body) {
+  const name = String(body.name ?? "").trim();
+  if (!name) {
+    throw new HttpError(400, "Group name is required", "GROUP_NAME_REQUIRED");
+  }
+  if (name.length > GROUP_NAME_MAX) {
+    throw new HttpError(
+      400,
+      `Group name must be at most ${GROUP_NAME_MAX} characters`,
+      "GROUP_NAME_TOO_LONG"
+    );
+  }
+  if (/[\u0000-\u001f\u007f]/.test(name)) {
+    throw new HttpError(400, "Invalid group name", "GROUP_NAME_INVALID");
+  }
+  if (GROUP_RESERVED_NAMES.has(name.toLowerCase())) {
+    throw new HttpError(400, "This group name is reserved", "GROUP_NAME_RESERVED");
+  }
+  let color = null;
+  if (body.color !== undefined && body.color !== null && body.color !== "") {
+    const raw = String(body.color).trim();
+    if (!TAG_COLOR_PATTERN.test(raw)) {
+      throw new HttpError(400, "Invalid group color (expected #RRGGBB)", "GROUP_COLOR_INVALID");
+    }
+    color = raw.toLowerCase();
+  }
+  return { name, color };
+}
+
+function formatGroup(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    color: row.color || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+route("GET", "/api/groups", async ({ res, user }) => {
+  const { data, error } = await supabaseAdmin
+    .from("groups")
+    .select(GROUP_COLUMNS)
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: true });
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      console.warn("[groups] table manquante — retourne []");
+      sendJson(res, 200, { success: true, groups: [] });
+      return;
+    }
+    throw dbError("groups.list", error);
+  }
+  sendJson(res, 200, { success: true, groups: (data || []).map(formatGroup) });
+}, { auth: true });
+
+route(["POST", "PUT"], "/api/groups", async ({ req, res, user }) => {
+  enforce(limiterGroups, `groups:${user.id}`);
+  const body = await getJsonBody(req);
+  const { name, color } = parseGroupInput(body);
+
+  const idInput = body.id ?? body.group_id;
+  const hasId = idInput !== undefined && idInput !== null && idInput !== "";
+  let id = null;
+  if (hasId) {
+    id = String(idInput);
+    if (!TAG_ID_PATTERN.test(id)) {
+      throw new HttpError(400, "Invalid group id", "GROUP_ID_INVALID");
+    }
+  } else {
+    const { count, error: countError } = await supabaseAdmin
+      .from("groups")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", user.id);
+    if (countError) {
+      if (isSchemaCacheMissingError(countError)) {
+        throw new HttpError(503, "Groups are not available yet", "GROUPS_UNAVAILABLE");
+      }
+      throw dbError("groups.count", countError);
+    }
+    if (Number(count) >= MAX_GROUPS_PER_USER) {
+      throw new HttpError(
+        400,
+        `You can have at most ${MAX_GROUPS_PER_USER} groups.`,
+        "GROUPS_LIMIT_REACHED"
+      );
+    }
+  }
+
+  const row = {
+    user_id: user.id,
+    name,
+    color,
+    updated_at: new Date().toISOString(),
+  };
+
+  const query = hasId
+    ? supabaseAdmin
+        .from("groups")
+        .update(row)
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .select(GROUP_COLUMNS)
+        .maybeSingle()
+    : supabaseAdmin
+        .from("groups")
+        .insert(row)
+        .select(GROUP_COLUMNS)
+        .maybeSingle();
+
+  const { data, error } = await query;
+  if (error) {
+    if (error.code === "23505" || /duplicate key/i.test(error.message || "")) {
+      throw new HttpError(409, "A group with this name already exists", "GROUP_DUPLICATE");
+    }
+    if (isSchemaCacheMissingError(error)) {
+      throw new HttpError(503, "Groups are not available yet", "GROUPS_UNAVAILABLE");
+    }
+    throw dbError("groups.save", error);
+  }
+  if (!data) {
+    if (hasId) throw new HttpError(404, "Group not found", "GROUP_NOT_FOUND");
+    throw dbError("groups.save", new Error("No row returned"));
+  }
+  sendJson(res, 200, { success: true, group: formatGroup(data) });
+}, { auth: true });
+
+route("DELETE", "/api/groups", async ({ req, res, url, user }) => {
+  enforce(limiterGroups, `groups:${user.id}`);
+  let id = url.searchParams.get("id");
+  if (!id) {
+    const body = await getJsonBody(req).catch(() => ({}));
+    id = body.id ?? body.group_id ?? null;
+  }
+  if (!id || !TAG_ID_PATTERN.test(String(id))) {
+    throw new HttpError(400, "Invalid group id", "GROUP_ID_INVALID");
+  }
+  const { data, error } = await supabaseAdmin
+    .from("groups")
+    .delete()
+    .eq("id", id)
+    .eq("user_id", user.id)
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    if (isSchemaCacheMissingError(error)) {
+      sendJson(res, 200, { success: true });
+      return;
+    }
+    throw dbError("groups.delete", error);
+  }
+  if (!data) throw new HttpError(404, "Group not found", "GROUP_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
 // ============================================================
@@ -7130,6 +7308,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
+  console.log(`  Groups          : activé (max ${MAX_GROUPS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
   console.log(`  Scheduled posts : activé (${MAX_POST_FILES} fichiers max / post, ${MAX_POST_FILE_SIZE / 1024 / 1024} MB par fichier)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
