@@ -8,7 +8,7 @@
 //                  OAUTH_STATE_SECRET (32+ caractères aléatoires)
 //   Recommandé   : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
 //                  chiffre les tokens TikTok / Pinterest / YouTube / Canva /
-//                  Dropbox / Google Drive / Google Photos en base
+//                  Dropbox / Google Drive / Google Photos / Instagram en base
 //                  (AES-256-GCM). Les anciens tokens en clair restent lisibles.
 //   Mot de passe oublié :
 //                  PASSWORD_RESET_REDIRECT_URL (optionnel, défaut :
@@ -27,6 +27,9 @@
 //                  (défaut : ${APP_URL}/googlephotos/callback).
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
+//   Instagram    : META_APP_ID, META_APP_SECRET, META_IG_CONFIG_ID
+//                  INSTAGRAM_REDIRECT_URI (défaut :
+//                    ${PUBLIC_API_URL}/api/instagram/callback)
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
 //                    - RECOVERY_CODE_PEPPER (32+ caractères aléatoires)
@@ -62,12 +65,14 @@ import {
 } from "@simplewebauthn/server";
 import busboy from "busboy";
 import Stripe from "stripe";
+
 // ============================================================
 // CHEMIN DU DOSSIER SERVER
 // ============================================================
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const envPath = path.join(__dirname, ".env");
+
 // ============================================================
 // CHARGEMENT DU .env (robuste)
 // ============================================================
@@ -92,11 +97,14 @@ function loadEnvFile(filePath) {
   }
 }
 loadEnvFile(envPath);
+
 function env(name) {
   const value = process.env[name];
   return typeof value === "string" ? value.trim() : undefined;
 }
+
 const IS_PRODUCTION = env("NODE_ENV") === "production";
+
 // ============================================================
 // UTILITAIRES GÉNÉRIQUES
 // ============================================================
@@ -110,12 +118,14 @@ class HttpError extends Error {
     this.retryAfter = retryAfter;
   }
 }
+
 const sha256 = (value) =>
   crypto.createHash("sha256").update(String(value)).digest("hex");
 const normalizeEmail = (value) => String(value ?? "").trim().toLowerCase();
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const toBool = (v) => v === true || v === "true" || v === "1";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const inflight = new Map();
 function withLock(key, fn) {
   const existing = inflight.get(key);
@@ -126,6 +136,7 @@ function withLock(key, fn) {
   inflight.set(key, promise);
   return promise;
 }
+
 const serialChains = new Map();
 function runSerial(key, fn) {
   const previous = serialChains.get(key) || Promise.resolve();
@@ -137,6 +148,7 @@ function runSerial(key, fn) {
   });
   return result;
 }
+
 function createSeenCache(maxEntries, ttlMs) {
   const entries = new Map();
   return {
@@ -157,6 +169,7 @@ function createSeenCache(maxEntries, ttlMs) {
     },
   };
 }
+
 const callbackCache = new Map();
 const CALLBACK_TTL_MS = 60_000;
 function dedupeCallback(key, fn) {
@@ -173,6 +186,7 @@ setInterval(() => {
     if (entry.expires <= now) callbackCache.delete(key);
   }
 }, 60_000).unref?.();
+
 async function fetchJson(resource, options = {}, timeoutMs = 15_000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -192,21 +206,26 @@ async function fetchJson(resource, options = {}, timeoutMs = 15_000) {
     clearTimeout(timer);
   }
 }
+
 function upstreamError(name, error) {
   if (error instanceof HttpError) return error;
   console.error(`[upstream:${name}]`, error?.message || error);
   return new HttpError(502, `${name} is unreachable`, "UPSTREAM_UNREACHABLE");
 }
+
 function upstreamStatus(status) {
   if (status === 429) return 429;
   return status >= 500 ? 502 : 400;
 }
+
 const reconnectError = (name, code) =>
   new HttpError(409, `${name} session expired, please reconnect`, code);
+
 function dbError(context, error) {
   console.error(`[db] ${context}:`, error?.message || error);
   return new HttpError(500, "Database error", "DB_ERROR");
 }
+
 // ============================================================
 // DÉTECTION DES OBJETS POSTGRES ABSENTS (migration manquante)
 // ============================================================
@@ -217,21 +236,22 @@ function isSchemaCacheMissingError(error) {
     /in the schema cache/i.test(msg)
   );
 }
+
 // ============================================================
 // CONFIGURATION
 // ============================================================
-const PORT = Number(
-  env("PORT") || (IS_PRODUCTION ? 10000 : 3002)
-);
+const PORT = Number(env("PORT") || (IS_PRODUCTION ? 10000 : 3002));
 const SUPABASE_URL = env("SUPABASE_URL");
 const SUPABASE_ANON_KEY = env("SUPABASE_ANON_KEY");
 const SUPABASE_SERVICE_ROLE_KEY = env("SUPABASE_SERVICE_ROLE_KEY");
 const RECOVERY_CODE_PEPPER = env("RECOVERY_CODE_PEPPER");
+
 const WEBAUTHN_RP_ID = env("WEBAUTHN_RP_ID") || "stone-prod.vercel.app";
 const WEBAUTHN_RP_NAME = env("WEBAUTHN_RP_NAME") || "Stone";
 const WEBAUTHN_ORIGIN = (
   env("WEBAUTHN_ORIGIN") || "https://stone-prod.vercel.app"
 ).replace(/\/+$/, "");
+
 const MFA_VERIFIED_SESSION_TTL_MINUTES = Number(
   env("MFA_VERIFIED_SESSION_TTL_MINUTES") || 15
 );
@@ -242,6 +262,7 @@ if (
 ) {
   throw new Error("MFA_VERIFIED_SESSION_TTL_MINUTES must be an integer between 1 and 1440");
 }
+
 const WEBAUTHN_ORIGIN_URL = new URL(WEBAUTHN_ORIGIN);
 if (
   !WEBAUTHN_RP_ID ||
@@ -256,10 +277,12 @@ if (
 ) {
   throw new Error("Invalid WebAuthn RP or origin configuration");
 }
+
 const DEFAULT_OAUTH_REDIRECT =
   env("OAUTH_REDIRECT_URL") || "http://localhost:5173/";
 const AVATAR_BUCKET = "avatars";
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024;
+
 // ============================================================
 // CONFIGURATION STRIPE
 // ============================================================
@@ -269,6 +292,7 @@ const APP_URL = (env("APP_URL") || "http://localhost:5173").replace(/\/+$/, "");
 const PASSWORD_RESET_REDIRECT_URL =
   env("PASSWORD_RESET_REDIRECT_URL") || `${APP_URL}/#/reset-password`;
 const RECOVERY_TOKEN_MAX_AGE_SEC = 60 * 60;
+
 const STRIPE_PRICES = {
   starter: {
     monthly: env("STRIPE_PRICE_STARTER_MONTHLY"),
@@ -306,6 +330,7 @@ function planDetails(priceId, metadataPlan) {
     plan_name: key ? PLAN_NAMES[key] : null,
   };
 }
+
 const STRIPE_SUCCESS_URL = `${APP_URL}/#/account?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
 const STRIPE_CANCEL_URL = `${APP_URL}/#/pricing?checkout=cancel`;
 const STRIPE_PORTAL_RETURN_URL = `${APP_URL}/#/account`;
@@ -316,6 +341,7 @@ const stripe = STRIPE_SECRET_KEY
       timeout: 20_000,
     })
   : null;
+
 // ============================================================
 // CONFIGURATION TIKTOK
 // ============================================================
@@ -336,6 +362,7 @@ const TIKTOK_AUDITED = env("TIKTOK_AUDITED") === "1";
 const TIKTOK_SANDBOX = !TIKTOK_AUDITED;
 const TIKTOK_FORCE_DRAFT = env("TIKTOK_FORCE_DRAFT") === "1";
 const tiktokEnabled = Boolean(TIKTOK_CLIENT_KEY && TIKTOK_CLIENT_SECRET);
+
 function tiktokCapabilities() {
   return {
     audited: TIKTOK_AUDITED,
@@ -349,15 +376,18 @@ function tiktokCapabilities() {
     testers_only_auth: TIKTOK_SANDBOX,
   };
 }
+
 const TIKTOK_WEBHOOK_TOLERANCE_SEC = (() => {
   const raw = env("TIKTOK_WEBHOOK_TOLERANCE_SEC");
   const value = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(value) && value >= 0 ? value : 300;
 })();
+
 const TIKTOK_VERIFICATION_NAME = (
   env("TIKTOK_VERIFICATION_FILE") ||
   "tiktok-developers-site-verification=mRJN1EDyG6GdEuRBeOe9A5VyNF5FZTlU"
 ).replace(/\.txt$/i, "");
+
 function resolvePublicApiUrl() {
   const candidates = [
     ["PUBLIC_API_URL", env("PUBLIC_API_URL")],
@@ -387,21 +417,25 @@ function resolvePublicApiUrl() {
   }
   return { url: "", source: null };
 }
+
 const { url: PUBLIC_API_URL, source: PUBLIC_API_URL_SOURCE } =
   resolvePublicApiUrl();
+
 const TIKTOK_MEDIA_BUCKET = "tiktok-media";
 const TIKTOK_MEDIA_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_TIKTOK_PHOTOS = 35;
 const MAX_PHOTO_SIZE = 10 * 1024 * 1024;
 const MAX_PHOTOS_TOTAL = 80 * 1024 * 1024;
+
 // ============================================================
-// ✅ NOUVEAU — CONFIGURATION POST MEDIA (intégration /api/posts)
+// ✅ CONFIGURATION POST MEDIA (intégration /api/posts)
 // ============================================================
 const POST_MEDIA_BUCKET = "post-media";
 const MAX_POST_FILES = 60;
 const MAX_POST_FILE_SIZE = 100 * 1024 * 1024;
 const MAX_POST_UPLOAD_TOTAL = 500 * 1024 * 1024;
 const POSTS_PUBLISH_INTERVAL_MS = 30_000;
+
 function publicApiLooksLikeFrontend() {
   if (!PUBLIC_API_URL) return false;
   try {
@@ -412,9 +446,11 @@ function publicApiLooksLikeFrontend() {
     return false;
   }
 }
+
 function publicApiSourceLabel(source) {
   return source || "URL publique";
 }
+
 // ============================================================
 // CONFIGURATION PINTEREST
 // ============================================================
@@ -444,6 +480,7 @@ const PINTEREST_OAUTH_BASE = trimSlashes(
       : PINTEREST_PROD_API_BASE)
 );
 const pinterestEnabled = Boolean(PINTEREST_APP_ID && PINTEREST_APP_SECRET);
+
 const pinterestConfigError = (() => {
   for (const [label, value] of [
     ["PINTEREST_API_BASE", PINTEREST_API_BASE],
@@ -465,6 +502,7 @@ const pinterestConfigError = (() => {
   return null;
 })();
 const pinterestUsable = pinterestEnabled && !pinterestConfigError;
+
 // ============================================================
 // CONFIGURATION YOUTUBE
 // ============================================================
@@ -472,9 +510,6 @@ const YOUTUBE_CLIENT_ID = env("YOUTUBE_CLIENT_ID");
 const YOUTUBE_CLIENT_SECRET = env("YOUTUBE_CLIENT_SECRET");
 const YOUTUBE_REDIRECT_URI =
   env("YOUTUBE_REDIRECT_URI") || `${APP_URL}/youtube/callback`;
-// force-ssl est désormais demandé par défaut : il est requis pour
-// répondre aux commentaires et pour toute opération d'écriture
-// (insert/update/delete de commentThreads).
 const YOUTUBE_SCOPES = (
   env("YOUTUBE_SCOPES") ||
   "https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl https://www.googleapis.com/auth/yt-analytics.readonly"
@@ -486,7 +521,6 @@ const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
 const YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3";
-// ✅ NOUVEAU : Endpoint Analytics
 const YOUTUBE_ANALYTICS_API = "https://youtubeanalytics.googleapis.com/v2/reports";
 const youtubeEnabled = Boolean(YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET);
 const YOUTUBE_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos";
@@ -495,19 +529,17 @@ const YOUTUBE_PRIVACY_LEVELS = new Set(["public", "unlisted", "private"]);
 const YOUTUBE_TITLE_MAX = 100;
 const YOUTUBE_DESCRIPTION_MAX_BYTES = 5000;
 const YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload";
-// ✅ Lecture YouTube (vidéos + commentaires)
 const YOUTUBE_READ_SCOPES = [
   "https://www.googleapis.com/auth/youtube.readonly",
   "https://www.googleapis.com/auth/youtube.force-ssl",
 ];
 const YOUTUBE_FORCE_SSL_SCOPE =
   "https://www.googleapis.com/auth/youtube.force-ssl";
-// ✅ NOUVEAU : Scope Analytics
 const YOUTUBE_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly";
-// ✅ Patterns / filtres mis à jour
 const YOUTUBE_ID_PATTERN = /^[\w-]{1,64}$/;
 const YOUTUBE_COMMENT_ID_PATTERN = /^[\w.-]{1,128}$/;
 const YOUTUBE_COMMENT_FILTERS = new Set(["all", "unanswered", "answered", "unread"]);
+
 // ============================================================
 // CONFIGURATION GOOGLE DRIVE
 // ============================================================
@@ -526,6 +558,7 @@ const GDRIVE_API = "https://www.googleapis.com/drive/v3";
 const GDRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files";
 const MAX_GDRIVE_UPLOAD = 100 * 1024 * 1024;
 const gdriveEnabled = Boolean(GDRIVE_CLIENT_ID && GDRIVE_CLIENT_SECRET);
+
 // ============================================================
 // CONFIGURATION GOOGLE PHOTOS (Picker API)
 // ============================================================
@@ -538,6 +571,7 @@ const GPHOTOS_PICKER_API = "https://photospicker.googleapis.com/v1";
 const MAX_GPHOTOS_DOWNLOAD = 100 * 1024 * 1024;
 const GPHOTOS_SESSION_ID = /^[\w.~-]{1,256}$/;
 const gphotosEnabled = Boolean(GPHOTOS_CLIENT_ID && GPHOTOS_CLIENT_SECRET);
+
 // ============================================================
 // CONFIGURATION CANVA
 // ============================================================
@@ -551,6 +585,7 @@ const CANVA_SCOPES =
 const CANVA_API_BASE = "https://api.canva.com/rest/v1";
 const CANVA_AUTH_URL = "https://www.canva.com/api/oauth/authorize";
 const canvaEnabled = Boolean(CANVA_CLIENT_ID && CANVA_CLIENT_SECRET);
+
 // ============================================================
 // CONFIGURATION DROPBOX
 // ============================================================
@@ -571,6 +606,22 @@ const DROPBOX_API = "https://api.dropboxapi.com/2";
 const DROPBOX_CONTENT_API = "https://content.dropboxapi.com/2";
 const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024;
 const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
+
+// ============================================================
+// CONFIGURATION INSTAGRAM (Facebook Login for Business)
+// ============================================================
+const META_APP_ID = env("META_APP_ID");
+const META_APP_SECRET = env("META_APP_SECRET");
+const META_IG_CONFIG_ID = env("META_IG_CONFIG_ID");
+const INSTAGRAM_GRAPH_API = "https://graph.facebook.com/v21.0";
+const INSTAGRAM_OAUTH_DIALOG = "https://www.facebook.com/v21.0/dialog/oauth";
+const INSTAGRAM_REDIRECT_URI =
+  env("INSTAGRAM_REDIRECT_URI") ||
+  (PUBLIC_API_URL ? `${PUBLIC_API_URL}/api/instagram/callback` : null);
+const instagramEnabled = Boolean(
+  META_APP_ID && META_APP_SECRET && META_IG_CONFIG_ID && INSTAGRAM_REDIRECT_URI
+);
+
 // ============================================================
 // CONFIGURATION TAGS
 // ============================================================
@@ -578,13 +629,14 @@ const MAX_TAGS_PER_USER = Math.max(1, Number(env("MAX_TAGS_PER_USER") || 100));
 const TAG_NAME_MAX = 50;
 const TAG_COLOR_PATTERN = /^#[0-9a-f]{6}$/i;
 const TAG_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 // ============================================================
 // CONFIGURATION GROUPES (colonnes du board Create)
 // ============================================================
 const MAX_GROUPS_PER_USER = Math.max(1, Number(env("MAX_GROUPS_PER_USER") || 50));
 const GROUP_NAME_MAX = 50;
-// "Unassigned" est le groupe système géré côté front : nom réservé.
 const GROUP_RESERVED_NAMES = new Set(["unassigned"]);
+
 // ------------------------------------------------------------
 // BLOC 1 — Configuration des saved replies
 // ------------------------------------------------------------
@@ -594,7 +646,8 @@ const MAX_SAVED_REPLIES_PER_USER = Math.max(
 );
 const SAVED_REPLY_NAME_MAX = 100;
 const SAVED_REPLY_CONTENT_MAX = 1000;
-const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN; // même format UUID
+const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN;
+
 // ============================================================
 // SECRETS : SIGNATURE DU STATE OAUTH + CHIFFREMENT DES TOKENS
 // ============================================================
@@ -608,10 +661,12 @@ let OAUTH_STATE_SECRET =
 if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
   OAUTH_STATE_SECRET = crypto.randomBytes(32).toString("hex");
 }
+
 const TOKEN_ENCRYPTION_KEY = env("TOKEN_ENCRYPTION_KEY")
   ? crypto.createHash("sha256").update(env("TOKEN_ENCRYPTION_KEY")).digest()
   : null;
 const ENC_PREFIX = "enc:v1:";
+
 function encryptSecret(value) {
   if (!value) return value ?? null;
   if (!TOKEN_ENCRYPTION_KEY) return value;
@@ -625,6 +680,7 @@ function encryptSecret(value) {
   const tag = cipher.getAuthTag();
   return ENC_PREFIX + Buffer.concat([iv, tag, encrypted]).toString("base64url");
 }
+
 function decryptSecret(value) {
   if (!value) return value ?? null;
   if (!String(value).startsWith(ENC_PREFIX)) return value;
@@ -639,6 +695,7 @@ function decryptSecret(value) {
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
 }
+
 function decryptTokenRow(row) {
   if (!row) return null;
   try {
@@ -652,6 +709,7 @@ function decryptTokenRow(row) {
     return { ...row, access_token: null, refresh_token: null };
   }
 }
+
 // ============================================================
 // VÉRIFICATION SUPABASE
 // ============================================================
@@ -662,6 +720,7 @@ const missingVars = [
 ]
   .filter(([, value]) => !value)
   .map(([name]) => name);
+
 if (missingVars.length > 0) {
   console.error("");
   console.error("Supabase non configuré. Variables manquantes :");
@@ -669,6 +728,7 @@ if (missingVars.length > 0) {
   console.error("");
   process.exit(1);
 }
+
 try {
   const parsed = new URL(SUPABASE_URL);
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
@@ -680,8 +740,10 @@ try {
   console.error("");
   process.exit(1);
 }
+
 const SUPABASE_BASE_URL = SUPABASE_URL.replace(/\/+$/, "");
 const SUPABASE_AUTH_BASE = `${SUPABASE_BASE_URL}/auth/v1`;
+
 // ============================================================
 // FAIL-FAST PRODUCTION
 // ============================================================
@@ -707,6 +769,7 @@ if (IS_PRODUCTION) {
     process.exit(1);
   }
 }
+
 // ============================================================
 // CLIENTS SUPABASE
 // ============================================================
@@ -724,6 +787,7 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 const supabaseOAuth = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { ...serverAuthOptions, flowType: "implicit" },
 });
+
 // ============================================================
 // RATE LIMITING (en mémoire)
 // ============================================================
@@ -732,6 +796,7 @@ const TRUST_PROXY_HOPS = (() => {
   const n = Number(env("TRUST_PROXY_HOPS"));
   return Number.isSafeInteger(n) && n >= 1 ? n : 1;
 })();
+
 function getClientIp(req) {
   const forwarded = req.headers["x-forwarded-for"];
   if (TRUST_PROXY && typeof forwarded === "string") {
@@ -745,12 +810,14 @@ function getClientIp(req) {
   }
   return req.socket?.remoteAddress || "unknown";
 }
+
 function authAttemptKey(subjectType, subject, ip) {
   return crypto
     .createHmac("sha256", SUPABASE_SERVICE_ROLE_KEY)
     .update(`${subjectType}\0${subject}\0${ip}`)
     .digest("hex");
 }
+
 function authAttemptRateLimitError(retryAfter) {
   return new HttpError(
     429,
@@ -760,6 +827,7 @@ function authAttemptRateLimitError(retryAfter) {
     retryAfter
   );
 }
+
 // ------------------------------------------------------------
 // Fallback mémoire : rate limiting des tentatives d'authentification
 // ------------------------------------------------------------
@@ -767,6 +835,7 @@ const authAttemptsMemory = new Map();
 const AUTH_ATTEMPT_MAX = 5;
 const AUTH_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
 const AUTH_ATTEMPT_BLOCK_MS = 15 * 60 * 1000;
+
 function checkAuthAttemptLimitMemory(attemptKey) {
   const now = Date.now();
   const entry = authAttemptsMemory.get(attemptKey);
@@ -787,6 +856,7 @@ function checkAuthAttemptLimitMemory(attemptKey) {
     );
   }
 }
+
 function recordAuthAttemptFailureMemory(attemptKey) {
   const now = Date.now();
   const entry = authAttemptsMemory.get(attemptKey);
@@ -801,6 +871,7 @@ function recordAuthAttemptFailureMemory(attemptKey) {
   entry.count += 1;
   entry.blockedUntil = null;
 }
+
 async function checkAuthAttemptLimit(attemptKey) {
   const { data, error } = await supabaseAdmin.rpc("auth_attempts_check", {
     p_attempt_key: attemptKey,
@@ -827,6 +898,7 @@ async function checkAuthAttemptLimit(attemptKey) {
     throw authAttemptRateLimitError(retryAfter);
   }
 }
+
 async function recordAuthAttemptFailure(attemptKey) {
   const { error } = await supabaseAdmin.rpc("auth_attempts_record_failure", {
     p_attempt_key: attemptKey,
@@ -839,6 +911,7 @@ async function recordAuthAttemptFailure(attemptKey) {
     throw dbError("auth_attempts_record_failure", error);
   }
 }
+
 async function resetAuthAttemptFailures(attemptKey) {
   const { error } = await supabaseAdmin.rpc("auth_attempts_reset_success", {
     p_attempt_key: attemptKey,
@@ -851,6 +924,7 @@ async function resetAuthAttemptFailures(attemptKey) {
     throw dbError("auth_attempts_reset_success", error);
   }
 }
+
 // ------------------------------------------------------------
 // Rate limiters en mémoire
 // ------------------------------------------------------------
@@ -888,13 +962,13 @@ function createRateLimiter({ windowMs, max, label, maxKeys = 50_000 }) {
     },
   };
 }
+
 const limiterStrict = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "auth" });
 const limiterRefresh = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30, label: "refresh" });
 const limiterOauth = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30, label: "oauth" });
 const limiterApi = createRateLimiter({ windowMs: 60 * 1000, max: 240, label: "api" });
 const limiterAccount = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, label: "account" });
 const limiterPublish = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 20, label: "publish" });
-// ✅ rate limiter dédié à la création de posts planifiés
 const limiterPosts = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 60, label: "posts" });
 const limiterPasswordReset = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 3, label: "password-reset" });
 const limiterMedia = createRateLimiter({ windowMs: 60 * 1000, max: 600, label: "media" });
@@ -905,26 +979,22 @@ const limiterGDrive = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 120, la
 const limiterGPhotos = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 240, label: "gphotos" });
 const limiterTags = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "tags" });
 const limiterGroups = createRateLimiter({ windowMs: 60 * 1000, max: 60, label: "groups" });
-// ✅ rate limiter dédié à la lecture YouTube (vidéos + commentaires)
 const limiterYouTubeRead = createRateLimiter({
   windowMs: 60 * 1000,
   max: 60,
   label: "youtube-read",
 });
-// ✅ NOUVEAU — rate limiter dédié aux écritures YouTube (réponses, marquage lu)
 const limiterYouTubeWrite = createRateLimiter({
   windowMs: 60 * 1000,
   max: 30,
   label: "youtube-write",
 });
-// ------------------------------------------------------------
-// BLOC 2 — Rate limiter saved replies
-// ------------------------------------------------------------
 const limiterSavedReplies = createRateLimiter({
   windowMs: 60 * 1000,
   max: 60,
   label: "saved-replies",
 });
+
 function enforce(limiter, key) {
   const { allowed, retryAfterSec } = limiter.check(key);
   if (!allowed) {
@@ -937,6 +1007,7 @@ function enforce(limiter, key) {
     );
   }
 }
+
 const STRICT_PATHS = new Set([
   "/api/auth/login",
   "/api/auth/check-verification",
@@ -944,7 +1015,8 @@ const STRICT_PATHS = new Set([
   "/api/auth/forgot-password",
   "/api/auth/reset-password",
 ]);
-const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox|googledrive|googlephotos)\/auth\//;
+const PROVIDER_AUTH_PATH = /^\/api\/(tiktok|pinterest|youtube|canva|dropbox|googledrive|googlephotos|instagram)\/auth\//;
+
 function pickLimiter(pathname) {
   if (STRICT_PATHS.has(pathname)) return limiterStrict;
   if (pathname === "/api/auth/refresh") return limiterRefresh;
@@ -953,6 +1025,7 @@ function pickLimiter(pathname) {
   }
   return limiterApi;
 }
+
 // ============================================================
 // CORS + EN-TÊTES DE SÉCURITÉ
 // ============================================================
@@ -981,6 +1054,7 @@ const allowedOrigins = new Set(
     .map(normalizeOrigin)
     .filter(Boolean)
 );
+
 function isOriginAllowed(origin) {
   if (!origin || typeof origin !== "string") return false;
   const normalized = normalizeOrigin(origin);
@@ -989,8 +1063,10 @@ function isOriginAllowed(origin) {
     VERCEL_DEPLOYMENT_ORIGIN_PATTERN.test(normalized)
   );
 }
+
 const warnedRejectedOrigins = new Set();
 const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Requested-With";
+
 function setCorsHeaders(req, res) {
   const origin = req.headers.origin;
   res.setHeader("Vary", "Origin");
@@ -1014,13 +1090,12 @@ function setCorsHeaders(req, res) {
   res.setHeader("Access-Control-Allow-Headers", CORS_ALLOWED_HEADERS);
   res.setHeader("Access-Control-Max-Age", "86400");
 }
+
 function setSecurityHeaders(res) {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Cache-Control", "no-store");
-  // ✅ diagnostic : permet de vérifier depuis le frontend que la réponse
-  // vient bien de CE serveur (et pas d'un SPA fallback).
   res.setHeader("X-Stone-Server", "1");
   res.setHeader(
     "Content-Security-Policy",
@@ -1033,6 +1108,7 @@ function setSecurityHeaders(res) {
     );
   }
 }
+
 // ============================================================
 // VALIDATION DU redirectTo
 // ============================================================
@@ -1054,12 +1130,14 @@ function sanitizeRedirectTo(value) {
     return DEFAULT_OAUTH_REDIRECT;
   }
 }
+
 // ============================================================
 // RÉPONSES + ERREURS
 // ============================================================
 function newRequestId() {
   return crypto.randomUUID().slice(0, 8);
 }
+
 function sendJson(res, statusCode, data, extraHeaders) {
   if (res.headersSent) {
     res.end();
@@ -1073,6 +1151,7 @@ function sendJson(res, statusCode, data, extraHeaders) {
   });
   res.end(payload);
 }
+
 function internalErrorResponse(res, requestId, error, context) {
   console.error(`[${requestId}] ${context}:`, error);
   if (res.headersSent) {
@@ -1089,13 +1168,25 @@ function internalErrorResponse(res, requestId, error, context) {
     request_id: requestId,
   });
 }
+
+function redirectTo(res, location) {
+  if (res.headersSent) return;
+  res.writeHead(302, {
+    Location: location,
+    "Content-Length": "0",
+  });
+  res.end();
+}
+
 // ============================================================
 // CORPS DES REQUÊTES
 // ============================================================
 const MAX_JSON_BODY = 1024 * 1024;
+
 function tooLargeError(message = "Request body too large") {
   return new HttpError(413, message, "BODY_TOO_LARGE", { Connection: "close" });
 }
+
 function readBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const declared = Number(req.headers["content-length"] || 0);
@@ -1127,6 +1218,7 @@ function readBody(req, maxBytes) {
     });
   });
 }
+
 async function getJsonBody(req) {
   const raw = await readBody(req, MAX_JSON_BODY);
   if (raw.length === 0) return {};
@@ -1139,7 +1231,9 @@ async function getJsonBody(req) {
     throw new HttpError(400, "Invalid JSON");
   }
 }
+
 const getRawBody = (req) => readBody(req, MAX_JSON_BODY);
+
 // ============================================================
 // MULTIPART
 // ============================================================
@@ -1223,6 +1317,7 @@ function parseMultipart(req, { fileField, maxSize }) {
     req.pipe(bb);
   });
 }
+
 function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
   return new Promise((resolve, reject) => {
     let bb;
@@ -1305,6 +1400,7 @@ function parseMultipartFiles(req, { fileField, maxFiles, maxFileSize }) {
     req.pipe(bb);
   });
 }
+
 // ------------------------------------------------------------
 // ✅ parseMultipartAny : équivalent `multer.any()`
 // ------------------------------------------------------------
@@ -1313,7 +1409,7 @@ function parseMultipartAny(
   {
     maxFiles = MAX_POST_FILES,
     maxFileSize = MAX_POST_FILE_SIZE,
-    maxFieldSize = 1024 * 1024, // 1 Mo pour le champ `data` (JSON)
+    maxFieldSize = 1024 * 1024,
     requireFile = false,
   } = {}
 ) {
@@ -1351,7 +1447,7 @@ function parseMultipartAny(
         tooLarge = true;
       });
       file.on("end", () => {
-        if (tooLarge) return; // ignore le fichier tronqué
+        if (tooLarge) return;
         files.push({
           fieldname,
           buffer: Buffer.concat(chunks),
@@ -1396,6 +1492,7 @@ function parseMultipartAny(
     req.pipe(bb);
   });
 }
+
 // ============================================================
 // VALIDATION DU TYPE DE FICHIER (magic bytes)
 // ============================================================
@@ -1406,6 +1503,7 @@ const AVATAR_EXTENSIONS = {
   "image/webp": "webp",
   "image/gif": "gif",
 };
+
 function sniffImageType(buffer) {
   if (!buffer || buffer.length < 12) return null;
   if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
@@ -1425,6 +1523,7 @@ function sniffImageType(buffer) {
   }
   return null;
 }
+
 function sniffVideoType(buffer) {
   if (!buffer || buffer.length < 12) return null;
   if (buffer.toString("ascii", 4, 8) === "ftyp") {
@@ -1437,6 +1536,7 @@ function sniffVideoType(buffer) {
   }
   return null;
 }
+
 function extractAvatarStoragePath(filePathOrUrl) {
   const marker = `/storage/v1/object/public/${AVATAR_BUCKET}/`;
   const markerIndex = filePathOrUrl.indexOf(marker);
@@ -1451,12 +1551,14 @@ function extractAvatarStoragePath(filePathOrUrl) {
   if (!filePathOrUrl.startsWith("http")) return filePathOrUrl;
   return null;
 }
+
 function isOwnedAvatarPath(storagePath, userId) {
   if (typeof storagePath !== "string") return false;
   if (storagePath.includes("..")) return false;
   if (storagePath.startsWith("/")) return false;
   return storagePath.startsWith(`${userId}/`);
 }
+
 // ============================================================
 // LIMITE DE CONCURRENCE DES UPLOADS
 // ============================================================
@@ -1465,12 +1567,14 @@ const MAX_VIDEO_QUEUE = 10;
 const VIDEO_QUEUE_TIMEOUT_MS = 60_000;
 let activeVideoUploads = 0;
 const videoUploadWaiters = [];
+
 const busyError = () =>
   new HttpError(
     503,
     "Server is busy processing uploads. Try again shortly.",
     "UPLOAD_QUEUE_FULL"
   );
+
 function acquireVideoSlot() {
   if (activeVideoUploads < MAX_VIDEO_UPLOADS) {
     activeVideoUploads++;
@@ -1494,6 +1598,7 @@ function acquireVideoSlot() {
     videoUploadWaiters.push(waiter);
   });
 }
+
 function releaseVideoSlot() {
   const next = videoUploadWaiters.shift();
   if (next) {
@@ -1502,12 +1607,14 @@ function releaseVideoSlot() {
     activeVideoUploads = Math.max(0, activeVideoUploads - 1);
   }
 }
+
 // ============================================================
 // AUTHENTIFICATION (avec cache court)
 // ============================================================
 const AUTH_CACHE_TTL_MS = 20_000;
 const AUTH_CACHE_MAX = 2_000;
 const authCache = new Map();
+
 function authCacheGet(token) {
   const key = sha256(token);
   const entry = authCache.get(key);
@@ -1518,6 +1625,7 @@ function authCacheGet(token) {
   }
   return entry.user;
 }
+
 function authCacheSet(token, user) {
   if (authCache.size >= AUTH_CACHE_MAX) {
     authCache.delete(authCache.keys().next().value);
@@ -1527,6 +1635,7 @@ function authCacheSet(token, user) {
     expires: Date.now() + AUTH_CACHE_TTL_MS,
   });
 }
+
 function authCacheInvalidateUser(userId) {
   for (const [key, entry] of authCache) {
     if (entry.user?.id === userId) authCache.delete(key);
@@ -1538,6 +1647,7 @@ setInterval(() => {
     if (entry.expires <= now) authCache.delete(key);
   }
 }, 60_000).unref?.();
+
 async function getAuthenticatedUser(req) {
   const authorization = req.headers.authorization;
   if (!authorization) {
@@ -1575,11 +1685,13 @@ async function getAuthenticatedUser(req) {
   authCacheSet(token, user);
   return { user, token, error: null, code: null };
 }
+
 async function adminUpdateUser(userId, attributes) {
   const result = await supabaseAdmin.auth.admin.updateUserById(userId, attributes);
   authCacheInvalidateUser(userId);
   return result;
 }
+
 // ============================================================
 // JETON DE RÉCUPÉRATION
 // ============================================================
@@ -1593,6 +1705,7 @@ function decodeJwtPayload(token) {
     return null;
   }
 }
+
 function isRecoverySessionToken(token) {
   const payload = decodeJwtPayload(token);
   if (!payload) return false;
@@ -1605,6 +1718,7 @@ function isRecoverySessionToken(token) {
   if (!Number.isFinite(issuedAt)) return false;
   return Date.now() / 1000 - issuedAt <= RECOVERY_TOKEN_MAX_AGE_SEC;
 }
+
 // ============================================================
 // MFA — AAL & FACTEURS (helpers)
 // ============================================================
@@ -1632,11 +1746,13 @@ function verifiedFactorsOf(user) {
   const factors = Array.isArray(user?.factors) ? user.factors : [];
   return factors.filter((f) => f?.status === "verified");
 }
+
 // ------------------------------------------------------------
 // Fallback mémoire si la table `mfa_verified_sessions` n'existe pas encore
 // ------------------------------------------------------------
 const mfaVerifiedMemory = new Map();
 const MFA_MEMORY_MAX = 10_000;
+
 function readVerifiedMfaSessionMemory(userId, sessionId) {
   const key = `${userId}:${sessionId}`;
   const expires = mfaVerifiedMemory.get(key);
@@ -1647,6 +1763,7 @@ function readVerifiedMfaSessionMemory(userId, sessionId) {
   }
   return true;
 }
+
 function writeVerifiedMfaSessionMemory(userId, sessionId) {
   if (mfaVerifiedMemory.size >= MFA_MEMORY_MAX) {
     mfaVerifiedMemory.delete(mfaVerifiedMemory.keys().next().value);
@@ -1662,6 +1779,7 @@ setInterval(() => {
     if (expires <= now) mfaVerifiedMemory.delete(key);
   }
 }, 60_000).unref?.();
+
 async function hasVerifiedMfaSession(userId, sessionId) {
   if (!sessionId) return false;
   const now = new Date().toISOString();
@@ -1691,6 +1809,7 @@ async function hasVerifiedMfaSession(userId, sessionId) {
   }
   return Boolean(data);
 }
+
 async function recordVerifiedMfaSession(userId, sessionId, method) {
   const now = new Date();
   const expiresAt = new Date(
@@ -1714,6 +1833,7 @@ async function recordVerifiedMfaSession(userId, sessionId, method) {
     throw dbError("mfa_verified_sessions.upsert", error);
   }
 }
+
 async function requireAal2(user, token) {
   if (!userHasVerifiedMfa(user)) return;
   if (getTokenAal(token) === "aal2") return;
@@ -1724,7 +1844,9 @@ async function requireAal2(user, token) {
     "MFA_REQUIRED"
   );
 }
+
 const RECOVERY_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
 function recoveryCodeHash(code) {
   if (!RECOVERY_CODE_PEPPER || Buffer.byteLength(RECOVERY_CODE_PEPPER) < 32) {
     throw new HttpError(
@@ -1738,11 +1860,13 @@ function recoveryCodeHash(code) {
     .update(code)
     .digest("hex");
 }
+
 function generateRecoveryCode() {
   const bytes = crypto.randomBytes(10);
   const raw = Array.from(bytes, (byte) => RECOVERY_CODE_ALPHABET[byte & 31]).join("");
   return `${raw.slice(0, 5)}-${raw.slice(5)}`;
 }
+
 async function getLatestRecoveryCodeBatch(userId) {
   const { data, error } = await supabaseAdmin
     .from("mfa_recovery_codes")
@@ -1754,6 +1878,7 @@ async function getLatestRecoveryCodeBatch(userId) {
   if (error) throw dbError("mfa_recovery_codes.latest_batch", error);
   return data;
 }
+
 async function getRemainingRecoveryCodeCount(userId, batchId) {
   const { count, error } = await supabaseAdmin
     .from("mfa_recovery_codes")
@@ -1767,6 +1892,7 @@ async function getRemainingRecoveryCodeCount(userId, batchId) {
   }
   return count;
 }
+
 async function replaceRecoveryCodeBatch(userId, batchId, hashes) {
   const { error } = await supabaseAdmin.rpc("mfa_recovery_replace_codes", {
     p_user_id: userId,
@@ -1775,6 +1901,7 @@ async function replaceRecoveryCodeBatch(userId, batchId, hashes) {
   });
   if (error) throw dbError("mfa_recovery_replace_codes", error);
 }
+
 function sendSecurityEmail(userId, type, meta = {}) {
   if (!userId || typeof type !== "string" || !type) {
     throw new Error("Invalid security email event");
@@ -1783,6 +1910,7 @@ function sendSecurityEmail(userId, type, meta = {}) {
   console.warn(`[security-email] not sent: provider not configured (${type})`);
   return false;
 }
+
 const WEBAUTHN_ALLOWED_TRANSPORTS = new Set([
   "ble",
   "hybrid",
@@ -1791,6 +1919,7 @@ const WEBAUTHN_ALLOWED_TRANSPORTS = new Set([
   "smart-card",
   "usb",
 ]);
+
 function validateWebAuthnResponse(response) {
   if (
     !response ||
@@ -1814,6 +1943,7 @@ function validateWebAuthnResponse(response) {
     throw new HttpError(400, "Invalid WebAuthn response", "INVALID_WEBAUTHN_RESPONSE");
   }
 }
+
 function normalizedWebAuthnTransports(transports) {
   if (!Array.isArray(transports)) return [];
   return transports.filter(
@@ -1821,11 +1951,13 @@ function normalizedWebAuthnTransports(transports) {
       typeof transport === "string" && WEBAUTHN_ALLOWED_TRANSPORTS.has(transport)
   );
 }
+
 function requireTotpForPasskey(user) {
   if (!userHasVerifiedMfa(user)) {
     throw new HttpError(400, "Enable an authenticator before using passkeys", "MFA_NOT_ENABLED");
   }
 }
+
 async function createWebAuthnChallenge(userId, sessionId, purpose, challenge) {
   const { error } = await supabaseAdmin.rpc("webauthn_create_challenge", {
     p_user_id: userId,
@@ -1835,6 +1967,7 @@ async function createWebAuthnChallenge(userId, sessionId, purpose, challenge) {
   });
   if (error) throw dbError("webauthn_create_challenge", error);
 }
+
 async function consumeWebAuthnChallenge(userId, sessionId, purpose) {
   const { data, error } = await supabaseAdmin.rpc("webauthn_consume_challenge", {
     p_user_id: userId,
@@ -1847,6 +1980,7 @@ async function consumeWebAuthnChallenge(userId, sessionId, purpose) {
   }
   return data[0].challenge;
 }
+
 async function getWebAuthnCredentials(userId) {
   const { data, error } = await supabaseAdmin
     .from("webauthn_credentials")
@@ -1859,6 +1993,7 @@ async function getWebAuthnCredentials(userId) {
   }
   return data;
 }
+
 // ============================================================
 // MFA — DETECTION PASSWORD VS OAUTH
 // ============================================================
@@ -1867,11 +2002,13 @@ function userHasPassword(user) {
   if (identities.length === 0) return true;
   return identities.some((i) => i?.provider === "email");
 }
+
 function userPrimaryProvider(user) {
   const identities = Array.isArray(user?.identities) ? user.identities : [];
   const external = identities.find((i) => i?.provider && i.provider !== "email");
   return external?.provider || "email";
 }
+
 // ============================================================
 // MFA — PROXY SUPABASE AUTH
 // ============================================================
@@ -1912,6 +2049,7 @@ async function supabaseAuthRequest(pathname, { method = "GET", token, json } = {
   }
   return data;
 }
+
 function toPublicFactor(f) {
   return {
     id: f.id,
@@ -1923,6 +2061,7 @@ function toPublicFactor(f) {
     created_at: f.created_at || f.createdAt || null,
   };
 }
+
 async function verifyMfaCode(factorId, code, token) {
   const challenge = await supabaseAuthRequest(
     `/factors/${encodeURIComponent(factorId)}/challenge`,
@@ -1957,6 +2096,7 @@ async function verifyMfaCode(factorId, code, token) {
   }
   return verify;
 }
+
 async function verifyMfaCodeWithAttempts(factorId, code, token, attemptKey) {
   try {
     const session = await verifyMfaCode(factorId, code, token);
@@ -1968,6 +2108,7 @@ async function verifyMfaCodeWithAttempts(factorId, code, token, attemptKey) {
     throw new HttpError(400, "Invalid authenticator code", "INVALID_MFA_CODE");
   }
 }
+
 // ============================================================
 // NORMALISATION UTILISATEUR
 // ============================================================
@@ -1977,6 +2118,7 @@ function resolveAvatar(metadata) {
   }
   return metadata.avatar_url || metadata.avatarUrl || metadata.picture || "";
 }
+
 function formatUser(user) {
   if (!user) return null;
   const metadata = user.user_metadata || {};
@@ -2009,6 +2151,7 @@ function formatUser(user) {
     provider,
   };
 }
+
 const sessionPayload = (session) =>
   session
     ? {
@@ -2016,6 +2159,7 @@ const sessionPayload = (session) =>
         refresh_token: session.refresh_token,
       }
     : null;
+
 // ============================================================
 // APP_METADATA
 // ============================================================
@@ -2032,6 +2176,7 @@ async function getAppMetadata(userId) {
   }
   return data.user.app_metadata || {};
 }
+
 function updateAppMetadata(userId, mutate) {
   return runSerial(`app-metadata:${userId}`, async () => {
     const current = await getAppMetadata(userId);
@@ -2042,6 +2187,7 @@ function updateAppMetadata(userId, mutate) {
     return next;
   });
 }
+
 // ============================================================
 // STRIPE — HELPERS
 // ============================================================
@@ -2049,6 +2195,7 @@ function requireStripe() {
   if (!stripe) throw new HttpError(500, "Stripe is not configured");
 }
 const isStripeMissing = (error) => error?.code === "resource_missing";
+
 async function getStripeCustomerId(user, { create = false } = {}) {
   const trusted = user.app_metadata?.stripe_customer_id;
   if (trusted) return trusted;
@@ -2114,6 +2261,7 @@ async function getStripeCustomerId(user, { create = false } = {}) {
     return customerId;
   });
 }
+
 async function resolveUserIdFromCustomer(customerId) {
   if (!customerId) return null;
   const id = typeof customerId === "string" ? customerId : customerId.id;
@@ -2128,6 +2276,7 @@ async function resolveUserIdFromCustomer(customerId) {
     throw error;
   }
 }
+
 function subscriptionSnapshot(subscription) {
   const price = subscription.items?.data?.[0]?.price;
   return {
@@ -2144,10 +2293,12 @@ function subscriptionSnapshot(subscription) {
         : subscription.customer?.id || null,
   };
 }
+
 const TERMINAL_SUBSCRIPTION_STATUSES = new Set([
   "canceled",
   "incomplete_expired",
 ]);
+
 async function syncSubscriptionToUser(
   userId,
   subscription,
@@ -2176,6 +2327,7 @@ async function syncSubscriptionToUser(
   });
   return written;
 }
+
 async function retrieveSubscription(subscriptionId, fallback) {
   try {
     return await stripe.subscriptions.retrieve(subscriptionId);
@@ -2184,8 +2336,10 @@ async function retrieveSubscription(subscriptionId, fallback) {
     throw error;
   }
 }
+
 const idOf = (value) =>
   typeof value === "string" ? value : value?.id || null;
+
 async function processStripeEvent(event) {
   const eventCreated = Number(event.created) || 0;
   try {
@@ -2258,6 +2412,7 @@ async function processStripeEvent(event) {
     throw error;
   }
 }
+
 // ============================================================
 // STATE OAUTH SIGNÉ
 // ============================================================
@@ -2267,12 +2422,14 @@ function hmac(value) {
     .update(value)
     .digest("hex");
 }
+
 function createOAuthState(provider, userId) {
   const payload = `${provider}.${userId}.${Date.now() + 10 * 60 * 1000}.${crypto
     .randomBytes(8)
     .toString("hex")}`;
   return Buffer.from(`${payload}.${hmac(payload)}`).toString("base64url");
 }
+
 function checkOAuthState(provider, state, userId) {
   if (!state) return "missing_state";
   try {
@@ -2295,6 +2452,36 @@ function checkOAuthState(provider, state, userId) {
     return "malformed_state";
   }
 }
+
+// ------------------------------------------------------------
+// Variante de checkOAuthState qui ne compare PAS au userId fourni :
+// elle EXTRAIT le userId du state, pour les callbacks OAuth qui
+// arrivent directement dans le navigateur (redirect, sans Bearer).
+// ------------------------------------------------------------
+function extractOAuthState(provider, state) {
+  if (!state || typeof state !== "string") return { error: "missing_state" };
+  if (state.length > 2048) return { error: "state_too_long" };
+  try {
+    const decoded = Buffer.from(state, "base64url").toString("utf-8");
+    const lastDot = decoded.lastIndexOf(".");
+    if (lastDot === -1) return { error: "malformed_state" };
+    const payload = decoded.slice(0, lastDot);
+    const signature = decoded.slice(lastDot + 1);
+    const a = Buffer.from(signature);
+    const b = Buffer.from(hmac(payload));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { error: "bad_signature" };
+    }
+    const [stateProvider, stateUserId, expiresAt] = payload.split(".");
+    if (stateProvider !== provider) return { error: "wrong_provider" };
+    if (!(Number(expiresAt) > Date.now())) return { error: "expired" };
+    if (!stateUserId) return { error: "missing_user" };
+    return { userId: stateUserId };
+  } catch {
+    return { error: "malformed_state" };
+  }
+}
+
 function assertValidOAuthCallback(provider, body, userId) {
   const code = String(body.code || "");
   let reason = null;
@@ -2307,6 +2494,7 @@ function assertValidOAuthCallback(provider, body, userId) {
   }
   return code;
 }
+
 // ============================================================
 // TOKENS OAUTH — LECTURE / ÉCRITURE
 // ============================================================
@@ -2319,13 +2507,16 @@ async function selectTokenRow(table, userId) {
   if (error) throw dbError(`${table} select`, error);
   return decryptTokenRow(data);
 }
+
 function isTokenFresh(account) {
   return Boolean(
     account?.access_token &&
     new Date(account.access_expires_at).getTime() > Date.now() + 60_000
   );
 }
+
 const isPast = (value) => new Date(value).getTime() <= Date.now();
+
 async function updateTokensIfUnchanged(table, userId, account, row) {
   let query = supabaseAdmin.from(table).update(row).eq("user_id", userId);
   query = account.updated_at
@@ -2335,7 +2526,9 @@ async function updateTokensIfUnchanged(table, userId, account, row) {
   if (error) throw dbError(`${table} update`, error);
   return Array.isArray(data) && data.length > 0;
 }
+
 const iso = (ms) => new Date(ms).toISOString();
+
 // ============================================================
 // TIKTOK — APPEL API
 // ============================================================
@@ -2352,6 +2545,7 @@ const TIKTOK_FRIENDLY_ERRORS = {
   access_denied:
     "Connection refused by TikTok. In sandbox mode, add the TikTok account as a Sandbox tester.",
 };
+
 async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) {
   const headers = {};
   let body;
@@ -2385,6 +2579,7 @@ async function tiktokApi(pathname, { method = "POST", token, json, form } = {}) 
   }
   return data;
 }
+
 // ============================================================
 // TIKTOK — TOKENS
 // ============================================================
@@ -2394,10 +2589,12 @@ const TIKTOK_PROFILE_TRANSIENT_RETRY_MS = 30 * 1000;
 const TIKTOK_PROFILE_DEAD_RETRY_MS = 5 * 60 * 1000;
 const tiktokProfileRefreshedAt = new Map();
 const tiktokProfileRetryAt = new Map();
+
 function clearTikTokProfileThrottle(userId) {
   tiktokProfileRefreshedAt.delete(userId);
   tiktokProfileRetryAt.delete(userId);
 }
+
 function buildTikTokTokenRow(t) {
   const now = Date.now();
   const accessTtl = Number(t.expires_in) || 24 * 60 * 60;
@@ -2415,6 +2612,7 @@ function buildTikTokTokenRow(t) {
   if (t.scope) row.scope = t.scope;
   return row;
 }
+
 async function saveTikTokTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("tiktok_accounts").upsert(
     { user_id: userId, ...buildTikTokTokenRow(t), ...extra },
@@ -2423,9 +2621,11 @@ async function saveTikTokTokens(userId, t, extra = {}) {
   if (error) throw new Error(error.message);
   clearTikTokProfileThrottle(userId);
 }
+
 async function getTikTokAccount(userId) {
   return selectTokenRow("tiktok_accounts", userId);
 }
+
 async function getValidTikTokToken(userId) {
   const notConnected = () =>
     new HttpError(400, "TikTok account not connected", "TIKTOK_NOT_CONNECTED");
@@ -2470,6 +2670,7 @@ async function getValidTikTokToken(userId) {
     throw new HttpError(409, "TikTok account changed during token refresh, please retry", "TIKTOK_REFRESH_CONFLICT");
   });
 }
+
 async function refreshTikTokProfile(userId, { force = false } = {}) {
   const lockKey = `tiktok-profile:${userId}:${force ? "force" : "normal"}`;
   return withLock(lockKey, async () => {
@@ -2528,6 +2729,7 @@ async function refreshTikTokProfile(userId, { force = false } = {}) {
     }
   });
 }
+
 // ============================================================
 // TIKTOK — UPLOAD
 // ============================================================
@@ -2537,6 +2739,7 @@ function computeChunking(size) {
   const chunkSize = 10 * MB;
   return { chunkSize, totalChunks: Math.ceil(size / chunkSize) };
 }
+
 async function putChunk(uploadUrl, part, mimeType, start, end, total) {
   const MAX_ATTEMPTS = 3;
   let lastError;
@@ -2567,6 +2770,7 @@ async function putChunk(uploadUrl, part, mimeType, start, end, total) {
   }
   throw new HttpError(502, "TikTok upload failed, please retry", "TIKTOK_UPLOAD_FAILED");
 }
+
 async function uploadVideoToTikTok(uploadUrl, buffer, mimeType, chunking) {
   const { chunkSize, totalChunks } = chunking;
   for (let i = 0; i < totalChunks; i++) {
@@ -2576,6 +2780,7 @@ async function uploadVideoToTikTok(uploadUrl, buffer, mimeType, chunking) {
     await putChunk(uploadUrl, part, mimeType, start, end, buffer.length);
   }
 }
+
 // ============================================================
 // TIKTOK — MODES / PRIVACY
 // ============================================================
@@ -2584,10 +2789,12 @@ function resolvePrivacy(requested) {
   const value = String(requested || "SELF_ONLY");
   return TIKTOK_PRIVACY_LEVELS.has(value) ? value : "SELF_ONLY";
 }
+
 function resolveVideoMode(requested) {
   if (TIKTOK_SANDBOX || TIKTOK_FORCE_DRAFT) return "draft";
   return requested === "draft" ? "draft" : "direct";
 }
+
 function brandFlags(fields, privacy) {
   const content = toBool(fields.brand_content_toggle);
   const organic = toBool(fields.brand_organic_toggle);
@@ -2603,6 +2810,7 @@ function brandFlags(fields, privacy) {
     ? { brand_content_toggle: content, brand_organic_toggle: organic }
     : {};
 }
+
 function buildPostInfo(fields) {
   const privacy = resolvePrivacy(fields.privacy_level);
   return {
@@ -2614,6 +2822,7 @@ function buildPostInfo(fields) {
     ...brandFlags(fields, privacy),
   };
 }
+
 async function initTikTokPublish(accessToken, mode, postInfoFields, sourceInfo) {
   return mode === "draft"
     ? tiktokApi("/v2/post/publish/inbox/video/init/", {
@@ -2625,6 +2834,7 @@ async function initTikTokPublish(accessToken, mode, postInfoFields, sourceInfo) 
         json: { post_info: buildPostInfo(postInfoFields), source_info: sourceInfo },
       });
 }
+
 const TIKTOK_PUBLISH_ID_PATTERN = /^[\w.:~-]+$/;
 const TIKTOK_PUBLISH_ID_MAX = 64;
 function isValidTikTokPublishId(value) {
@@ -2635,6 +2845,7 @@ function isValidTikTokPublishId(value) {
     TIKTOK_PUBLISH_ID_PATTERN.test(value)
   );
 }
+
 // ============================================================
 // TIKTOK — PHOTOS
 // ============================================================
@@ -2644,15 +2855,14 @@ async function ensureTikTokMediaBucket() {
     console.warn("TikTok media bucket:", error.message);
   }
 }
-// ------------------------------------------------------------
-// bucket public pour les médias de posts planifiés
-// ------------------------------------------------------------
+
 async function ensurePostMediaBucket() {
   const { error } = await supabaseAdmin.storage.createBucket(POST_MEDIA_BUCKET, { public: true });
   if (error && !/already exists|duplicate/i.test(error.message || "")) {
     console.warn("Post media bucket:", error.message);
   }
 }
+
 async function sweepTikTokMedia() {
   try {
     const { data, error } = await supabaseAdmin.storage
@@ -2675,6 +2885,7 @@ async function sweepTikTokMedia() {
     console.warn("TikTok media sweep failed:", error?.message || error);
   }
 }
+
 async function removeTikTokPhotos(names) {
   try {
     await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).remove(names);
@@ -2682,6 +2893,7 @@ async function removeTikTokPhotos(names) {
     // balayage périodique
   }
 }
+
 async function storeTikTokPhotos(photos) {
   const names = photos.map(
     (photo) =>
@@ -2711,6 +2923,7 @@ async function storeTikTokPhotos(photos) {
   }
   return names;
 }
+
 async function serveTikTokMedia(req, res, fileName) {
   if (req.method === "HEAD") {
     res.writeHead(200, {
@@ -2737,6 +2950,7 @@ async function serveTikTokMedia(req, res, fileName) {
   });
   res.end(buffer);
 }
+
 async function probePublicPhoto(imageUrl, index = 1, total = 1) {
   const label = total > 1 ? ` (photo ${index}/${total})` : "";
   let status = null;
@@ -2763,6 +2977,7 @@ async function probePublicPhoto(imageUrl, index = 1, total = 1) {
     throw new HttpError(502, `Invalid image${label} (HTTP ${status}, ${contentType || "no content-type"})`, "PHOTO_URL_INVALID");
   }
 }
+
 async function probePublicPhotos(imageUrls) {
   if (env("TIKTOK_SKIP_PHOTO_PROBE") === "1") return;
   const BATCH = 6;
@@ -2774,6 +2989,7 @@ async function probePublicPhotos(imageUrls) {
     );
   }
 }
+
 function buildPhotoPostInfo(mode, fields) {
   const caption = String(fields.title || "").trim();
   const postInfo = {
@@ -2789,10 +3005,12 @@ function buildPhotoPostInfo(mode, fields) {
   }
   return postInfo;
 }
+
 function resolvePhotoMode(requested) {
   if (TIKTOK_SANDBOX || TIKTOK_FORCE_DRAFT) return "draft";
   return requested === "draft" ? "draft" : "direct";
 }
+
 function initTikTokPhotoPublish(accessToken, mode, postInfo, imageUrls, coverIndex) {
   const payload = {
     post_info: postInfo,
@@ -2809,6 +3027,7 @@ function initTikTokPhotoPublish(accessToken, mode, postInfo, imageUrls, coverInd
     json: payload,
   });
 }
+
 // ============================================================
 // PINTEREST
 // ============================================================
@@ -2851,6 +3070,7 @@ async function pinterestApi(
   }
   return data;
 }
+
 function buildPinterestTokenRow(t, { replaceRefresh = false } = {}) {
   const now = Date.now();
   const accessTtl = Number(t.expires_in) || 30 * 24 * 60 * 60;
@@ -2871,6 +3091,7 @@ function buildPinterestTokenRow(t, { replaceRefresh = false } = {}) {
   else if (replaceRefresh) row.scope = null;
   return row;
 }
+
 async function savePinterestTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin.from("pinterest_accounts").upsert(
     {
@@ -2883,16 +3104,20 @@ async function savePinterestTokens(userId, t, extra = {}) {
   );
   if (error) throw dbError("pinterest_accounts upsert", error);
 }
+
 async function getPinterestAccount(userId) {
   return selectTokenRow("pinterest_accounts", userId);
 }
+
 const pinterestAccountMatchesEnv = (account) =>
   Boolean(account) && account.api_env === PINTEREST_ENVIRONMENT;
+
 const isPinterestInvalidGrant = (error) =>
   error instanceof HttpError &&
   (error.upstreamStatus === 400 ||
     error.upstreamStatus === 401 ||
     error.code === "invalid_grant");
+
 async function getValidPinterestToken(userId) {
   const load = async () => {
     const account = await getPinterestAccount(userId);
@@ -2938,6 +3163,7 @@ async function getValidPinterestToken(userId) {
     throw new HttpError(409, "Pinterest account changed during token refresh, please retry", "PINTEREST_REFRESH_CONFLICT");
   });
 }
+
 // ============================================================
 // YOUTUBE
 // ============================================================
@@ -2969,6 +3195,7 @@ async function googleRequest(requestUrl, { method = "GET", token, form, json } =
   }
   return data;
 }
+
 async function fetchYouTubeChannel(accessToken) {
   const data = await googleRequest(`${YOUTUBE_API_BASE}/channels?part=snippet&mine=true`, { token: accessToken });
   const channel = data.items?.[0];
@@ -2981,6 +3208,7 @@ async function fetchYouTubeChannel(accessToken) {
     avatarUrl: thumbnails.high?.url || thumbnails.medium?.url || thumbnails.default?.url || null,
   };
 }
+
 function buildYouTubeTokenRow(t) {
   const now = Date.now();
   const accessTtl = Number(t.expires_in) || 3600;
@@ -2998,18 +3226,22 @@ function buildYouTubeTokenRow(t) {
   }
   return row;
 }
+
 async function saveYouTubeTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("youtube_accounts")
     .upsert({ user_id: userId, ...buildYouTubeTokenRow(t), ...extra }, { onConflict: "user_id" });
   if (error) throw dbError("youtube_accounts upsert", error);
 }
+
 async function getYouTubeAccount(userId) {
   return selectTokenRow("youtube_accounts", userId);
 }
+
 const youtubeRefreshExpired = (account) =>
   !account.refresh_token ||
   Boolean(account.refresh_expires_at) && isPast(account.refresh_expires_at);
+
 async function getValidYouTubeToken(userId) {
   const load = async () => {
     const account = await getYouTubeAccount(userId);
@@ -3054,6 +3286,7 @@ async function getValidYouTubeToken(userId) {
     throw new HttpError(409, "YouTube account changed during token refresh, please retry", "YOUTUBE_REFRESH_CONFLICT");
   });
 }
+
 const YOUTUBE_FRIENDLY_ERRORS = {
   quotaExceeded: "YouTube daily quota reached for this app. Please try again tomorrow.",
   dailyLimitExceeded: "YouTube daily quota reached for this app. Please try again tomorrow.",
@@ -3068,6 +3301,7 @@ const YOUTUBE_FRIENDLY_ERRORS = {
   mediaBodyRequired: "The video file is empty.",
   videoTooLong: "This video is too long for your YouTube account.",
 };
+
 function youtubeApiError(status, data) {
   const reason =
     data?.error?.errors?.[0]?.reason ||
@@ -3076,8 +3310,6 @@ function youtubeApiError(status, data) {
   if (status === 401 || reason === "authError" || reason === "invalid_grant") {
     return reconnectError("YouTube", "YOUTUBE_REFRESH_EXPIRED");
   }
-  // Log de l'erreur Google brute pour distinguer
-  // « scope non stocké en base » de « scope refusé par Google ».
   console.warn("[youtube] erreur Google :", status, JSON.stringify(data?.error || data).slice(0, 400));
   if (reason === "insufficientPermissions") {
     return new HttpError(409, "YouTube permission missing, please reconnect your YouTube account.", "YOUTUBE_SCOPE_MISSING");
@@ -3091,6 +3323,7 @@ function youtubeApiError(status, data) {
     reason
   );
 }
+
 function parseYouTubeTags(raw) {
   const text = String(raw || "").trim();
   let list = [];
@@ -3114,6 +3347,7 @@ function parseYouTubeTags(raw) {
   }
   return tags;
 }
+
 function buildYouTubeMetadata(fields) {
   const title = String(fields.title || "").replace(/[<>]/g, "").trim();
   if (!title) throw new HttpError(400, "A title is required for YouTube videos.", "YOUTUBE_TITLE_REQUIRED");
@@ -3155,6 +3389,7 @@ function buildYouTubeMetadata(fields) {
     },
   };
 }
+
 async function initYouTubeUpload(accessToken, metadata, size, mimeType, notifySubscribers = true) {
   let result;
   try {
@@ -3183,6 +3418,7 @@ async function initYouTubeUpload(accessToken, metadata, size, mimeType, notifySu
   }
   return location;
 }
+
 async function youtubePut(uploadUrl, headers, body) {
   const { response, data } = await fetchJson(uploadUrl, { method: "PUT", headers, body, redirect: "manual" }, 120_000);
   if (response.status === 200 || response.status === 201) return { done: true, video: data };
@@ -3195,6 +3431,7 @@ async function youtubePut(uploadUrl, headers, body) {
   error.data = data;
   throw error;
 }
+
 async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
   const total = buffer.length;
   let offset = 0;
@@ -3228,6 +3465,7 @@ async function uploadVideoToYouTube(uploadUrl, buffer, mimeType) {
     }
   }
 }
+
 // ------------------------------------------------------------
 // YOUTUBE — LECTURE DES VIDÉOS & COMMENTAIRES
 // ------------------------------------------------------------
@@ -3246,8 +3484,7 @@ async function youtubeGet(pathname, params, token) {
   if (!result.response.ok) throw youtubeApiError(result.response.status, result.data);
   return result.data;
 }
-// `comments: true` → exige explicitement le scope force-ssl
-// (nécessaire pour lire les commentaires ET pour y répondre).
+
 async function getYouTubeReader(userId, { comments = false } = {}) {
   const account = await getYouTubeAccount(userId);
   if (!account) {
@@ -3268,7 +3505,7 @@ async function getYouTubeReader(userId, { comments = false } = {}) {
   const token = await getValidYouTubeToken(userId);
   return { token, channelId: account.channel_id };
 }
-// ✅ Formatage d'une réponse (commentaire enfant)
+
 function formatYouTubeReply(comment, channelId) {
   const s = comment?.snippet || {};
   return {
@@ -3280,7 +3517,7 @@ function formatYouTubeReply(comment, channelId) {
     is_own: (s.authorChannelId?.value || null) === channelId,
   };
 }
-// ✅ Formatage d'un thread (renvoie aussi les réponses)
+
 function formatYouTubeThread(item, channelId) {
   const top = item.snippet?.topLevelComment?.snippet || {};
   const replies = item.replies?.comments || [];
@@ -3302,7 +3539,7 @@ function formatYouTubeThread(item, channelId) {
     replies: replies.map((r) => formatYouTubeReply(r, channelId)),
   };
 }
-// IDs de commentaires déjà marqués comme lus par cet utilisateur
+
 async function getReadCommentIds(userId, ids) {
   if (ids.length === 0) return new Set();
   const { data, error } = await supabaseAdmin
@@ -3323,8 +3560,6 @@ async function getReadCommentIds(userId, ids) {
 // ============================================================
 // YOUTUBE INSIGHTS — HELPERS & CACHE
 // ============================================================
-
-// Cache simple en mémoire pour les insights (5 minutes)
 const youtubeInsightsCache = new Map();
 const INSIGHTS_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -3339,7 +3574,6 @@ function getCachedInsights(key) {
 }
 
 function setCachedInsights(key, data) {
-  // Limiter la taille du cache à 100 entrées
   if (youtubeInsightsCache.size >= 100) {
     youtubeInsightsCache.delete(youtubeInsightsCache.keys().next().value);
   }
@@ -3349,7 +3583,6 @@ function setCachedInsights(key, data) {
   });
 }
 
-// Nettoyeur périodique
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of youtubeInsightsCache) {
@@ -3357,9 +3590,6 @@ setInterval(() => {
   }
 }, 60_000).unref?.();
 
-/**
- * Parse une durée ISO 8601 (ex: PT1M30S) en secondes
- */
 function parseDurationToSeconds(duration) {
   if (!duration) return 0;
   const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -3370,24 +3600,16 @@ function parseDurationToSeconds(duration) {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
-/**
- * Vérifie si une vidéo est un Short (< 60s)
- */
 function isShortVideo(durationIso) {
   return parseDurationToSeconds(durationIso) <= 60;
 }
 
-/**
- * Récupère les vidéos publiées entre start et end via la playlist Uploads
- * et leurs stats spécifiques sur cette période.
- */
 async function fetchVideosInPeriod(ytToken, uploadsPlaylistId, startDate, endDate) {
-  const videosMap = new Map(); // id -> video info
+  const videosMap = new Map();
   let pageToken = null;
   const startMs = new Date(startDate).getTime();
-  const endMs = new Date(endDate).getTime() + 24 * 60 * 60 * 1000; // Inclure tout le jour de fin
+  const endMs = new Date(endDate).getTime() + 24 * 60 * 60 * 1000;
 
-  // 1. Parcourir la playlist uploads pour trouver les IDs pertinents
   while (true) {
     const params = new URLSearchParams({
       part: "contentDetails",
@@ -3397,17 +3619,16 @@ async function fetchVideosInPeriod(ytToken, uploadsPlaylistId, startDate, endDat
     if (pageToken) params.set("pageToken", pageToken);
 
     const data = await googleRequest(`${YOUTUBE_API_BASE}/playlistItems?${params.toString()}`, { token: ytToken });
-    
+
     const items = data.items || [];
     let shouldStop = false;
 
     for (const item of items) {
       const pubAtStr = item.contentDetails?.videoPublishedAt;
       if (!pubAtStr) continue;
-      
+
       const pubMs = new Date(pubAtStr).getTime();
-      
-      // La playlist est triée du plus récent au plus ancien.
+
       if (pubMs < startMs) {
         shouldStop = true;
         break;
@@ -3428,36 +3649,33 @@ async function fetchVideosInPeriod(ytToken, uploadsPlaylistId, startDate, endDat
   if (videosMap.size === 0) return [];
 
   const videoIds = Array.from(videosMap.keys());
-  
-  // 2. Récupérer les détails (titre, thumbnail, durée) par lots de 50
+
   const detailsMap = new Map();
   for (let i = 0; i < videoIds.length; i += 50) {
     const batchIds = videoIds.slice(i, i + 50);
-const params = new URLSearchParams({
-  part: "snippet,contentDetails,status",
-  id: batchIds.join(","),
-});
+    const params = new URLSearchParams({
+      part: "snippet,contentDetails,status",
+      id: batchIds.join(","),
+    });
     const data = await googleRequest(`${YOUTUBE_API_BASE}/videos?${params.toString()}`, { token: ytToken });
-    
-for (const v of (data.items || [])) {
-  const publishAt = v.status?.publishAt || null;
-  const isScheduled = Boolean(
-    publishAt && new Date(publishAt).getTime() > Date.now()
-  );
-  detailsMap.set(v.id, {
-    title: v.snippet?.title || "Sans titre",
-    thumbnail: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
-    duration: v.contentDetails?.duration || "PT0S",
-    status: isScheduled ? "scheduled" : "published",
-    publish_at: publishAt,
-  });
-}
+
+    for (const v of (data.items || [])) {
+      const publishAt = v.status?.publishAt || null;
+      const isScheduled = Boolean(
+        publishAt && new Date(publishAt).getTime() > Date.now()
+      );
+      detailsMap.set(v.id, {
+        title: v.snippet?.title || "Sans titre",
+        thumbnail: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
+        duration: v.contentDetails?.duration || "PT0S",
+        status: isScheduled ? "scheduled" : "published",
+        publish_at: publishAt,
+      });
+    }
   }
 
-  // 3. Récupérer les stats Analytics pour ces vidéos sur la période
   const statsMap = new Map();
-  
-  // Chunking pour l'API Analytics (max 500 IDs par requête)
+
   const chunks = [];
   for (let i = 0; i < videoIds.length; i += 500) {
     chunks.push(videoIds.slice(i, i + 500));
@@ -3472,13 +3690,12 @@ for (const v of (data.items || [])) {
       metrics: "views,likes,comments,shares",
       filters: `video==${chunkIds.join(",")}`,
     });
-    
+
     try {
       const report = await googleRequest(`${YOUTUBE_ANALYTICS_API}?${params.toString()}`, { token: ytToken });
       const rows = report.rows || [];
       const headers = report.columnHeaders || [];
-      
-      // Trouver les index des colonnes
+
       const idxVideo = headers.findIndex(h => h.name === "video");
       const idxViews = headers.findIndex(h => h.name === "views");
       const idxLikes = headers.findIndex(h => h.name === "likes");
@@ -3501,22 +3718,22 @@ for (const v of (data.items || [])) {
     }
   }
 
-return videoIds.map(id => {
-  const info = videosMap.get(id);
-  const details = detailsMap.get(id) || {};
-  const stats = statsMap.get(id) || { views: 0, likes: 0, comments: 0, shares: 0 };
+  return videoIds.map(id => {
+    const info = videosMap.get(id);
+    const details = detailsMap.get(id) || {};
+    const stats = statsMap.get(id) || { views: 0, likes: 0, comments: 0, shares: 0 };
 
-  return {
-    id,
-    title: details.title,
-    thumbnail: details.thumbnail,
-    published_at: info.published_at,
-    is_short: isShortVideo(details.duration),
-    status: details.status || "published",    // ← NOUVEAU
-    publish_at: details.publish_at || null,   // ← NOUVEAU
-    ...stats,
-  };
-});
+    return {
+      id,
+      title: details.title,
+      thumbnail: details.thumbnail,
+      published_at: info.published_at,
+      is_short: isShortVideo(details.duration),
+      status: details.status || "published",
+      publish_at: details.publish_at || null,
+      ...stats,
+    };
+  });
 }
 
 // ============================================================
@@ -3533,13 +3750,16 @@ function buildGDriveTokenRow(t) {
   if (t.scope) row.scope = t.scope;
   return row;
 }
+
 async function saveGDriveTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("google_drive_accounts")
     .upsert({ user_id: userId, ...buildGDriveTokenRow(t), ...extra }, { onConflict: "user_id" });
   if (error) throw dbError("google_drive_accounts upsert", error);
 }
+
 const getGDriveAccount = (userId) => selectTokenRow("google_drive_accounts", userId);
+
 async function getValidGDriveToken(userId) {
   const load = async () => {
     const account = await getGDriveAccount(userId);
@@ -3584,6 +3804,7 @@ async function getValidGDriveToken(userId) {
     throw new HttpError(409, "Google Drive account changed during token refresh, please retry", "GDRIVE_REFRESH_CONFLICT");
   });
 }
+
 async function gdriveRequest(requestUrl, { method = "GET", token, headers = {}, body, timeoutMs = 20_000 } = {}) {
   let result;
   try {
@@ -3614,6 +3835,7 @@ async function gdriveRequest(requestUrl, { method = "GET", token, headers = {}, 
   }
   return data;
 }
+
 const GDRIVE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 function parseGDriveFolderId(value) {
   const id = String(value ?? "").trim();
@@ -3621,6 +3843,7 @@ function parseGDriveFolderId(value) {
   if (!GDRIVE_ID_PATTERN.test(id)) throw new HttpError(400, "Invalid Google Drive folder id", "INVALID_GDRIVE_ID");
   return id;
 }
+
 // ============================================================
 // GOOGLE PHOTOS
 // ============================================================
@@ -3634,13 +3857,16 @@ function buildGPhotosTokenRow(t) {
   if (t.scope) row.scope = t.scope;
   return row;
 }
+
 async function saveGPhotosTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("google_photos_accounts")
     .upsert({ user_id: userId, ...buildGPhotosTokenRow(t), ...extra }, { onConflict: "user_id" });
   if (error) throw dbError("google_photos_accounts upsert", error);
 }
+
 const getGPhotosAccount = (userId) => selectTokenRow("google_photos_accounts", userId);
+
 async function getValidGPhotosToken(userId) {
   const load = async () => {
     const account = await getGPhotosAccount(userId);
@@ -3682,6 +3908,7 @@ async function getValidGPhotosToken(userId) {
     throw new HttpError(409, "Google Photos account changed during token refresh, please retry", "GPHOTOS_REFRESH_CONFLICT");
   });
 }
+
 async function gphotosPicker(pathname, { method = "GET", token, json } = {}) {
   let result;
   try {
@@ -3715,20 +3942,24 @@ async function gphotosPicker(pathname, { method = "GET", token, json } = {}) {
   }
   return data;
 }
+
 function parseGPhotosSessionId(value) {
   const id = String(value ?? "").trim();
   if (!GPHOTOS_SESSION_ID.test(id)) throw new HttpError(400, "Invalid session id", "INVALID_GPHOTOS_SESSION");
   return id;
 }
+
 function isGoogleMediaHost(hostname) {
   const h = hostname.toLowerCase();
   return h === "googleusercontent.com" || h.endsWith(".googleusercontent.com");
 }
+
 // ============================================================
 // CANVA
 // ============================================================
 const canvaPkce = new Map();
 const CANVA_PKCE_TTL_MS = 10 * 60 * 1000;
+
 function createCanvaPkce(state) {
   const now = Date.now();
   for (const [key, entry] of canvaPkce) {
@@ -3740,12 +3971,14 @@ function createCanvaPkce(state) {
   canvaPkce.set(sha256(state), { verifier, expires: now + CANVA_PKCE_TTL_MS });
   return challenge;
 }
+
 function takeCanvaVerifier(state) {
   const key = sha256(state);
   const entry = canvaPkce.get(key);
   canvaPkce.delete(key);
   return entry && entry.expires > Date.now() ? entry.verifier : null;
 }
+
 async function canvaApi(pathname, { method = "GET", token, basic = false, form, json } = {}) {
   const headers = { Accept: "application/json" };
   let body;
@@ -3782,6 +4015,7 @@ async function canvaApi(pathname, { method = "GET", token, basic = false, form, 
   }
   return data;
 }
+
 function buildCanvaTokenRow(t) {
   const accessTtl = Number(t.expires_in) || 4 * 60 * 60;
   const row = {
@@ -3793,13 +4027,16 @@ function buildCanvaTokenRow(t) {
   if (t.scope) row.scope = t.scope;
   return row;
 }
+
 async function saveCanvaTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("canva_accounts")
     .upsert({ user_id: userId, ...buildCanvaTokenRow(t), ...extra }, { onConflict: "user_id" });
   if (error) throw dbError("canva_accounts upsert", error);
 }
+
 const getCanvaAccount = (userId) => selectTokenRow("canva_accounts", userId);
+
 async function getValidCanvaToken(userId) {
   const load = async () => {
     const account = await getCanvaAccount(userId);
@@ -3845,6 +4082,7 @@ async function getValidCanvaToken(userId) {
     throw new HttpError(409, "Canva account changed during token refresh, please retry", "CANVA_REFRESH_CONFLICT");
   });
 }
+
 // ============================================================
 // DROPBOX
 // ============================================================
@@ -3855,10 +4093,12 @@ const DROPBOX_FRIENDLY_ERRORS = {
   "path/malformed_path": "Invalid Dropbox path.",
   missing_scope: "Dropbox permission missing, please reconnect your Dropbox account.",
 };
+
 const dropboxArgHeader = (obj) =>
   JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) =>
     "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")
   );
+
 function dropboxApiError(response, data) {
   const summary = String(data?.error_summary || "");
   const tag = data?.error?.[".tag"];
@@ -3877,6 +4117,7 @@ function dropboxApiError(response, data) {
   error.upstreamStatus = response.status;
   return error;
 }
+
 async function dropboxRpc(pathname, { token, json } = {}) {
   const headers = { Authorization: `Bearer ${token}` };
   let body;
@@ -3893,6 +4134,7 @@ async function dropboxRpc(pathname, { token, json } = {}) {
   if (!result.response.ok) throw dropboxApiError(result.response, result.data);
   return result.data;
 }
+
 async function dropboxToken(form) {
   let result;
   try {
@@ -3924,6 +4166,7 @@ async function dropboxToken(form) {
   }
   return data;
 }
+
 function buildDropboxTokenRow(t) {
   const accessTtl = Number(t.expires_in) || 4 * 60 * 60;
   const row = {
@@ -3936,13 +4179,16 @@ function buildDropboxTokenRow(t) {
   if (t.account_id) row.account_id = t.account_id;
   return row;
 }
+
 async function saveDropboxTokens(userId, t, extra = {}) {
   const { error } = await supabaseAdmin
     .from("dropbox_accounts")
     .upsert({ user_id: userId, ...buildDropboxTokenRow(t), ...extra }, { onConflict: "user_id" });
   if (error) throw dbError("dropbox_accounts upsert", error);
 }
+
 const getDropboxAccount = (userId) => selectTokenRow("dropbox_accounts", userId);
+
 async function getValidDropboxToken(userId) {
   const load = async () => {
     const account = await getDropboxAccount(userId);
@@ -3985,6 +4231,7 @@ async function getValidDropboxToken(userId) {
     throw new HttpError(409, "Dropbox account changed during token refresh, please retry", "DROPBOX_REFRESH_CONFLICT");
   });
 }
+
 function parseDropboxPath(value, { allowRoot = false } = {}) {
   const path = String(value ?? "").trim();
   if (allowRoot && (path === "" || path === "/")) return "";
@@ -3993,6 +4240,70 @@ function parseDropboxPath(value, { allowRoot = false } = {}) {
   }
   return path;
 }
+
+// ============================================================
+// INSTAGRAM — HELPERS
+// ============================================================
+async function instagramGraphRequest(pathname, params = {}) {
+  const query = new URLSearchParams(params).toString();
+  let result;
+  try {
+    result = await fetchJson(
+      `${INSTAGRAM_GRAPH_API}${pathname}${query ? `?${query}` : ""}`,
+      {},
+      20_000
+    );
+  } catch (error) {
+    throw upstreamError("Instagram Graph", error);
+  }
+  const { response, data } = result;
+  if (!response.ok) {
+    const msg =
+      data?.error?.message || `Instagram Graph error (HTTP ${response.status})`;
+    throw new HttpError(
+      upstreamStatus(response.status),
+      msg,
+      data?.error?.code ? String(data.error.code) : undefined
+    );
+  }
+  return data;
+}
+
+async function saveInstagramTokens(userId, t, extra = {}) {
+  const row = {
+    user_id: userId,
+    access_token: encryptSecret(t.access_token),
+    access_expires_at: t.expires_in
+      ? iso(Date.now() + Number(t.expires_in) * 1000)
+      : null,
+    updated_at: new Date().toISOString(),
+    ...extra,
+  };
+  const { error } = await supabaseAdmin
+    .from("instagram_accounts")
+    .upsert(row, { onConflict: "user_id" });
+  if (error) throw dbError("instagram_accounts upsert", error);
+}
+
+const getInstagramAccount = (userId) =>
+  selectTokenRow("instagram_accounts", userId);
+
+async function getValidInstagramToken(userId) {
+  const account = await getInstagramAccount(userId);
+  if (!account) {
+    throw new HttpError(
+      400,
+      "Instagram account not connected",
+      "INSTAGRAM_NOT_CONNECTED"
+    );
+  }
+  if (!account.access_token) {
+    throw reconnectError("Instagram", "INSTAGRAM_REFRESH_EXPIRED");
+  }
+  // SUAT : pas d'expiration → pas de refresh.
+  return account;
+}
+
 // ============================================================
 // ROUTEUR
 // ============================================================
@@ -4002,6 +4313,7 @@ function route(methods, pathname, handler, { auth = false } = {}) {
     routes.set(`${method} ${pathname}`, { handler, auth });
   }
 }
+
 // ============================================================
 // ROUTES — HEALTH
 // ============================================================
@@ -4018,12 +4330,14 @@ route("GET", "/api/health", ({ res }) => {
     googlephotos: gphotosEnabled,
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
+    instagram: instagramEnabled,
     tags: true,
     groups: true,
     saved_replies: true,
     posts: true,
   });
 });
+
 // ============================================================
 // ROUTES — AUTH
 // ============================================================
@@ -4058,6 +4372,7 @@ route("POST", "/api/auth/signup", async ({ req, res }) => {
       : "Account created. Check your email to confirm your account.",
   });
 });
+
 route("POST", "/api/auth/login", async ({ req, res }) => {
   const body = await getJsonBody(req);
   const email = typeof body.email === "string" ? normalizeEmail(body.email) : "";
@@ -4089,6 +4404,7 @@ route("POST", "/api/auth/login", async ({ req, res }) => {
     aal: sessionAal,
   });
 });
+
 route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   const body = await getJsonBody(req);
   const email = normalizeEmail(body.email);
@@ -4117,6 +4433,7 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
     aal: sessionAal,
   });
 });
+
 route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
   const body = await getJsonBody(req);
   const email = normalizeEmail(body.email);
@@ -4136,6 +4453,7 @@ route("POST", "/api/auth/forgot-password", async ({ req, res, requestId }) => {
     message: "If an account exists for this email, a password reset link has been sent.",
   });
 });
+
 route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   const body = await getJsonBody(req);
   const password = String(body.password ?? body.newPassword ?? body.new_password ?? "");
@@ -4179,6 +4497,7 @@ route("POST", "/api/auth/reset-password", async ({ req, res, requestId }) => {
   authCacheInvalidateUser(user.id);
   sendJson(res, 200, { success: true, message: "Password updated successfully. You can now sign in." });
 });
+
 function registerOAuthLoginRoute(provider, extraOptions) {
   route("POST", `/api/auth/${provider}/url`, async ({ req, res }) => {
     const body = await getJsonBody(req).catch(() => ({}));
@@ -4191,10 +4510,12 @@ function registerOAuthLoginRoute(provider, extraOptions) {
     sendJson(res, 200, { success: true, url: data.url });
   });
 }
+
 registerOAuthLoginRoute("google", {
   queryParams: { access_type: "offline", prompt: "select_account" },
 });
 registerOAuthLoginRoute("github", { scopes: "read:user user:email" });
+
 route("POST", "/api/auth/logout", async ({ req, res }) => {
   const authorization = req.headers.authorization || "";
   const token = authorization.replace(/^Bearer\s+/i, "").trim();
@@ -4209,12 +4530,14 @@ route("POST", "/api/auth/logout", async ({ req, res }) => {
   }
   sendJson(res, 200, { success: true });
 });
+
 route("POST", "/api/auth/sessions/revoke-others", async ({ res, user, token }) => {
   const { error } = await supabaseAdmin.auth.admin.signOut(token, "others");
   if (error) throw dbError("auth.admin.signOut(others)", error);
   authCacheInvalidateUser(user.id);
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("POST", "/api/auth/refresh", async ({ req, res }) => {
   const body = await getJsonBody(req);
   const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
@@ -4229,6 +4552,7 @@ route("POST", "/api/auth/refresh", async ({ req, res }) => {
     aal: getTokenAal(data.session.access_token),
   });
 });
+
 route("POST", "/api/auth/resend-verification", async ({ res, user }) => {
   if (user.email_confirmed_at) throw new HttpError(400, "This email is already verified");
   if (!user.email) throw new HttpError(400, "No email associated with this account");
@@ -4237,6 +4561,7 @@ route("POST", "/api/auth/resend-verification", async ({ res, user }) => {
   if (error) throw error;
   sendJson(res, 200, { success: true, message: "Verification email sent" });
 }, { auth: true });
+
 // ============================================================
 // ROUTES — MFA (proxy complet)
 // ============================================================
@@ -4255,6 +4580,7 @@ route("GET", "/api/auth/mfa/status", async ({ res, user, token }) => {
     factors: factors.map(toPublicFactor),
   });
 }, { auth: true });
+
 route("GET", "/api/mfa/factors", ({ res, url, user }) => {
   const includeUnverified = url.searchParams.get("status") === "all";
   const factors = (Array.isArray(user.factors) ? user.factors : [])
@@ -4266,6 +4592,7 @@ route("GET", "/api/mfa/factors", ({ res, url, user }) => {
     .map(toPublicFactor);
   sendJson(res, 200, { success: true, factors });
 }, { auth: true });
+
 route("GET", "/api/mfa/recovery-codes", async ({ res, user }) => {
   const batch = await getLatestRecoveryCodeBatch(user.id);
   const remaining = batch
@@ -4277,6 +4604,7 @@ route("GET", "/api/mfa/recovery-codes", async ({ res, user }) => {
     generatedAt: batch?.created_at || null,
   });
 }, { auth: true });
+
 route("POST", "/api/mfa/recovery-codes", async ({ res, user, token }) => {
   await requireAal2(user, token);
   if (!userHasVerifiedMfa(user)) {
@@ -4289,6 +4617,7 @@ route("POST", "/api/mfa/recovery-codes", async ({ res, user, token }) => {
   sendSecurityEmail(user.id, "recovery_codes_regenerated", { count: codes.length });
   sendJson(res, 200, { success: true, codes });
 }, { auth: true });
+
 route("POST", "/api/mfa/recovery-codes/verify", async ({ req, res, user, token }) => {
   const body = await getJsonBody(req);
   if (typeof body.code !== "string" || body.code.length > 32) {
@@ -4360,6 +4689,7 @@ route("POST", "/api/mfa/recovery-codes/verify", async ({ req, res, user, token }
     remaining,
   });
 }, { auth: true });
+
 route("POST", "/api/mfa/passkeys/register/options", async ({ req, res, user, token }) => {
   requireTotpForPasskey(user);
   await requireAal2(user, token);
@@ -4399,6 +4729,7 @@ route("POST", "/api/mfa/passkeys/register/options", async ({ req, res, user, tok
   await createWebAuthnChallenge(user.id, sessionId, "register", options.challenge);
   sendJson(res, 200, { success: true, options });
 }, { auth: true });
+
 route("POST", "/api/mfa/passkeys/register/verify", async ({ req, res, user, token }) => {
   requireTotpForPasskey(user);
   await requireAal2(user, token);
@@ -4464,6 +4795,7 @@ route("POST", "/api/mfa/passkeys/register/verify", async ({ req, res, user, toke
     passkey: { id: data.id, name, createdAt: data.created_at },
   });
 }, { auth: true });
+
 route("GET", "/api/mfa/passkeys", async ({ res, user }) => {
   const credentials = await getWebAuthnCredentials(user.id);
   sendJson(res, 200, {
@@ -4476,6 +4808,7 @@ route("GET", "/api/mfa/passkeys", async ({ res, user }) => {
     })),
   });
 }, { auth: true });
+
 route("DELETE", "/api/mfa/passkeys", async ({ res, url, user, token }) => {
   await requireAal2(user, token);
   const id = url.searchParams.get("id");
@@ -4496,6 +4829,7 @@ route("DELETE", "/api/mfa/passkeys", async ({ res, url, user, token }) => {
   if (!data) throw new HttpError(404, "Passkey not found", "PASSKEY_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("POST", "/api/mfa/passkeys/authenticate/options", async ({ res, user, token }) => {
   requireTotpForPasskey(user);
   const sessionId = getTokenSessionId(token);
@@ -4516,6 +4850,7 @@ route("POST", "/api/mfa/passkeys/authenticate/options", async ({ res, user, toke
   await createWebAuthnChallenge(user.id, sessionId, "authenticate", options.challenge);
   sendJson(res, 200, { success: true, options });
 }, { auth: true });
+
 route("POST", "/api/mfa/passkeys/authenticate/verify", async ({ req, res, user, token }) => {
   requireTotpForPasskey(user);
   const body = await getJsonBody(req);
@@ -4587,6 +4922,7 @@ route("POST", "/api/mfa/passkeys/authenticate/verify", async ({ req, res, user, 
   await recordVerifiedMfaSession(user.id, sessionId, "passkey");
   sendJson(res, 200, { success: true, session: { access_token: token } });
 }, { auth: true });
+
 route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
   if (userHasVerifiedMfa(user)) await requireAal2(user, token);
   enforce(limiterAccount, `mfa-enroll:${user.id}`);
@@ -4628,6 +4964,7 @@ route("POST", "/api/mfa/enroll", async ({ res, user, token }) => {
     secret,
   });
 }, { auth: true });
+
 route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
   const body = await getJsonBody(req);
   const factorId = typeof body.factorId === "string" ? body.factorId.trim() : "";
@@ -4652,6 +4989,7 @@ route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
     },
   });
 }, { auth: true });
+
 route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
   const body = await getJsonBody(req);
   let factorId = typeof body.factorId === "string" ? body.factorId.trim() : "";
@@ -4676,6 +5014,7 @@ route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
     },
   });
 }, { auth: true });
+
 route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
   const factorId = url.searchParams.get("factorId");
   if (!factorId || factorId.length > 128) throw new HttpError(400, "Missing factorId");
@@ -4697,6 +5036,7 @@ route("DELETE", "/api/mfa/factors", async ({ res, url, user, token }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // ROUTES — TAGS
 // ============================================================
@@ -4725,6 +5065,7 @@ function parseTagInput(body) {
   }
   return { name, color };
 }
+
 function formatTag(row) {
   return {
     id: row.id,
@@ -4734,6 +5075,7 @@ function formatTag(row) {
     updated_at: row.updated_at,
   };
 }
+
 route("GET", "/api/tags", async ({ res, user }) => {
   const { data, error } = await supabaseAdmin
     .from("tags")
@@ -4750,6 +5092,7 @@ route("GET", "/api/tags", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true, tags: (data || []).map(formatTag) });
 }, { auth: true });
+
 route(["POST", "PUT"], "/api/tags", async ({ req, res, user }) => {
   enforce(limiterTags, `tags:${user.id}`);
   const body = await getJsonBody(req);
@@ -4817,6 +5160,7 @@ route(["POST", "PUT"], "/api/tags", async ({ req, res, user }) => {
   }
   sendJson(res, 200, { success: true, tag: formatTag(data) });
 }, { auth: true });
+
 route("DELETE", "/api/tags", async ({ req, res, url, user }) => {
   enforce(limiterTags, `tags:${user.id}`);
   let id = url.searchParams.get("id");
@@ -4844,18 +5188,10 @@ route("DELETE", "/api/tags", async ({ req, res, url, user }) => {
   if (!data) throw new HttpError(404, "Tag not found", "TAG_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // ROUTES — GROUPS (colonnes du board : To Do, In Progress, …)
 // ============================================================
-//
-//   GET    /api/groups          → { success, groups: [{ id, name, color, … }] }
-//   POST   /api/groups          → { success, group }   body: { name, color }
-//   PUT    /api/groups          → { success, group }   body: { id, name, color }
-//   DELETE /api/groups?id=<id>  → { success }
-//
-// Même contrat que /api/tags, mais dans la table `groups`.
-// Les tags (étiquettes libres) et les groupes (colonnes) sont indépendants.
-// ------------------------------------------------------------
 const GROUP_COLUMNS = "id,name,color,created_at,updated_at";
 
 function parseGroupInput(body) {
@@ -5012,10 +5348,12 @@ route("DELETE", "/api/groups", async ({ req, res, url, user }) => {
   if (!data) throw new HttpError(404, "Group not found", "GROUP_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // BLOC 3 — ROUTES — SAVED REPLIES
 // ============================================================
 const SAVED_REPLY_COLUMNS = "id,name,content,created_at,updated_at";
+
 function parseSavedReplyInput(body) {
   const name = String(body.name ?? body.title ?? body.label ?? "").trim();
   const content = String(body.content ?? body.text ?? body.body ?? "").trim();
@@ -5042,12 +5380,12 @@ function parseSavedReplyInput(body) {
       "SAVED_REPLY_CONTENT_TOO_LONG"
     );
   }
-  // Autorise \n et \t, refuse les autres caractères de contrôle.
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(content)) {
     throw new HttpError(400, "Invalid saved reply content", "SAVED_REPLY_CONTENT_INVALID");
   }
   return { name, content };
 }
+
 function formatSavedReply(row) {
   return {
     id: row.id,
@@ -5057,6 +5395,7 @@ function formatSavedReply(row) {
     updated_at: row.updated_at,
   };
 }
+
 route("GET", "/api/saved-replies", async ({ res, user }) => {
   const { data, error } = await supabaseAdmin
     .from("saved_replies")
@@ -5073,6 +5412,7 @@ route("GET", "/api/saved-replies", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true, replies: (data || []).map(formatSavedReply) });
 }, { auth: true });
+
 route(["POST", "PUT"], "/api/saved-replies", async ({ req, res, user }) => {
   enforce(limiterSavedReplies, `saved-replies:${user.id}`);
   const body = await getJsonBody(req);
@@ -5136,6 +5476,7 @@ route(["POST", "PUT"], "/api/saved-replies", async ({ req, res, user }) => {
   }
   sendJson(res, 200, { success: true, reply: formatSavedReply(data) });
 }, { auth: true });
+
 route("DELETE", "/api/saved-replies", async ({ req, res, url, user }) => {
   enforce(limiterSavedReplies, `saved-replies:${user.id}`);
   let id = url.searchParams.get("id");
@@ -5163,24 +5504,16 @@ route("DELETE", "/api/saved-replies", async ({ req, res, url, user }) => {
   if (!data) throw new HttpError(404, "Saved reply not found", "SAVED_REPLY_NOT_FOUND");
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // ROUTES — SCHEDULED POSTS
 // ============================================================
-//
-// Équivalent natif du fichier multer :
-//   POST   /api/posts   (multipart, `upload.any()`)
-//   GET    /api/posts
-//   DELETE /api/posts
-//
-// Le champ `data` contient le JSON de configuration, les fichiers
-// sont nommés `media` (partagés) ou `media_<network>` (par réseau).
-// Les médias sont stockés dans le bucket public `post-media`.
-// ------------------------------------------------------------
 function sanitizePostExtension(fileName) {
   const raw = String(fileName || "").split(".").pop() || "";
   const ext = raw.toLowerCase();
   return /^[a-z0-9]{1,10}$/.test(ext) ? ext : "bin";
 }
+
 async function uploadPostFile(userId, file) {
   const ext = sanitizePostExtension(file.fileName);
   const objectPath = `${userId}/${crypto.randomUUID()}.${ext}`;
@@ -5196,6 +5529,7 @@ async function uploadPostFile(userId, file) {
     kind: mimeType.startsWith("video/") ? "video" : "image",
   };
 }
+
 route("POST", "/api/posts", async ({ req, res, user }) => {
   enforce(limiterPosts, `posts:${user.id}`);
   const declared = Number(req.headers["content-length"] || 0);
@@ -5244,7 +5578,6 @@ route("POST", "/api/posts", async ({ req, res, user }) => {
   if (networks.length === 0) {
     throw new HttpError(400, "At least one network is required", "NO_NETWORK");
   }
-  // Upload des médias partagés (fieldname === "media") une seule fois
   const shared = await Promise.all(
     files.filter((f) => f.fieldname === "media").map((f) => uploadPostFile(userId, f))
   );
@@ -5291,11 +5624,12 @@ route("POST", "/api/posts", async ({ req, res, user }) => {
   if (error) throw dbError("scheduled_posts.insert", error);
   sendJson(res, 200, { success: true, posts: inserted });
 }, { auth: true });
+
 route("GET", "/api/posts", async ({ res, url, user }) => {
   let q = supabaseAdmin
     .from("scheduled_posts")
     .select("*")
-    .eq("user_id", user.id) // service role : filtrer explicitement par user
+    .eq("user_id", user.id)
     .not("scheduled_at", "is", null)
     .order("scheduled_at");
   const from = url.searchParams.get("from");
@@ -5306,6 +5640,7 @@ route("GET", "/api/posts", async ({ res, url, user }) => {
   if (error) throw dbError("scheduled_posts.list", error);
   sendJson(res, 200, { success: true, posts: data });
 }, { auth: true });
+
 route("DELETE", "/api/posts", async ({ res, url, user }) => {
   const id = url.searchParams.get("id");
   if (!id) throw new HttpError(400, "Missing post id", "POST_ID_REQUIRED");
@@ -5317,9 +5652,7 @@ route("DELETE", "/api/posts", async ({ res, url, user }) => {
   if (error) throw dbError("scheduled_posts.delete", error);
   sendJson(res, 200, { success: true });
 }, { auth: true });
-// ------------------------------------------------------------
-// transition périodique scheduled/external → published
-// ------------------------------------------------------------
+
 async function publishDueScheduledPosts() {
   const nowIso = new Date().toISOString();
   const { error } = await supabaseAdmin
@@ -5331,15 +5664,18 @@ async function publishDueScheduledPosts() {
     console.warn("[posts] status refresh failed:", error.message);
   }
 }
+
 // ============================================================
 // ROUTES — UTILISATEUR
 // ============================================================
 route("GET", "/api/user", ({ res, user }) => {
   sendJson(res, 200, { success: true, user: formatUser(user) });
 }, { auth: true });
+
 route("GET", "/api/user/profile", ({ res, user }) => {
   sendJson(res, 200, { success: true, user: formatUser(user) });
 }, { auth: true });
+
 route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user, token }) => {
   await requireAal2(user, token);
   const body = await getJsonBody(req);
@@ -5369,6 +5705,7 @@ route(["PUT", "PATCH"], "/api/user/profile", async ({ req, res, user, token }) =
   if (error) throw error;
   sendJson(res, 200, { success: true, user: formatUser(data.user) });
 }, { auth: true });
+
 route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) => {
   await requireAal2(user, token);
   const body = await getJsonBody(req);
@@ -5406,6 +5743,7 @@ route(["PUT", "POST"], "/api/user/password", async ({ req, res, user, token }) =
     message: hasPassword ? "Password updated successfully" : "Password set successfully",
   });
 }, { auth: true });
+
 route("POST", "/api/user/avatar", async ({ req, res, user, token }) => {
   await requireAal2(user, token);
   enforce(limiterAccount, `avatar:${user.id}`);
@@ -5433,6 +5771,7 @@ route("POST", "/api/user/avatar", async ({ req, res, user, token }) => {
   const { data: publicUrlData } = supabaseAdmin.storage.from(AVATAR_BUCKET).getPublicUrl(storagePath);
   sendJson(res, 200, { success: true, avatar_url: publicUrlData.publicUrl });
 }, { auth: true });
+
 route("DELETE", "/api/user/avatar", async ({ req, res, user, token }) => {
   await requireAal2(user, token);
   const body = await getJsonBody(req);
@@ -5450,6 +5789,7 @@ route("DELETE", "/api/user/avatar", async ({ req, res, user, token }) => {
   if (error) throw error;
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // ROUTES — STRIPE
 // ============================================================
@@ -5481,6 +5821,7 @@ route("POST", "/api/stripe/checkout", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, id: session.id, url: session.url });
 }, { auth: true });
+
 route("POST", "/api/stripe/portal", async ({ res, user }) => {
   requireStripe();
   const customerId = await getStripeCustomerId(user);
@@ -5491,6 +5832,7 @@ route("POST", "/api/stripe/portal", async ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: session.url });
 }, { auth: true });
+
 route("GET", "/api/stripe/subscription", async ({ res, user }) => {
   requireStripe();
   const customerId = await getStripeCustomerId(user);
@@ -5534,6 +5876,7 @@ route("GET", "/api/stripe/subscription", async ({ res, user }) => {
       : null,
   });
 }, { auth: true });
+
 const processedStripeEvents = createSeenCache(10_000, 24 * 60 * 60 * 1000);
 route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) throw new HttpError(500, "Stripe webhook not configured");
@@ -5555,6 +5898,7 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
   processedStripeEvents.add(event.id);
   sendJson(res, 200, { received: true });
 });
+
 // ============================================================
 // ROUTES — TIKTOK
 // ============================================================
@@ -5572,6 +5916,7 @@ route("POST", "/api/tiktok/auth/url", ({ res, user }) => {
     capabilities: tiktokCapabilities(),
   });
 }, { auth: true });
+
 route("POST", "/api/tiktok/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("tiktok", body, user.id);
@@ -5610,6 +5955,7 @@ route("POST", "/api/tiktok/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, account, capabilities: tiktokCapabilities() });
 }, { auth: true });
+
 route("GET", "/api/tiktok/status", async ({ res, url, user }) => {
   const force = url.searchParams.get("refresh") === "1";
   const { account, needsReconnect } = await refreshTikTokProfile(user.id, { force });
@@ -5624,6 +5970,7 @@ route("GET", "/api/tiktok/status", async ({ res, url, user }) => {
     capabilities: tiktokCapabilities(),
   });
 }, { auth: true });
+
 route("DELETE", "/api/tiktok/disconnect", async ({ res, user }) => {
   const account = await getTikTokAccount(user.id);
   if (account) {
@@ -5642,11 +5989,13 @@ route("DELETE", "/api/tiktok/disconnect", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("GET", "/api/tiktok/creator-info", async ({ res, user }) => {
   const accessToken = await getValidTikTokToken(user.id);
   const result = await tiktokApi("/v2/post/publish/creator_info/query/", { token: accessToken, json: {} });
   sendJson(res, 200, { success: true, creator: result.data, capabilities: tiktokCapabilities() });
 }, { auth: true });
+
 route("POST", "/api/tiktok/publish", async ({ req, res, user }) => {
   enforce(limiterPublish, `tiktok:${user.id}`);
   const declared = Number(req.headers["content-length"] || 0);
@@ -5689,6 +6038,7 @@ route("POST", "/api/tiktok/publish", async ({ req, res, user }) => {
     releaseVideoSlot();
   }
 }, { auth: true });
+
 route("POST", "/api/tiktok/publish_url", async ({ req, res, user }) => {
   enforce(limiterPublish, `tiktok:${user.id}`);
   const body = await getJsonBody(req);
@@ -5712,6 +6062,7 @@ route("POST", "/api/tiktok/publish_url", async ({ req, res, user }) => {
     publish_id: init.data.publish_id,
   });
 }, { auth: true });
+
 route("POST", "/api/tiktok/publish/photos", async ({ req, res, user }) => {
   if (!PUBLIC_API_URL) throw new HttpError(500, "Photo publishing is not configured (PUBLIC_API_URL missing)", "PUBLIC_API_URL_MISSING");
   if (!PUBLIC_API_URL.startsWith("https://")) throw new HttpError(500, "PUBLIC_API_URL must use https", "PUBLIC_API_URL_NOT_HTTPS");
@@ -5773,6 +6124,7 @@ route("POST", "/api/tiktok/publish/photos", async ({ req, res, user }) => {
     releaseVideoSlot();
   }
 }, { auth: true });
+
 route("GET", "/api/tiktok/publish/status", async ({ res, url, user }) => {
   const publishId = url.searchParams.get("publish_id");
   if (!isValidTikTokPublishId(publishId)) throw new HttpError(400, "Missing or invalid publish_id");
@@ -5780,6 +6132,7 @@ route("GET", "/api/tiktok/publish/status", async ({ res, url, user }) => {
   const result = await tiktokApi("/v2/post/publish/status/fetch/", { token: accessToken, json: { publish_id: publishId } });
   sendJson(res, 200, { success: true, ...result.data });
 }, { auth: true });
+
 // ============================================================
 // TIKTOK WEBHOOK
 // ============================================================
@@ -5788,6 +6141,7 @@ const TIKTOK_WEBHOOK_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 const TIKTOK_WEBHOOK_DEDUPE_MAX = 5_000;
 const TIKTOK_REVOKE_SKEW_SEC = 5;
 const processedTikTokWebhooks = createSeenCache(TIKTOK_WEBHOOK_DEDUPE_MAX, TIKTOK_WEBHOOK_DEDUPE_TTL_MS);
+
 function parseTikTokSignatureHeader(header) {
   if (typeof header !== "string" || header.length > 512) return null;
   let timestamp = null;
@@ -5804,6 +6158,7 @@ function parseTikTokSignatureHeader(header) {
   if (!signature || !/^[a-f0-9]{64}$/i.test(signature)) return null;
   return { timestamp, signature: signature.toLowerCase() };
 }
+
 function verifyTikTokWebhookSignature(rawBody, header, secret, toleranceSec = TIKTOK_WEBHOOK_TOLERANCE_SEC, nowMs = Date.now()) {
   if (!secret) return { ok: false, reason: "secret_missing" };
   const parsed = parseTikTokSignatureHeader(header);
@@ -5819,6 +6174,7 @@ function verifyTikTokWebhookSignature(rawBody, header, secret, toleranceSec = TI
   }
   return { ok: true, timestamp: Number(parsed.timestamp) };
 }
+
 async function handleTikTokAuthorizationRemoved(payload, requestId) {
   const openId = payload.user_openid;
   if (typeof openId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(openId)) {
@@ -5843,11 +6199,13 @@ async function handleTikTokAuthorizationRemoved(payload, requestId) {
   }
   console.log(`[${requestId}] [tiktok:webhook] authorization.removed comptes_supprimés=${data ? data.length : 0}`);
 }
+
 const TIKTOK_ACK_ONLY_EVENTS = new Set([
   "video.upload.failed",
   "video.publish.completed",
   "portability.download.ready",
 ]);
+
 route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
   const rawBody = await readBody(req, MAX_TIKTOK_WEBHOOK_BODY);
   const check = verifyTikTokWebhookSignature(rawBody, req.headers["tiktok-signature"], TIKTOK_CLIENT_SECRET);
@@ -5887,6 +6245,7 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
   processedTikTokWebhooks.add(dedupeKey);
   sendJson(res, 200, { received: true });
 });
+
 // ============================================================
 // PINTEREST ROUTES
 // ============================================================
@@ -5900,6 +6259,7 @@ route("POST", "/api/pinterest/auth/url", ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: `${PINTEREST_AUTH_URL}?${params.toString()}` });
 }, { auth: true });
+
 route("POST", "/api/pinterest/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("pinterest", body, user.id);
@@ -5932,6 +6292,7 @@ route("POST", "/api/pinterest/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
+
 route("POST", "/api/pinterest/auth/token", async ({ req, res, user }) => {
   if (env("PINTEREST_ALLOW_MANUAL_TOKEN") !== "1") {
     throw new HttpError(403, "Manual token connection is disabled");
@@ -5965,6 +6326,7 @@ route("POST", "/api/pinterest/auth/token", async ({ req, res, user }) => {
     },
   });
 }, { auth: true });
+
 route("GET", "/api/pinterest/status", async ({ res, user }) => {
   const account = await getPinterestAccount(user.id);
   const usable = pinterestAccountMatchesEnv(account);
@@ -5977,11 +6339,13 @@ route("GET", "/api/pinterest/status", async ({ res, user }) => {
     ...(account && !usable ? { needs_reconnect: true } : {}),
   });
 }, { auth: true });
+
 route("DELETE", "/api/pinterest/disconnect", async ({ res, user }) => {
   const { error } = await supabaseAdmin.from("pinterest_accounts").delete().eq("user_id", user.id);
   if (error) throw error;
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // YOUTUBE ROUTES
 // ============================================================
@@ -5998,6 +6362,7 @@ route("POST", "/api/youtube/auth/url", ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: `${GOOGLE_AUTH_URL}?${params.toString()}` });
 }, { auth: true });
+
 route("POST", "/api/youtube/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("youtube", body, user.id);
@@ -6042,6 +6407,7 @@ route("POST", "/api/youtube/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
+
 route("POST", "/api/youtube/publish", async ({ req, res, user }) => {
   enforce(limiterPublish, `youtube:${user.id}`);
   const declared = Number(req.headers["content-length"] || 0);
@@ -6081,6 +6447,7 @@ route("POST", "/api/youtube/publish", async ({ req, res, user }) => {
     releaseVideoSlot();
   }
 }, { auth: true });
+
 route("GET", "/api/youtube/status", async ({ res, user }) => {
   const account = await getYouTubeAccount(user.id);
   sendJson(res, 200, {
@@ -6097,6 +6464,7 @@ route("GET", "/api/youtube/status", async ({ res, user }) => {
       : null,
   });
 }, { auth: true });
+
 route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
   const account = await getYouTubeAccount(user.id);
   if (account) {
@@ -6116,6 +6484,7 @@ route("DELETE", "/api/youtube/disconnect", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ------------------------------------------------------------
 // YOUTUBE — ROUTE INSIGHTS
 // ------------------------------------------------------------
@@ -6125,7 +6494,6 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
   const startParam = url.searchParams.get("start");
   const endParam = url.searchParams.get("end");
 
-  // 1. Validation des dates
   if (!startParam || !endParam) {
     throw new HttpError(400, "Missing start or end date", "MISSING_DATES");
   }
@@ -6137,15 +6505,13 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
     throw new HttpError(400, "Invalid date format. Use YYYY-MM-DD", "INVALID_DATE_FORMAT");
   }
 
-  // Normaliser à minuit UTC
   const startStr = startDate.toISOString().split("T")[0];
   let endObj = new Date(endDate);
-  
-  // Ramener end à aujourd'hui si futur
+
   const today = new Date();
   const todayStr = today.toISOString().split("T")[0];
   const endStrRaw = endObj.toISOString().split("T")[0];
-  
+
   if (endStrRaw > todayStr) {
     endObj = today;
   }
@@ -6155,14 +6521,12 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
     throw new HttpError(400, "Start date must be before end date", "INVALID_DATE_RANGE");
   }
 
-  // Durée max 366 jours
   const diffTime = Math.abs(endObj - startDate);
   const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
   if (diffDays > 366) {
     throw new HttpError(400, "Period cannot exceed 366 days", "PERIOD_TOO_LONG");
   }
 
-  // 2. Cache Check
   const cacheKey = `${user.id}:${startStr}:${endStr}`;
   const cached = getCachedInsights(cacheKey);
   if (cached) {
@@ -6170,7 +6534,6 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
     return;
   }
 
-  // 3. Vérification connexion & Scope
   const account = await getYouTubeAccount(user.id);
   if (!account) {
     throw new HttpError(404, "YouTube non connecté", "YOUTUBE_NOT_CONNECTED");
@@ -6188,9 +6551,7 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
   const token = await getValidYouTubeToken(user.id);
 
   try {
-    // 4. Appels parallèles : Stats Journalières + Info Chaîne (Abonnés + Playlist ID)
     const [analyticsReport, channelData] = await Promise.all([
-      // A. Stats par jour
       (async () => {
         const params = new URLSearchParams({
           ids: "channel==MINE",
@@ -6202,7 +6563,6 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
         });
         return googleRequest(`${YOUTUBE_ANALYTICS_API}?${params.toString()}`, { token });
       })(),
-      // B. Info Chaîne
       (async () => {
         const params = new URLSearchParams({
           part: "statistics,contentDetails",
@@ -6212,28 +6572,23 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
       })(),
     ]);
 
-    // Traitement Abonnés
     const channelItem = channelData.items?.[0];
     const subscriberCount = channelItem?.statistics?.hiddenSubscriberCount
       ? 0
       : Number(channelItem?.statistics?.subscriberCount || 0);
-    
+
     const uploadsPlaylistId = channelItem?.contentDetails?.relatedPlaylists?.uploads;
 
-    // Traitement Stats Journalières
     const rows = analyticsReport.rows || [];
     const headers = analyticsReport.columnHeaders || [];
-    
-    // Map des indices de colonnes
+
     const colIndex = {};
     headers.forEach((h, i) => { colIndex[h.name] = i; });
 
-    // Générer tous les jours de la période pour combler les trous
     const daysResult = [];
     const currentDay = new Date(startStr);
     const finalDay = new Date(endStr);
-    
-    // Créer une map rapide des données reçues
+
     const dataMap = new Map();
     for (const row of rows) {
       const dateKey = row[colIndex["day"]];
@@ -6256,16 +6611,15 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
         views: 0, likes: 0, comments: 0, shares: 0,
         watch_minutes: 0, subscribers_gained: 0, subscribers_lost: 0
       };
-      
+
       daysResult.push({
         date: dateStr,
         ...dayData,
       });
-      
+
       currentDay.setDate(currentDay.getDate() + 1);
     }
 
-    // 5. Vidéos publiées sur la période
     let videosResult = [];
     if (uploadsPlaylistId) {
       videosResult = await fetchVideosInPeriod(token, uploadsPlaylistId, startStr, endStr);
@@ -6274,7 +6628,7 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
     const responsePayload = {
       success: true,
       subscribers: subscriberCount,
-      impressions: 0, // Non disponible via API publique simplement
+      impressions: 0,
       days: daysResult,
       videos: videosResult,
     };
@@ -6283,10 +6637,8 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
     sendJson(res, 200, responsePayload);
 
   } catch (error) {
-    // Gestion spécifique des erreurs Google
     if (error instanceof HttpError) throw error;
-    
-    // Erreur Google standard
+
     const msg = error?.message || "Unknown error";
     if (msg.includes("insufficientPermissions") || msg.includes("permission")) {
       throw new HttpError(403, "Reconnecte ta chaîne YouTube pour autoriser les statistiques", "YOUTUBE_SCOPE_MISSING");
@@ -6294,19 +6646,18 @@ route("GET", "/api/youtube/insights", async ({ res, url, user }) => {
     if (msg.includes("quota") || msg.includes("Quota")) {
       throw new HttpError(429, "Quota YouTube dépassé, réessaie plus tard", "QUOTA_EXCEEDED");
     }
-    
+
     throw upstreamError("YouTube Analytics", error);
   }
 }, { auth: true });
+
 // ------------------------------------------------------------
 // YOUTUBE — ROUTES DE LECTURE (vidéos + commentaires)
 // ------------------------------------------------------------
-// Liste des vidéos de la chaîne (panneau « Posts »)
 route("GET", "/api/youtube/videos", async ({ res, url, user }) => {
   enforce(limiterYouTubeRead, `youtube-read:${user.id}`);
   const { token, channelId } = await getYouTubeReader(user.id);
   const pageToken = url.searchParams.get("pageToken");
-  // La playlist « uploads » d'une chaîne = "UU" + channelId sans le "UC"
   const uploadsPlaylistId = `UU${channelId.slice(2)}`;
   const playlist = await youtubeGet(
     "/playlistItems",
@@ -6323,36 +6674,34 @@ route("GET", "/api/youtube/videos", async ({ res, url, user }) => {
     .filter((id) => typeof id === "string" && YOUTUBE_ID_PATTERN.test(id));
   let videos = [];
   if (ids.length > 0) {
-const data = await youtubeGet(
-  "/videos",
-  { part: "snippet,statistics,status", id: ids.join(","), maxResults: "50" },
-  token
-);
-videos = (data.items || []).map((v) => {
-  const publishAt = v.status?.publishAt || null;
-  const privacyStatus = v.status?.privacyStatus || null;
+    const data = await youtubeGet(
+      "/videos",
+      { part: "snippet,statistics,status", id: ids.join(","), maxResults: "50" },
+      token
+    );
+    videos = (data.items || []).map((v) => {
+      const publishAt = v.status?.publishAt || null;
+      const privacyStatus = v.status?.privacyStatus || null;
 
-  // `publishAt` dans le futur → YouTube va publier la vidéo plus tard
-  // (c'est le cas des vidéos programmées depuis Stone via `publishAt`).
-  let status;
-  if (publishAt && new Date(publishAt).getTime() > Date.now()) {
-    status = "scheduled";
-  } else if (privacyStatus === "private") {
-    status = "private";
-  } else {
-    status = "published";
-  }
+      let status;
+      if (publishAt && new Date(publishAt).getTime() > Date.now()) {
+        status = "scheduled";
+      } else if (privacyStatus === "private") {
+        status = "private";
+      } else {
+        status = "published";
+      }
 
-  return {
-    id: v.id,
-    title: v.snippet?.title || "",
-    thumbnail:
-      v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
-    published_at: v.snippet?.publishedAt || null,
-    comment_count: Number(v.statistics?.commentCount || 0),
-    status,
-  };
-});
+      return {
+        id: v.id,
+        title: v.snippet?.title || "",
+        thumbnail:
+          v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
+        published_at: v.snippet?.publishedAt || null,
+        comment_count: Number(v.statistics?.commentCount || 0),
+        status,
+      };
+    });
   }
   sendJson(res, 200, {
     success: true,
@@ -6360,8 +6709,7 @@ videos = (data.items || []).map((v) => {
     next_page_token: playlist.nextPageToken || null,
   });
 }, { auth: true });
-// Commentaires (toute la chaîne, ou une vidéo si videoId est fourni)
-// → exige explicitement le scope force-ssl (comments: true).
+
 route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
   enforce(limiterYouTubeRead, `youtube-read:${user.id}`);
   const filter = url.searchParams.get("filter") || "all";
@@ -6386,7 +6734,6 @@ route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
   try {
     data = await youtubeGet("/commentThreads", params, token);
   } catch (error) {
-    // Vidéo dont les commentaires sont désactivés → liste vide, pas une erreur
     if (error instanceof HttpError && error.code === "commentsDisabled") {
       sendJson(res, 200, { success: true, comments: [], next_page_token: null });
       return;
@@ -6409,7 +6756,7 @@ route("GET", "/api/youtube/comments", async ({ res, url, user }) => {
     next_page_token: data.nextPageToken || null,
   });
 }, { auth: true });
-// Répondre à un commentaire
+
 route("POST", "/api/youtube/comments/reply", async ({ req, res, user }) => {
   enforce(limiterYouTubeWrite, `youtube-write:${user.id}`);
   const body = await getJsonBody(req);
@@ -6423,7 +6770,6 @@ route("POST", "/api/youtube/comments/reply", async ({ req, res, user }) => {
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
     throw new HttpError(400, "Invalid reply", "REPLY_INVALID");
   }
-  // Écrire exige le scope force-ssl, comme la lecture des commentaires
   const { token, channelId } = await getYouTubeReader(user.id, { comments: true });
   let result;
   try {
@@ -6444,7 +6790,6 @@ route("POST", "/api/youtube/comments/reply", async ({ req, res, user }) => {
     throw upstreamError("YouTube", error);
   }
   if (!result.response.ok) throw youtubeApiError(result.response.status, result.data);
-  // Un commentaire auquel on répond est forcément lu (échec ignoré)
   try {
     await supabaseAdmin
       .from("youtube_comment_reads")
@@ -6457,7 +6802,7 @@ route("POST", "/api/youtube/comments/reply", async ({ req, res, user }) => {
   }
   sendJson(res, 200, { success: true, reply: formatYouTubeReply(result.data, channelId) });
 }, { auth: true });
-// Marquer des commentaires comme lus / non lus
+
 route("POST", "/api/youtube/comments/read", async ({ req, res, user }) => {
   enforce(limiterYouTubeWrite, `youtube-write:${user.id}`);
   const body = await getJsonBody(req);
@@ -6497,6 +6842,7 @@ route("POST", "/api/youtube/comments/read", async ({ req, res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // GOOGLE DRIVE ROUTES
 // ============================================================
@@ -6513,6 +6859,7 @@ route("POST", "/api/googledrive/auth/url", ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: `${GOOGLE_AUTH_URL}?${params.toString()}` });
 }, { auth: true });
+
 route("POST", "/api/googledrive/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("googledrive", body, user.id);
@@ -6554,6 +6901,7 @@ route("POST", "/api/googledrive/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
+
 route("GET", "/api/googledrive/status", async ({ res, user }) => {
   const account = await getGDriveAccount(user.id);
   sendJson(res, 200, {
@@ -6569,6 +6917,7 @@ route("GET", "/api/googledrive/status", async ({ res, user }) => {
       : null,
   });
 }, { auth: true });
+
 route("DELETE", "/api/googledrive/disconnect", async ({ res, user }) => {
   const account = await getGDriveAccount(user.id);
   if (account) {
@@ -6585,6 +6934,7 @@ route("DELETE", "/api/googledrive/disconnect", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("GET", "/api/googledrive/files", async ({ res, url, user }) => {
   enforce(limiterGDrive, `gdrive:${user.id}`);
   const folderId = parseGDriveFolderId(url.searchParams.get("folderId"));
@@ -6613,6 +6963,7 @@ route("GET", "/api/googledrive/files", async ({ res, url, user }) => {
     has_more: Boolean(data.nextPageToken),
   });
 }, { auth: true });
+
 route("POST", "/api/googledrive/upload", async ({ req, res, user }) => {
   enforce(limiterPublish, `gdrive:${user.id}`);
   const declared = Number(req.headers["content-length"] || 0);
@@ -6667,6 +7018,7 @@ route("POST", "/api/googledrive/upload", async ({ req, res, user }) => {
     releaseVideoSlot();
   }
 }, { auth: true });
+
 // ============================================================
 // GOOGLE PHOTOS ROUTES
 // ============================================================
@@ -6682,6 +7034,7 @@ route("POST", "/api/googlephotos/auth/url", ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: `${GOOGLE_AUTH_URL}?${params.toString()}` });
 }, { auth: true });
+
 route("POST", "/api/googlephotos/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("googlephotos", body, user.id);
@@ -6708,6 +7061,7 @@ route("POST", "/api/googlephotos/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
+
 route("GET", "/api/googlephotos/status", async ({ res, user }) => {
   const account = await getGPhotosAccount(user.id);
   sendJson(res, 200, {
@@ -6716,6 +7070,7 @@ route("GET", "/api/googlephotos/status", async ({ res, user }) => {
     account: account ? { display_name: account.display_name, scope: account.scope } : null,
   });
 }, { auth: true });
+
 route("DELETE", "/api/googlephotos/disconnect", async ({ res, user }) => {
   const account = await getGPhotosAccount(user.id);
   if (account) {
@@ -6732,6 +7087,7 @@ route("DELETE", "/api/googlephotos/disconnect", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("POST", "/api/googlephotos/picker/session", async ({ res, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const token = await getValidGPhotosToken(user.id);
@@ -6747,6 +7103,7 @@ route("POST", "/api/googlephotos/picker/session", async ({ res, user }) => {
     timeout_ms: Number.parseInt(session.pollingConfig?.timeoutIn, 10) * 1000 || 5 * 60 * 1000,
   });
 }, { auth: true });
+
 route("GET", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
@@ -6754,6 +7111,7 @@ route("GET", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
   const session = await gphotosPicker(`/sessions/${encodeURIComponent(sessionId)}`, { token });
   sendJson(res, 200, { success: true, media_items_set: Boolean(session.mediaItemsSet) });
 }, { auth: true });
+
 route("GET", "/api/googlephotos/picker/items", async ({ res, url, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
@@ -6776,6 +7134,7 @@ route("GET", "/api/googlephotos/picker/items", async ({ res, url, user }) => {
     next_page_token: data.nextPageToken || null,
   });
 }, { auth: true });
+
 route("POST", "/api/googlephotos/picker/download", async ({ req, res, user }) => {
   enforce(limiterGPhotos, `gphotos:${user.id}`);
   const body = await getJsonBody(req);
@@ -6824,6 +7183,7 @@ route("POST", "/api/googlephotos/picker/download", async ({ req, res, user }) =>
   });
   res.end(buffer);
 }, { auth: true });
+
 route("DELETE", "/api/googlephotos/picker/session", async ({ res, url, user }) => {
   const sessionId = parseGPhotosSessionId(url.searchParams.get("sessionId"));
   const token = await getValidGPhotosToken(user.id);
@@ -6834,6 +7194,7 @@ route("DELETE", "/api/googlephotos/picker/session", async ({ res, url, user }) =
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 // ============================================================
 // CANVA ROUTES
 // ============================================================
@@ -6850,6 +7211,7 @@ route("POST", "/api/canva/auth/url", ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: `${CANVA_AUTH_URL}?${params.toString()}` });
 }, { auth: true });
+
 route("POST", "/api/canva/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("canva", body, user.id);
@@ -6876,6 +7238,7 @@ route("POST", "/api/canva/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, connected: true });
 }, { auth: true });
+
 route("GET", "/api/canva/status", async ({ res, user }) => {
   const account = await getCanvaAccount(user.id);
   sendJson(res, 200, {
@@ -6884,6 +7247,7 @@ route("GET", "/api/canva/status", async ({ res, user }) => {
     account: account ? { display_name: account.display_name } : null,
   });
 }, { auth: true });
+
 route("DELETE", "/api/canva/disconnect", async ({ res, user }) => {
   const account = await getCanvaAccount(user.id);
   if (account) {
@@ -6900,6 +7264,7 @@ route("DELETE", "/api/canva/disconnect", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("POST", "/api/canva/designs", async ({ req, res, user }) => {
   enforce(limiterCanva, `canva:${user.id}`);
   const body = await getJsonBody(req);
@@ -6918,8 +7283,10 @@ route("POST", "/api/canva/designs", async ({ req, res, user }) => {
   if (!design?.id || !design.urls?.edit_url) throw new HttpError(502, "Canva did not return a design", "CANVA_NO_DESIGN");
   sendJson(res, 200, { success: true, design_id: design.id, edit_url: design.urls.edit_url });
 }, { auth: true });
+
 const CANVA_EXPORT_MAX_PAGES = 10;
 const CANVA_EXPORT_MAX_TOTAL = 30 * 1024 * 1024;
+
 route("POST", "/api/canva/export", async ({ req, res, user }) => {
   enforce(limiterCanva, `canva:${user.id}`);
   const body = await getJsonBody(req);
@@ -6968,6 +7335,7 @@ route("POST", "/api/canva/export", async ({ req, res, user }) => {
   if (pages.length === 0) throw new HttpError(502, "Canva returned no image", "CANVA_EMPTY_EXPORT");
   sendJson(res, 200, { success: true, pages });
 }, { auth: true });
+
 // ============================================================
 // DROPBOX ROUTES
 // ============================================================
@@ -6982,6 +7350,7 @@ route("POST", "/api/dropbox/auth/url", ({ res, user }) => {
   });
   sendJson(res, 200, { success: true, url: `${DROPBOX_AUTH_URL}?${params.toString()}` });
 }, { auth: true });
+
 route("POST", "/api/dropbox/auth/callback", async ({ req, res, user }) => {
   const body = await getJsonBody(req);
   const authCode = assertValidOAuthCallback("dropbox", body, user.id);
@@ -7010,9 +7379,11 @@ route("POST", "/api/dropbox/auth/callback", async ({ req, res, user }) => {
   });
   sendJson(res, 200, { success: true, connected: true, account });
 }, { auth: true });
+
 const dropboxProfileCheckedAt = new Map();
 const DROPBOX_PROFILE_REFRESH_MS = 30 * 60 * 1000;
 const DROPBOX_PROFILE_RETRY_MS = 60 * 1000;
+
 async function refreshDropboxProfile(userId, account) {
   const incomplete = !account.avatar_url || !account.display_name || !account.email;
   const interval = incomplete ? DROPBOX_PROFILE_RETRY_MS : DROPBOX_PROFILE_REFRESH_MS;
@@ -7045,6 +7416,7 @@ async function refreshDropboxProfile(userId, account) {
     return account;
   }
 }
+
 route("GET", "/api/dropbox/status", async ({ res, user }) => {
   let account = await getDropboxAccount(user.id);
   if (account) account = await refreshDropboxProfile(user.id, account);
@@ -7061,6 +7433,7 @@ route("GET", "/api/dropbox/status", async ({ res, user }) => {
       : null,
   });
 }, { auth: true });
+
 route("DELETE", "/api/dropbox/disconnect", async ({ res, user }) => {
   const account = await getDropboxAccount(user.id);
   if (account) {
@@ -7079,6 +7452,7 @@ route("DELETE", "/api/dropbox/disconnect", async ({ res, user }) => {
   }
   sendJson(res, 200, { success: true });
 }, { auth: true });
+
 route("GET", "/api/dropbox/files", async ({ res, url, user }) => {
   enforce(limiterDropbox, `dropbox:${user.id}`);
   const path = parseDropboxPath(url.searchParams.get("path"), { allowRoot: true });
@@ -7101,6 +7475,7 @@ route("GET", "/api/dropbox/files", async ({ res, url, user }) => {
     has_more: Boolean(data.has_more),
   });
 }, { auth: true });
+
 route("GET", "/api/dropbox/temporary-link", async ({ res, url, user }) => {
   enforce(limiterDropbox, `dropbox:${user.id}`);
   const path = parseDropboxPath(url.searchParams.get("path"));
@@ -7108,6 +7483,7 @@ route("GET", "/api/dropbox/temporary-link", async ({ res, url, user }) => {
   const data = await dropboxRpc("/files/get_temporary_link", { token, json: { path } });
   sendJson(res, 200, { success: true, link: data.link, name: data.metadata?.name });
 }, { auth: true });
+
 route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
   enforce(limiterPublish, `dropbox:${user.id}`);
   const declared = Number(req.headers["content-length"] || 0);
@@ -7165,6 +7541,183 @@ route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
     releaseVideoSlot();
   }
 }, { auth: true });
+
+// ============================================================
+// INSTAGRAM ROUTES (Facebook Login for Business)
+// ============================================================
+route(
+  "POST",
+  "/api/instagram/login",
+  ({ res, user }) => {
+    const params = new URLSearchParams({
+      client_id: META_APP_ID,
+      config_id: META_IG_CONFIG_ID,
+      response_type: "code",
+      override_default_response_type: "true",
+      redirect_uri: INSTAGRAM_REDIRECT_URI,
+      state: createOAuthState("instagram", user.id),
+    });
+    sendJson(res, 200, {
+      success: true,
+      url: `${INSTAGRAM_OAUTH_DIALOG}?${params.toString()}`,
+    });
+  },
+  { auth: true }
+);
+
+// Callback navigateur : PAS d'auth (Facebook redirige le navigateur).
+// → le userId est porté par le state signé, vérifié par extractOAuthState.
+route("GET", "/api/instagram/callback", async ({ res, url }) => {
+  const frontBase = `${APP_URL}/?section=channels`;
+  const redirectError = (msg) => {
+    const safe = String(msg || "instagram_callback_failed").slice(0, 300);
+    redirectTo(res, `${frontBase}&instagram_error=${encodeURIComponent(safe)}`);
+  };
+
+  const errorCode = url.searchParams.get("error");
+  const errorDescription =
+    url.searchParams.get("error_description") || errorCode;
+  if (errorDescription) {
+    console.warn(`[instagram:callback] rejeté : ${errorDescription}`);
+    redirectError(errorDescription);
+    return;
+  }
+  const code = url.searchParams.get("code");
+  if (!code || code.length > 2048) {
+    redirectError("missing_code");
+    return;
+  }
+  const stateInfo = extractOAuthState(
+    "instagram",
+    url.searchParams.get("state")
+  );
+  if (stateInfo.error) {
+    console.warn(`[instagram:callback] state invalide (${stateInfo.error})`);
+    redirectError(`invalid_state_${stateInfo.error}`);
+    return;
+  }
+  const userId = stateInfo.userId;
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      userId
+    )
+  ) {
+    redirectError("invalid_user");
+    return;
+  }
+  try {
+    const result = await dedupeCallback(
+      `instagram:${userId}:${sha256(code)}`,
+      async () => {
+        // 1. code -> token (SUAT, n'expire pas)
+        const tok = await instagramGraphRequest("/oauth/access_token", {
+          client_id: META_APP_ID,
+          client_secret: META_APP_SECRET,
+          redirect_uri: INSTAGRAM_REDIRECT_URI,
+          code,
+        });
+        if (!tok?.access_token) {
+          throw new HttpError(
+            400,
+            tok?.error?.message || "Token exchange failed",
+            "INSTAGRAM_TOKEN_EXCHANGE_FAILED"
+          );
+        }
+        // 2. Retrouver le compte Instagram choisi
+        const dbg = await instagramGraphRequest("/debug_token", {
+          input_token: tok.access_token,
+          access_token: `${META_APP_ID}|${META_APP_SECRET}`,
+        });
+        const igId = dbg?.data?.granular_scopes?.find(
+          (s) => s.scope === "instagram_basic"
+        )?.target_ids?.[0];
+        if (!igId) {
+          throw new HttpError(
+            400,
+            "Aucun compte Instagram autorisé",
+            "INSTAGRAM_NO_ACCOUNT"
+          );
+        }
+        // 3. Infos du compte
+        const me = await instagramGraphRequest(`/${encodeURIComponent(igId)}`, {
+          fields: "username,name,profile_picture_url",
+          access_token: tok.access_token,
+        });
+        if (!me?.id) {
+          throw new HttpError(
+            502,
+            me?.error?.message || "Failed to fetch Instagram account",
+            "INSTAGRAM_ACCOUNT_FETCH_FAILED"
+          );
+        }
+        await saveInstagramTokens(userId, tok, {
+          account_id: igId,
+          display_name: me.username || me.name || null,
+          avatar_url: me.profile_picture_url || null,
+        });
+        return { igId };
+      }
+    );
+    console.log(`[instagram:callback] compte ${result.igId} lié`);
+    redirectTo(res, `${frontBase}&instagram=1`);
+  } catch (error) {
+    console.error("[instagram:callback]", error?.message || error);
+    redirectError(error?.message || "instagram_callback_failed");
+  }
+});
+
+route(
+  "GET",
+  "/api/instagram/status",
+  async ({ res, user }) => {
+    const account = await getInstagramAccount(user.id);
+    const connected = Boolean(account?.access_token);
+    sendJson(res, 200, {
+      success: true,
+      connected,
+      account: connected
+        ? {
+            display_name: account.display_name || null,
+            avatar_url: account.avatar_url || null,
+            account_id: account.account_id || null,
+          }
+        : null,
+    });
+  },
+  { auth: true }
+);
+
+route(
+  "POST",
+  "/api/instagram/disconnect",
+  async ({ res, user }) => {
+    const account = await getInstagramAccount(user.id);
+    if (account?.access_token) {
+      try {
+        await fetchJson(
+          `${INSTAGRAM_GRAPH_API}/me/permissions?access_token=${encodeURIComponent(
+            account.access_token
+          )}`,
+          { method: "DELETE" },
+          10_000
+        );
+      } catch (revokeError) {
+        console.warn(
+          "[instagram] revoke error:",
+          revokeError?.message || revokeError
+        );
+      }
+    }
+    const { error } = await supabaseAdmin
+      .from("instagram_accounts")
+      .delete()
+      .eq("user_id", user.id);
+    if (error) throw dbError("instagram_accounts.delete", error);
+    sendJson(res, 200, { success: true });
+  },
+  { auth: true }
+);
+
 // ============================================================
 // SERVER
 // ============================================================
@@ -7176,13 +7729,11 @@ const providerGuards = [
   ["/api/googlephotos/", gphotosEnabled, "Google Photos"],
   ["/api/canva/", canvaEnabled, "Canva"],
   ["/api/dropbox/", dropboxEnabled, "Dropbox"],
+  ["/api/instagram/", instagramEnabled, "Instagram"],
 ];
+
 const server = createServer(async (req, res) => {
   const requestId = newRequestId();
-  // ✅ diagnostic : prouve dans les logs que la requête
-  // atteint bien CE serveur. Si la ligne n'apparaît pas quand le
-  // frontend appelle /api/youtube/videos, c'est que la requête est
-  // interceptée ailleurs (SPA fallback, proxy mal configuré…).
   console.log(
     `[${requestId}] → ${req.method} ${req.url} origin=${req.headers.origin || "-"} host=${req.headers.host || "-"}`
   );
@@ -7195,16 +7746,19 @@ const server = createServer(async (req, res) => {
   } catch (corsError) {
     console.error(`[${requestId}] CORS error:`, corsError);
   }
+
   if (req.method === "OPTIONS") {
     res.writeHead(204, { "Content-Length": "0" });
     res.end();
     return;
   }
+
   let routeLabel = `${req.method} ${req.url}`;
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || `localhost:${PORT}`}`);
     const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
     routeLabel = `${req.method} ${pathname}`;
+
     if (req.method === "GET" || req.method === "HEAD") {
       let decodedPath = pathname;
       try {
@@ -7228,6 +7782,7 @@ const server = createServer(async (req, res) => {
         return;
       }
     }
+
     const isStripeWebhook = req.method === "POST" && pathname === "/api/stripe/webhook";
     const isHealth = req.method === "GET" && pathname === "/api/health";
     const isTiktokWebhook = req.method === "POST" && pathname === "/api/tiktok/webhook";
@@ -7236,15 +7791,18 @@ const server = createServer(async (req, res) => {
     } else if (!isStripeWebhook && !isHealth) {
       enforce(pickLimiter(pathname), getClientIp(req));
     }
+
     for (const [prefix, enabled, name] of providerGuards) {
       if (pathname.startsWith(prefix) && !enabled) {
         throw new HttpError(500, `${name} is not configured`);
       }
     }
+
     if (pathname.startsWith("/api/pinterest/") && pinterestConfigError) {
       console.error(`[${requestId}] Pinterest config: ${pinterestConfigError}`);
       throw new HttpError(500, "Pinterest configuration is inconsistent (sandbox / production mismatch)", "PINTEREST_CONFIG_INVALID");
     }
+
     const entry = routes.get(`${req.method} ${pathname}`);
     if (!entry) {
       sendJson(res, 404, {
@@ -7255,7 +7813,9 @@ const server = createServer(async (req, res) => {
       });
       return;
     }
+
     const ctx = { req, res, url, requestId, user: null, token: null };
+
     if (entry.auth) {
       const { user, token, error, code } = await getAuthenticatedUser(req);
       if (!user) {
@@ -7265,6 +7825,7 @@ const server = createServer(async (req, res) => {
       ctx.user = user;
       ctx.token = token;
     }
+
     await entry.handler(ctx);
   } catch (error) {
     if (error instanceof HttpError) {
@@ -7286,9 +7847,11 @@ const server = createServer(async (req, res) => {
     internalErrorResponse(res, requestId, error, routeLabel);
   }
 });
+
 server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
 server.requestTimeout = 5 * 60_000;
+
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`Stone server running on port ${PORT}`);
   console.log(`  NODE_ENV        : ${env("NODE_ENV") || "(non défini)"}`);
@@ -7307,26 +7870,28 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Google Photos   : ${gphotosEnabled ? "activé" : "désactivé"}`);
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
+  console.log(`  Instagram       : ${instagramEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Groups          : activé (max ${MAX_GROUPS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
   console.log(`  Scheduled posts : activé (${MAX_POST_FILES} fichiers max / post, ${MAX_POST_FILE_SIZE / 1024 / 1024} MB par fichier)`);
   console.log(`  Stripe checkout : success ${STRIPE_SUCCESS_URL} · cancel ${STRIPE_CANCEL_URL}`);
   console.log(`  Diagnostic      : en-tête X-Stone-Server: 1 ajouté à toutes les réponses`);
-  // initialisation du bucket pour les posts
+
   try {
     await ensurePostMediaBucket();
     console.log(`  Post media      : bucket "${POST_MEDIA_BUCKET}" prêt`);
   } catch (error) {
     console.warn(`  Post media      : initialisation échouée (${error?.message || error})`);
   }
-  // timer de transition scheduled/external → published
+
   const postsTimer = setInterval(() => {
     void publishDueScheduledPosts();
   }, POSTS_PUBLISH_INTERVAL_MS);
   postsTimer.unref?.();
-  // premier passage rapide (5 s après démarrage)
+
   setTimeout(() => void publishDueScheduledPosts(), 5_000).unref?.();
+
   if (tiktokEnabled) {
     try {
       await ensureTikTokMediaBucket();
@@ -7341,6 +7906,7 @@ server.listen(PORT, "0.0.0.0", async () => {
     setTimeout(() => void sweepTikTokMedia(), 5 * 60 * 1000).unref?.();
   }
 });
+
 server.on("error", (error) => {
   if (error.code === "EADDRINUSE") {
     console.error(`Le port ${PORT} est déjà utilisé.`);
@@ -7348,6 +7914,7 @@ server.on("error", (error) => {
     console.error("Server error:", error);
   }
 });
+
 server.on("clientError", (error, socket) => {
   if (socket.writable) {
     socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -7355,6 +7922,7 @@ server.on("clientError", (error, socket) => {
     socket.destroy();
   }
 });
+
 let shuttingDown = false;
 function shutdown(signal, exitCode = 0) {
   if (shuttingDown) return;
@@ -7371,6 +7939,7 @@ ${signal} reçu — arrêt du serveur...`);
     process.exit(1);
   }, 10_000).unref?.();
 }
+
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("unhandledRejection", (reason) => {
