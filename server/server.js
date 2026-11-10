@@ -5571,10 +5571,10 @@ route("POST", "/api/posts", async ({ req, res, user }) => {
   const userId = user.id;
   const files = upload.files;
   const external = Array.isArray(data.externalNetworks) ? data.externalNetworks : [];
-  const networks = [
+  const networks = [...new Set([
     ...(Array.isArray(data.networks) ? data.networks : []),
     ...external,
-  ];
+  ])];
   if (networks.length === 0) {
     throw new HttpError(400, "At least one network is required", "NO_NETWORK");
   }
