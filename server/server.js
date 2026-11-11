@@ -608,19 +608,27 @@ const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024;
 const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
 
 // ============================================================
-// CONFIGURATION INSTAGRAM (Facebook Login for Business)
+// CONFIGURATION INSTAGRAM (Instagram Login direct + legacy Facebook Login)
 // ============================================================
+const INSTAGRAM_APP_ID = env("INSTAGRAM_APP_ID");
+const INSTAGRAM_APP_SECRET = env("INSTAGRAM_APP_SECRET");
 const META_APP_ID = env("META_APP_ID");
 const META_APP_SECRET = env("META_APP_SECRET");
 const META_IG_CONFIG_ID = env("META_IG_CONFIG_ID");
 const INSTAGRAM_GRAPH_API = "https://graph.facebook.com/v21.0";
-const INSTAGRAM_OAUTH_DIALOG = "https://www.facebook.com/v21.0/dialog/oauth";
+const INSTAGRAM_DIRECT_GRAPH_API = "https://graph.instagram.com";
+const INSTAGRAM_DIRECT_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize";
+const INSTAGRAM_DIRECT_TOKEN_URL = "https://api.instagram.com/oauth/access_token";
 const INSTAGRAM_REDIRECT_URI =
   env("INSTAGRAM_REDIRECT_URI") ||
   (PUBLIC_API_URL ? `${PUBLIC_API_URL}/api/instagram/callback` : null);
-const instagramEnabled = Boolean(
+const instagramDirectEnabled = Boolean(
+  INSTAGRAM_APP_ID && INSTAGRAM_APP_SECRET && INSTAGRAM_REDIRECT_URI
+);
+const instagramLegacyEnabled = Boolean(
   META_APP_ID && META_APP_SECRET && META_IG_CONFIG_ID && INSTAGRAM_REDIRECT_URI
 );
+const instagramEnabled = instagramDirectEnabled || instagramLegacyEnabled;
 
 // ============================================================
 // CONFIGURATION TAGS
@@ -654,6 +662,7 @@ const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN;
 let OAUTH_STATE_SECRET =
   env("OAUTH_STATE_SECRET") ||
   TIKTOK_CLIENT_SECRET ||
+  INSTAGRAM_APP_SECRET ||
   PINTEREST_APP_SECRET ||
   YOUTUBE_CLIENT_SECRET ||
   CANVA_CLIENT_SECRET ||
@@ -7549,6 +7558,20 @@ route(
   "POST",
   "/api/instagram/login",
   ({ res, user }) => {
+    if (instagramDirectEnabled) {
+      const params = new URLSearchParams({
+        client_id: INSTAGRAM_APP_ID,
+        redirect_uri: INSTAGRAM_REDIRECT_URI,
+        response_type: "code",
+        scope: "instagram_business_basic,instagram_business_content_publish",
+        state: createOAuthState("instagram", user.id),
+      });
+      sendJson(res, 200, {
+        success: true,
+        url: `${INSTAGRAM_DIRECT_AUTHORIZE_URL}?${params.toString()}`,
+      });
+      return;
+    }
     const params = new URLSearchParams({
       client_id: META_APP_ID,
       config_id: META_IG_CONFIG_ID,
@@ -7559,7 +7582,7 @@ route(
     });
     sendJson(res, 200, {
       success: true,
-      url: `${INSTAGRAM_OAUTH_DIALOG}?${params.toString()}`,
+      url: `https://www.facebook.com/v21.0/dialog/oauth?${params.toString()}`,
     });
   },
   { auth: true }
@@ -7609,7 +7632,74 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
     const result = await dedupeCallback(
       `instagram:${userId}:${sha256(code)}`,
       async () => {
-        // 1. code -> token (SUAT, n'expire pas)
+        if (instagramDirectEnabled) {
+          // Instagram Login direct : échange du code contre un token court,
+          // puis échange contre un token longue durée (environ 60 jours).
+          const form = new URLSearchParams({
+            client_id: INSTAGRAM_APP_ID,
+            client_secret: INSTAGRAM_APP_SECRET,
+            grant_type: "authorization_code",
+            redirect_uri: INSTAGRAM_REDIRECT_URI,
+            code,
+          });
+          const shortResult = await fetchJson(
+            INSTAGRAM_DIRECT_TOKEN_URL,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: form,
+            },
+            20_000
+          );
+          if (!shortResult.response.ok || !shortResult.data?.access_token) {
+            throw new HttpError(
+              400,
+              shortResult.data?.error_message || shortResult.data?.error?.message || "Instagram token exchange failed",
+              "INSTAGRAM_TOKEN_EXCHANGE_FAILED"
+            );
+          }
+          const longUrl = new URL(`${INSTAGRAM_DIRECT_GRAPH_API}/access_token`);
+          longUrl.search = new URLSearchParams({
+            grant_type: "ig_exchange",
+            client_secret: INSTAGRAM_APP_SECRET,
+            access_token: shortResult.data.access_token,
+          }).toString();
+          const longResult = await fetchJson(longUrl.toString(), {}, 20_000);
+          if (!longResult.response.ok || !longResult.data?.access_token) {
+            throw new HttpError(
+              502,
+              longResult.data?.error?.message || "Instagram long-lived token exchange failed",
+              "INSTAGRAM_LONG_TOKEN_EXCHANGE_FAILED"
+            );
+          }
+          const token = longResult.data.access_token;
+          const profileUrl = new URL(`${INSTAGRAM_DIRECT_GRAPH_API}/me`);
+          profileUrl.search = new URLSearchParams({
+            fields: "user_id,username,account_type",
+            access_token: token,
+          }).toString();
+          const profileResult = await fetchJson(profileUrl.toString(), {}, 20_000);
+          if (!profileResult.response.ok || !profileResult.data?.username) {
+            throw new HttpError(
+              502,
+              profileResult.data?.error?.message || "Unable to read Instagram profile",
+              "INSTAGRAM_ACCOUNT_FETCH_FAILED"
+            );
+          }
+          const profile = profileResult.data;
+          await saveInstagramTokens(userId, {
+            access_token: token,
+            expires_in: longResult.data.expires_in || 5184000,
+          }, {
+            account_id: String(profile.user_id || shortResult.data.user_id),
+            display_name: profile.username,
+            avatar_url: null,
+            auth_type: "instagram_login",
+          });
+          return { igId: profile.user_id || shortResult.data.user_id };
+        }
+
+        // Legacy Facebook Login for Business flow.
         const tok = await instagramGraphRequest("/oauth/access_token", {
           client_id: META_APP_ID,
           client_secret: META_APP_SECRET,
