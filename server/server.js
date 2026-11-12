@@ -6,8 +6,8 @@
 //   Obligatoires : SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
 //   Production   : NODE_ENV=production, APP_URL, OAUTH_REDIRECT_URL,
 //                  OAUTH_STATE_SECRET (32+ caractères aléatoires)
-//   Recommandé   : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
-//                  chiffre les tokens TikTok / Pinterest / YouTube / Canva /
+//   Obligatoire en production : TOKEN_ENCRYPTION_KEY (32+ caractères aléatoires) →
+//                  chiffre les tokens OAuth avant leur stockage.
 //                  Dropbox / Google Drive / Google Photos / Instagram en base
 //                  (AES-256-GCM). Les anciens tokens en clair restent lisibles.
 //   Mot de passe oublié :
@@ -692,14 +692,15 @@ if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
 const TOKEN_ENCRYPTION_KEY = env("TOKEN_ENCRYPTION_KEY")
   ? crypto.createHash("sha256").update(env("TOKEN_ENCRYPTION_KEY")).digest()
   : null;
+const TOKEN_ENCRYPTION_REQUIRED = IS_PRODUCTION || Boolean(env("RENDER"));
 const ENC_PREFIX = "enc:v1:";
 
 function encryptSecret(value) {
   if (!value) return value ?? null;
   if (!TOKEN_ENCRYPTION_KEY) {
-    if (IS_PRODUCTION) {
+    if (TOKEN_ENCRYPTION_REQUIRED) {
       throw new Error(
-        "TOKEN_ENCRYPTION_KEY must be configured in production before storing OAuth tokens"
+        "TOKEN_ENCRYPTION_KEY must be configured on the production host before storing OAuth tokens"
       );
     }
     return value;
