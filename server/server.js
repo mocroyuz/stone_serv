@@ -7909,39 +7909,145 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
             "INSTAGRAM_TOKEN_EXCHANGE_FAILED"
           );
         }
-        // 2. Retrouver le compte Instagram choisi
+        // 2. Valider le jeton et récupérer les assets autorisés par la
+        // configuration Unified Login (System User Access Token).
         const dbg = await instagramGraphRequest("/debug_token", {
           input_token: tok.access_token,
           access_token: `${META_APP_ID}|${META_APP_SECRET}`,
         });
-        const igId = dbg?.data?.granular_scopes?.find(
-          (s) => s.scope === "instagram_basic"
-        )?.target_ids?.[0];
-        if (!igId) {
+        if (dbg?.data?.is_valid === false) {
+          throw new HttpError(
+            401,
+            "Le jeton Meta retourné par Unified Login n'est pas valide. Vérifie la configuration et régénère le jeton.",
+            "INSTAGRAM_INVALID_TOKEN"
+          );
+        }
+        if (
+          dbg?.data?.app_id &&
+          String(dbg.data.app_id) !== String(META_APP_ID)
+        ) {
+          throw new HttpError(
+            401,
+            "Le jeton Instagram a été émis pour une autre application Meta que celle configurée dans Stone.",
+            "INSTAGRAM_TOKEN_APP_MISMATCH"
+          );
+        }
+
+        const granularScopes = Array.isArray(dbg?.data?.granular_scopes)
+          ? dbg.data.granular_scopes
+          : [];
+        const instagramPermissionNames = new Set([
+          "instagram_basic",
+          "instagram_content_publish",
+          "instagram_manage_comments",
+          "instagram_manage_messages",
+          "instagram_manage_insights",
+        ]);
+        const grantedScopes = new Set([
+          ...(Array.isArray(dbg?.data?.scopes) ? dbg.data.scopes : []),
+          ...granularScopes.map((scope) => scope?.scope).filter(Boolean),
+        ]);
+        const missingFeatureScopes = [...instagramPermissionNames].filter(
+          (scope) => !grantedScopes.has(scope)
+        );
+        if (missingFeatureScopes.length) {
+          console.warn(
+            "[instagram:callback] permissions non accordées par la configuration Unified Login:",
+            missingFeatureScopes.join(", ")
+          );
+        }
+
+        // Avec une configuration SUAT, les identifiants des comptes Instagram
+        // autorisés sont normalement exposés dans granular_scopes.target_ids.
+        // On accepte aussi les autres permissions Instagram comme source
+        // d'assets, car Meta peut renvoyer des granular scopes partiels.
+        const candidateIds = [];
+        for (const scope of granularScopes) {
+          if (!instagramPermissionNames.has(scope?.scope)) continue;
+          for (const targetId of scope?.target_ids || []) {
+            const id = String(targetId || "").trim();
+            if (id && !candidateIds.includes(id)) candidateIds.push(id);
+          }
+        }
+
+        // Repli pour les configurations qui exposent les Pages associées
+        // plutôt que l'IG User directement dans les granular scopes.
+        try {
+          const pages = await instagramGraphRequest("/me/accounts", {
+            fields: "id,name,instagram_business_account",
+            access_token: tok.access_token,
+          });
+          for (const page of pages?.data || []) {
+            const id = page?.instagram_business_account?.id;
+            if (id) {
+              const normalizedId = String(id);
+              if (!candidateIds.includes(normalizedId)) {
+                candidateIds.push(normalizedId);
+              }
+            }
+          }
+        } catch (error) {
+          // Le repli Pages peut être indisponible avec certaines configurations
+          // SUAT qui attribuent directement l'asset Instagram.
+          console.warn(
+            "[instagram:callback] découverte via Pages indisponible:",
+            error?.message || error
+          );
+        }
+
+        if (!candidateIds.length) {
           throw new HttpError(
             400,
-            "Aucun compte Instagram autorisé",
+            "Meta n'a associé aucun compte Instagram à ce jeton. Dans la configuration Unified Login, sélectionne le compte Instagram comme asset et accorde instagram_basic.",
             "INSTAGRAM_NO_ACCOUNT"
           );
         }
-        // 3. Infos du compte
-        const me = await instagramGraphRequest(`/${encodeURIComponent(igId)}`, {
-          fields: "username,name,profile_picture_url",
-          access_token: tok.access_token,
-        });
-        if (!me?.id) {
+
+        // 3. Lire le profil réel de chaque asset autorisé. Ne pas enregistrer
+        // un simple ID de permission : on exige une réponse profil exploitable.
+        let instagramProfile = null;
+        let selectedInstagramId = null;
+        let lastProfileError = null;
+        for (const igId of candidateIds) {
+          try {
+            const profile = await instagramGraphRequest(
+              `/${encodeURIComponent(igId)}`,
+              {
+                fields: "id,username,name,profile_picture_url",
+                access_token: tok.access_token,
+              }
+            );
+            if (profile?.id && (profile.username || profile.name)) {
+              instagramProfile = profile;
+              selectedInstagramId = String(profile.id);
+              break;
+            }
+          } catch (error) {
+            lastProfileError = error;
+          }
+        }
+
+        if (!instagramProfile || !selectedInstagramId) {
           throw new HttpError(
             502,
-            me?.error?.message || "Failed to fetch Instagram account",
+            lastProfileError?.message ||
+              "Meta a retourné un compte autorisé, mais son profil Instagram est inaccessible. Vérifie les assets et les permissions de la configuration Unified Login.",
             "INSTAGRAM_ACCOUNT_FETCH_FAILED"
           );
         }
-        await saveInstagramTokens(userId, tok, {
-          account_id: igId,
-          display_name: me.username || me.name || null,
-          avatar_url: me.profile_picture_url || null,
-        });
-        return { igId };
+
+        await saveInstagramTokens(
+          userId,
+          tok,
+          {
+            account_id: selectedInstagramId,
+            display_name:
+              instagramProfile.username || instagramProfile.name || null,
+            avatar_url: instagramProfile.profile_picture_url || null,
+            auth_type: "facebook_login_business_system_user",
+          }
+        );
+        return { igId: selectedInstagramId };
       }
     );
     console.log(`[instagram:callback] compte ${result.igId} lié`);
