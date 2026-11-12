@@ -678,6 +678,7 @@ const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN;
 // ============================================================
 let OAUTH_STATE_SECRET =
   env("OAUTH_STATE_SECRET") ||
+  META_APP_SECRET ||
   TIKTOK_CLIENT_SECRET ||
   INSTAGRAM_APP_SECRET ||
   PINTEREST_APP_SECRET ||
@@ -695,7 +696,14 @@ const ENC_PREFIX = "enc:v1:";
 
 function encryptSecret(value) {
   if (!value) return value ?? null;
-  if (!TOKEN_ENCRYPTION_KEY) return value;
+  if (!TOKEN_ENCRYPTION_KEY) {
+    if (IS_PRODUCTION) {
+      throw new Error(
+        "TOKEN_ENCRYPTION_KEY must be configured in production before storing OAuth tokens"
+      );
+    }
+    return value;
+  }
   if (String(value).startsWith(ENC_PREFIX)) return value;
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", TOKEN_ENCRYPTION_KEY, iv);
@@ -8046,6 +8054,10 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
               instagramProfile.username || instagramProfile.name || null,
             avatar_url: instagramProfile.profile_picture_url || null,
             auth_type: "facebook_login_business_system_user",
+            scope: [...grantedScopes].sort().join(" ") || null,
+            token_type: dbg?.data?.type
+              ? String(dbg.data.type).toUpperCase()
+              : null,
           }
         );
         return { igId: selectedInstagramId };
