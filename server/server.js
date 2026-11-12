@@ -7850,27 +7850,46 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
             );
           }
           const token = longResult.data.access_token;
-          const profileUrl = new URL(`${INSTAGRAM_DIRECT_GRAPH_API}/me`);
-          profileUrl.search = new URLSearchParams({
-            fields: "user_id,username,account_type",
-            access_token: token,
-          }).toString();
-          const profileResult = await fetchJson(profileUrl.toString(), {}, 20_000);
+          const fetchDirectInstagramProfile = async (fields) => {
+            const profileUrl = new URL(`${INSTAGRAM_DIRECT_GRAPH_API}/me`);
+            profileUrl.search = new URLSearchParams({
+              fields,
+              access_token: token,
+            }).toString();
+            return fetchJson(profileUrl.toString(), {}, 20_000);
+          };
+
+          // Demander la photo quand l'API Instagram Login la fournit.
+          // Certaines configurations Meta ne l'exposent pas : dans ce cas,
+          // refaire la lecture avec les champs de base pour ne pas bloquer
+          // l'enregistrement du compte.
+          let profileResult = await fetchDirectInstagramProfile(
+            "user_id,username,account_type,profile_picture_url"
+          );
           if (!profileResult.response.ok || !profileResult.data?.username) {
-            throw new HttpError(
-              502,
-              profileResult.data?.error?.message || "Unable to read Instagram profile",
-              "INSTAGRAM_ACCOUNT_FETCH_FAILED"
+            const basicProfileResult = await fetchDirectInstagramProfile(
+              "user_id,username,account_type"
             );
+            if (!basicProfileResult.response.ok || !basicProfileResult.data?.username) {
+              throw new HttpError(
+                502,
+                basicProfileResult.data?.error?.message ||
+                  profileResult.data?.error?.message ||
+                  "Unable to read Instagram profile",
+                "INSTAGRAM_ACCOUNT_FETCH_FAILED"
+              );
+            }
+            profileResult = basicProfileResult;
           }
+
           const profile = profileResult.data;
           await saveInstagramTokens(userId, {
             access_token: token,
             expires_in: longResult.data.expires_in || 5184000,
           }, {
             account_id: String(profile.user_id || shortResult.data.user_id),
-            display_name: profile.username,
-            avatar_url: null,
+            display_name: profile.username || profile.name || null,
+            avatar_url: profile.profile_picture_url || null,
             auth_type: "instagram_login",
           });
           return { igId: profile.user_id || shortResult.data.user_id };
