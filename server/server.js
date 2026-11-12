@@ -625,7 +625,7 @@ const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024;
 const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
 
 // ============================================================
-// CONFIGURATION INSTAGRAM (Instagram Login direct + legacy Facebook Login)
+// CONFIGURATION INSTAGRAM (Unified Login / Facebook Login for Business + direct fallback)
 // ============================================================
 const INSTAGRAM_APP_ID = env("INSTAGRAM_APP_ID");
 const INSTAGRAM_APP_SECRET = env("INSTAGRAM_APP_SECRET");
@@ -642,10 +642,10 @@ const INSTAGRAM_REDIRECT_URI =
 const instagramDirectEnabled = Boolean(
   INSTAGRAM_APP_ID && INSTAGRAM_APP_SECRET && INSTAGRAM_REDIRECT_URI
 );
-const instagramLegacyEnabled = Boolean(
+const instagramUnifiedLoginEnabled = Boolean(
   META_APP_ID && META_APP_SECRET && META_IG_CONFIG_ID && INSTAGRAM_REDIRECT_URI
 );
-const instagramEnabled = instagramDirectEnabled || instagramLegacyEnabled;
+const instagramEnabled = instagramDirectEnabled || instagramUnifiedLoginEnabled;
 
 // ============================================================
 // CONFIGURATION TAGS
@@ -7722,15 +7722,16 @@ route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
 }, { auth: true });
 
 // ============================================================
-// INSTAGRAM ROUTES (Facebook Login for Business)
+// INSTAGRAM ROUTES (Unified Login / Facebook Login for Business)
 // ============================================================
 route(
   "POST",
   "/api/instagram/login",
   ({ res, user }) => {
-    // Priorité au parcours Facebook Login for Business configuré dans Meta.
+    // Priorité au parcours Unified Login / Facebook Login for Business configuré dans Meta.
+    // Les permissions sont définies dans META_IG_CONFIG_ID : ne pas ajouter scope ici.
     // Le state reste signé et lié à l'utilisateur Stone.
-    if (instagramLegacyEnabled) {
+    if (instagramUnifiedLoginEnabled) {
       const params = new URLSearchParams({
         client_id: META_APP_ID,
         config_id: META_IG_CONFIG_ID,
@@ -7809,7 +7810,7 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
     const result = await dedupeCallback(
       `instagram:${userId}:${sha256(code)}`,
       async () => {
-        if (!instagramLegacyEnabled && instagramDirectEnabled) {
+        if (!instagramUnifiedLoginEnabled && instagramDirectEnabled) {
           // Instagram Login direct : échange du code contre un token court,
           // puis échange contre un token longue durée (environ 60 jours).
           const form = new URLSearchParams({
@@ -7895,7 +7896,7 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
           return { igId: profile.user_id || shortResult.data.user_id };
         }
 
-        // Legacy Facebook Login for Business flow.
+        // Unified Login / Facebook Login for Business avec System User Access Token.
         const tok = await instagramGraphRequest("/oauth/access_token", {
           client_id: META_APP_ID,
           client_secret: META_APP_SECRET,
