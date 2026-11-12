@@ -28,7 +28,7 @@
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
 //   Instagram    : META_APP_ID, META_APP_SECRET, META_IG_CONFIG_ID
-//                  INSTAGRAM_REDIRECT_URI (défaut : ${APP_URL}/instagram/callback)
+//                  INSTAGRAM_REDIRECT_URI (défaut : ${PUBLIC_API_URL}/api/instagram/callback)
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
 //                    - RECOVERY_CODE_PEPPER (32+ caractères aléatoires)
@@ -262,6 +262,19 @@ if (
   throw new Error("MFA_VERIFIED_SESSION_TTL_MINUTES must be an integer between 1 and 1440");
 }
 
+// Fenêtre pendant laquelle une session vérifiée par passkey / code de secours
+// reste autorisée à utiliser l'API (porte MFA globale). Elle est volontairement
+// plus longue que le TTL « step-up » (opérations sensibles, 15 min par défaut).
+const MFA_GATE_WINDOW_HOURS = Number(env("MFA_GATE_WINDOW_HOURS") || 720);
+if (
+  !Number.isSafeInteger(MFA_GATE_WINDOW_HOURS) ||
+  MFA_GATE_WINDOW_HOURS < 1 ||
+  MFA_GATE_WINDOW_HOURS > 8760
+) {
+  throw new Error("MFA_GATE_WINDOW_HOURS must be an integer between 1 and 8760");
+}
+const MFA_GATE_WINDOW_MS = MFA_GATE_WINDOW_HOURS * 3_600_000;
+
 const WEBAUTHN_ORIGIN_URL = new URL(WEBAUTHN_ORIGIN);
 if (
   !WEBAUTHN_RP_ID ||
@@ -432,7 +445,12 @@ const MAX_PHOTOS_TOTAL = 80 * 1024 * 1024;
 const POST_MEDIA_BUCKET = "post-media";
 const MAX_POST_FILES = 60;
 const MAX_POST_FILE_SIZE = 100 * 1024 * 1024;
-const MAX_POST_UPLOAD_TOTAL = 500 * 1024 * 1024;
+const MAX_POST_UPLOAD_TOTAL =
+  (Number.isFinite(Number(env("MAX_POST_UPLOAD_TOTAL_MB"))) && Number(env("MAX_POST_UPLOAD_TOTAL_MB")) > 0
+    ? Number(env("MAX_POST_UPLOAD_TOTAL_MB"))
+    : 500) *
+  1024 *
+  1024;
 const POSTS_PUBLISH_INTERVAL_MS = 30_000;
 
 function publicApiLooksLikeFrontend() {
@@ -607,19 +625,27 @@ const MAX_DROPBOX_UPLOAD = 100 * 1024 * 1024;
 const dropboxEnabled = Boolean(DROPBOX_APP_KEY && DROPBOX_APP_SECRET);
 
 // ============================================================
-// CONFIGURATION INSTAGRAM (Facebook Login for Business)
+// CONFIGURATION INSTAGRAM (Instagram Login direct + legacy Facebook Login)
 // ============================================================
+const INSTAGRAM_APP_ID = env("INSTAGRAM_APP_ID");
+const INSTAGRAM_APP_SECRET = env("INSTAGRAM_APP_SECRET");
 const META_APP_ID = env("META_APP_ID");
 const META_APP_SECRET = env("META_APP_SECRET");
 const META_IG_CONFIG_ID = env("META_IG_CONFIG_ID");
 const INSTAGRAM_GRAPH_API = "https://graph.facebook.com/v21.0";
-const INSTAGRAM_OAUTH_DIALOG = "https://www.facebook.com/v21.0/dialog/oauth";
+const INSTAGRAM_DIRECT_GRAPH_API = "https://graph.instagram.com";
+const INSTAGRAM_DIRECT_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize";
+const INSTAGRAM_DIRECT_TOKEN_URL = "https://api.instagram.com/oauth/access_token";
 const INSTAGRAM_REDIRECT_URI =
   env("INSTAGRAM_REDIRECT_URI") ||
-  (APP_URL ? `${APP_URL}/instagram/callback` : null);
-const instagramEnabled = Boolean(
+  (PUBLIC_API_URL ? `${PUBLIC_API_URL}/api/instagram/callback` : null);
+const instagramDirectEnabled = Boolean(
+  INSTAGRAM_APP_ID && INSTAGRAM_APP_SECRET && INSTAGRAM_REDIRECT_URI
+);
+const instagramLegacyEnabled = Boolean(
   META_APP_ID && META_APP_SECRET && META_IG_CONFIG_ID && INSTAGRAM_REDIRECT_URI
 );
+const instagramEnabled = instagramDirectEnabled || instagramLegacyEnabled;
 
 // ============================================================
 // CONFIGURATION TAGS
@@ -653,6 +679,7 @@ const SAVED_REPLY_ID_PATTERN = TAG_ID_PATTERN;
 let OAUTH_STATE_SECRET =
   env("OAUTH_STATE_SECRET") ||
   TIKTOK_CLIENT_SECRET ||
+  INSTAGRAM_APP_SECRET ||
   PINTEREST_APP_SECRET ||
   YOUTUBE_CLIENT_SECRET ||
   CANVA_CLIENT_SECRET ||
@@ -1038,8 +1065,6 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:5173",
   "https://stone-prod.vercel.app",
 ];
-const VERCEL_DEPLOYMENT_ORIGIN_PATTERN =
-  /^https:\/\/stone-prod(-[a-z0-9]+)?-xsdevs-projects\.vercel\.app$/;
 const extraAllowedOrigins = (env("ALLOWED_ORIGINS") || "")
   .split(",")
   .map(normalizeOrigin)
@@ -1057,10 +1082,8 @@ const allowedOrigins = new Set(
 function isOriginAllowed(origin) {
   if (!origin || typeof origin !== "string") return false;
   const normalized = normalizeOrigin(origin);
-  return (
-    allowedOrigins.has(normalized) ||
-    VERCEL_DEPLOYMENT_ORIGIN_PATTERN.test(normalized)
-  );
+  // Liste exacte uniquement : pas de motif générique (voir ALLOWED_ORIGINS).
+  return allowedOrigins.has(normalized);
 }
 
 const warnedRejectedOrigins = new Set();
@@ -1137,16 +1160,59 @@ function newRequestId() {
   return crypto.randomUUID().slice(0, 8);
 }
 
+const REFRESH_COOKIE_NAME = "__Host-stone_refresh";
+const REFRESH_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
+
+function refreshCookieHeader(refreshToken) {
+  return `${REFRESH_COOKIE_NAME}=${encodeURIComponent(refreshToken)}; Path=/; Max-Age=${REFRESH_COOKIE_MAX_AGE_SECONDS}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function clearRefreshCookieHeader() {
+  return `${REFRESH_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function readRequestCookie(req, name) {
+  const header = typeof req.headers.cookie === "string" ? req.headers.cookie : "";
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+    const value = part.slice(separator + 1).trim();
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  }
+  return null;
+}
+
 function sendJson(res, statusCode, data, extraHeaders) {
   if (res.headersSent) {
     res.end();
     return;
   }
-  const payload = JSON.stringify(data);
+
+  let responseData = data;
+  const refreshToken =
+    data && typeof data === "object" && data.session &&
+    typeof data.session.refresh_token === "string"
+      ? data.session.refresh_token
+      : null;
+  const headers = { ...(extraHeaders || {}) };
+
+  // Le refresh token reste dans un cookie HttpOnly et n'est jamais exposé au JS.
+  if (refreshToken && refreshToken.length <= 4096) {
+    headers["Set-Cookie"] = refreshCookieHeader(refreshToken);
+    responseData = { ...data, session: { ...data.session } };
+    delete responseData.session.refresh_token;
+  }
+
+  const payload = JSON.stringify(responseData);
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(payload),
-    ...(extraHeaders || {}),
+    ...headers,
   });
   res.end(payload);
 }
@@ -1410,6 +1476,7 @@ function parseMultipartAny(
     maxFileSize = MAX_POST_FILE_SIZE,
     maxFieldSize = 1024 * 1024,
     requireFile = false,
+    maxTotalBytes = 0,
   } = {}
 ) {
   return new Promise((resolve, reject) => {
@@ -1439,14 +1506,39 @@ function parseMultipartAny(
       settled = true;
       fn(arg);
     };
+    let aborted = false;
+    let receivedBytes = 0;
+    const liveChunks = [];
+    // Plafond réel sur les octets reçus : le Content-Length peut être absent
+    // (Transfer-Encoding: chunked) ou mensonger, il ne protège donc pas la mémoire.
+    if (maxTotalBytes > 0) {
+      req.on("data", (chunk) => {
+        if (aborted) return;
+        receivedBytes += chunk.length;
+        if (receivedBytes > maxTotalBytes) {
+          aborted = true;
+          settle(reject, tooLargeError("Post media is too large."));
+          files.length = 0;
+          for (const list of liveChunks) list.length = 0;
+          liveChunks.length = 0;
+          req.unpipe(bb);
+          bb.destroy();
+          req.resume();
+        }
+      });
+    }
     bb.on("file", (fieldname, file, info) => {
       const chunks = [];
-      file.on("data", (chunk) => chunks.push(chunk));
+      liveChunks.push(chunks);
+      file.on("error", () => {});
+      file.on("data", (chunk) => {
+        if (!aborted) chunks.push(chunk);
+      });
       file.on("limit", () => {
         tooLarge = true;
       });
       file.on("end", () => {
-        if (tooLarge) return;
+        if (tooLarge || aborted) return;
         files.push({
           fieldname,
           buffer: Buffer.concat(chunks),
@@ -1752,44 +1844,53 @@ function verifiedFactorsOf(user) {
 const mfaVerifiedMemory = new Map();
 const MFA_MEMORY_MAX = 10_000;
 
-function readVerifiedMfaSessionMemory(userId, sessionId) {
+// Valeur stockée : date de vérification (ms). Le step-up (TTL court) et la porte
+// globale (fenêtre longue) en dérivent chacun leur propre échéance.
+function readVerifiedMfaSessionMemory(userId, sessionId, windowMs) {
   const key = `${userId}:${sessionId}`;
-  const expires = mfaVerifiedMemory.get(key);
-  if (!expires) return false;
-  if (expires <= Date.now()) {
+  const verifiedAt = mfaVerifiedMemory.get(key);
+  if (!verifiedAt) return false;
+  if (verifiedAt + MFA_GATE_WINDOW_MS <= Date.now()) {
     mfaVerifiedMemory.delete(key);
     return false;
   }
-  return true;
+  return verifiedAt + windowMs > Date.now();
 }
 
 function writeVerifiedMfaSessionMemory(userId, sessionId) {
   if (mfaVerifiedMemory.size >= MFA_MEMORY_MAX) {
     mfaVerifiedMemory.delete(mfaVerifiedMemory.keys().next().value);
   }
-  mfaVerifiedMemory.set(
-    `${userId}:${sessionId}`,
-    Date.now() + MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000
-  );
+  mfaVerifiedMemory.set(`${userId}:${sessionId}`, Date.now());
 }
 setInterval(() => {
   const now = Date.now();
-  for (const [key, expires] of mfaVerifiedMemory) {
-    if (expires <= now) mfaVerifiedMemory.delete(key);
+  for (const [key, verifiedAt] of mfaVerifiedMemory) {
+    if (verifiedAt + MFA_GATE_WINDOW_MS <= now) mfaVerifiedMemory.delete(key);
   }
 }, 60_000).unref?.();
 
-async function hasVerifiedMfaSession(userId, sessionId) {
+const MFA_STEP_UP_TTL_MS = MFA_VERIFIED_SESSION_TTL_MINUTES * 60_000;
+
+/**
+ * Cherche une vérification MFA (passkey / code de secours) pour cette session.
+ *  - mode "step-up" : vérifiée il y a moins de MFA_VERIFIED_SESSION_TTL_MINUTES
+ *    (opérations sensibles, statut « requires_challenge ») ;
+ *  - mode "gate"    : vérifiée il y a moins de MFA_GATE_WINDOW_HOURS
+ *    (autorise l'usage normal de l'API).
+ */
+async function findVerifiedMfaSession(userId, sessionId, windowMs) {
   if (!sessionId) return false;
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const gateCutoff = new Date(nowMs - MFA_GATE_WINDOW_MS).toISOString();
   const { error: purgeError } = await supabaseAdmin
     .from("mfa_verified_sessions")
     .delete()
     .eq("user_id", userId)
-    .lte("expires_at", now);
+    .lte("verified_at", gateCutoff);
   if (purgeError) {
     if (isSchemaCacheMissingError(purgeError)) {
-      return readVerifiedMfaSessionMemory(userId, sessionId);
+      return readVerifiedMfaSessionMemory(userId, sessionId, windowMs);
     }
     throw dbError("mfa_verified_sessions.purge", purgeError);
   }
@@ -1798,15 +1899,30 @@ async function hasVerifiedMfaSession(userId, sessionId) {
     .select("session_id")
     .eq("user_id", userId)
     .eq("session_id", sessionId)
-    .gt("expires_at", now)
+    .gt("verified_at", new Date(nowMs - windowMs).toISOString())
     .maybeSingle();
   if (error) {
     if (isSchemaCacheMissingError(error)) {
-      return readVerifiedMfaSessionMemory(userId, sessionId);
+      return readVerifiedMfaSessionMemory(userId, sessionId, windowMs);
     }
     throw dbError("mfa_verified_sessions.lookup", error);
   }
   return Boolean(data);
+}
+
+function hasVerifiedMfaSession(userId, sessionId) {
+  return findVerifiedMfaSession(userId, sessionId, MFA_STEP_UP_TTL_MS);
+}
+
+function hasMfaGateSession(userId, sessionId) {
+  return findVerifiedMfaSession(userId, sessionId, MFA_GATE_WINDOW_MS);
+}
+
+/** true si la session courante doit encore passer le défi MFA pour utiliser l'API. */
+async function mfaGatePending(user, token) {
+  if (!userHasVerifiedMfa(user)) return false;
+  if (getTokenAal(token) === "aal2") return false;
+  return !(await hasMfaGateSession(user.id, getTokenSessionId(token)));
 }
 
 async function recordVerifiedMfaSession(userId, sessionId, method) {
@@ -4426,7 +4542,8 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   sendJson(res, 200, {
     success: true,
     verified: Boolean(data.user?.email_confirmed_at),
-    session: sessionPayload(data.session),
+    // Cette route vérifie l'adresse email ; elle ne doit pas ouvrir une session persistante.
+    session: data.session ? { access_token: data.session.access_token } : null,
     mfa_enabled: hasVerifiedMfa,
     mfa_required: hasVerifiedMfa && sessionAal === "aal1",
     aal: sessionAal,
@@ -4527,7 +4644,9 @@ route("POST", "/api/auth/logout", async ({ req, res }) => {
     }
     if (cachedUser) authCacheInvalidateUser(cachedUser.id);
   }
-  sendJson(res, 200, { success: true });
+  sendJson(res, 200, { success: true }, {
+    "Set-Cookie": clearRefreshCookieHeader(),
+  });
 });
 
 route("POST", "/api/auth/sessions/revoke-others", async ({ res, user, token }) => {
@@ -4539,13 +4658,31 @@ route("POST", "/api/auth/sessions/revoke-others", async ({ res, user, token }) =
 
 route("POST", "/api/auth/refresh", async ({ req, res }) => {
   const body = await getJsonBody(req);
-  const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
-  if (!refreshToken || refreshToken.length > 4096) throw new HttpError(400, "Missing refresh token");
+  // Accepte les anciennes sessions via body et les nouvelles via cookie HttpOnly.
+  const refreshToken = String(
+    body.refreshToken || body.refresh_token ||
+    readRequestCookie(req, REFRESH_COOKIE_NAME) || ""
+  );
+
+  if (!refreshToken || refreshToken.length > 4096) {
+    sendJson(res, 401, {
+      success: false,
+      error: "No active session",
+      code: "NO_REFRESH_TOKEN",
+    }, { "Set-Cookie": clearRefreshCookieHeader() });
+    return;
+  }
+
   const { data, error } = await withLock(`auth-refresh:${sha256(refreshToken)}`, () =>
     supabase.auth.refreshSession({ refresh_token: refreshToken })
   );
   if (error || !data.session) {
-    throw new HttpError(401, "Invalid or expired refresh token", "INVALID_REFRESH_TOKEN");
+    sendJson(res, 401, {
+      success: false,
+      error: "Invalid or expired refresh token",
+      code: "INVALID_REFRESH_TOKEN",
+    }, { "Set-Cookie": clearRefreshCookieHeader() });
+    return;
   }
   if (data.user) authCacheSet(data.session.access_token, data.user);
   sendJson(res, 200, {
@@ -4629,7 +4766,7 @@ route("POST", "/api/mfa/recovery-codes/verify", async ({ req, res, user, token }
   if (!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{10}$/.test(normalizedCode)) {
     throw new HttpError(400, "Invalid or already used recovery code", "INVALID_RECOVERY_CODE");
   }
-  const attemptKey = authAttemptKey("user", user.id, getClientIp(req));
+  const attemptKey = authAttemptKey("user", user.id, "-");
   await checkAuthAttemptLimit(attemptKey);
   const sessionId = getTokenSessionId(token);
   if (!sessionId) throw new HttpError(401, "Invalid session", "INVALID_SESSION");
@@ -4973,7 +5110,7 @@ route("POST", "/api/mfa/enroll/verify", async ({ req, res, user, token }) => {
   const code = typeof body.code === "string" ? body.code : "";
   if (!factorId || factorId.length > 128) throw new HttpError(400, "Missing factorId");
   if (!/^\d{6,8}$/.test(code)) throw new HttpError(400, "Invalid code", "INVALID_CODE");
-  const attemptKey = authAttemptKey("user", user.id, getClientIp(req));
+  const attemptKey = authAttemptKey("user", user.id, "-");
   await checkAuthAttemptLimit(attemptKey);
   const alreadyHadAuthenticator = userHasVerifiedMfa(user);
   const session = await verifyMfaCodeWithAttempts(factorId, code, token, attemptKey);
@@ -5005,7 +5142,7 @@ route("POST", "/api/mfa/verify", async ({ req, res, user, token }) => {
     if (!first) throw new HttpError(400, "No authenticator found", "NO_MFA_FACTOR");
     factorId = first.id;
   }
-  const attemptKey = authAttemptKey("user", user.id, getClientIp(req));
+  const attemptKey = authAttemptKey("user", user.id, "-");
   await checkAuthAttemptLimit(attemptKey);
   const session = await verifyMfaCodeWithAttempts(factorId, code, token, attemptKey);
   sendJson(res, 200, {
@@ -5516,10 +5653,32 @@ function sanitizePostExtension(fileName) {
   return /^[a-z0-9]{1,10}$/.test(ext) ? ext : "bin";
 }
 
+const POST_MEDIA_EXTENSIONS = new Set([
+  "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "bmp", "tif", "tiff",
+  "mp4", "m4v", "mov", "webm", "mkv", "avi", "3gp",
+]);
+
+// Le bucket de médias est public : on n'y accepte que de vraies images / vidéos,
+// jamais de HTML, de SVG ou de script qui s'exécuterait depuis notre domaine de stockage.
+function validatePostMedia(file) {
+  const mimeType = String(file.mimeType || "").toLowerCase();
+  if (!/^(image|video)\/[a-z0-9][a-z0-9.+-]*$/.test(mimeType) || mimeType === "image/svg+xml") {
+    throw new HttpError(400, "Unsupported media type. Use images or videos.", "UNSUPPORTED_MEDIA_TYPE");
+  }
+  const head = file.buffer.subarray(0, 512).toString("latin1").trimStart().toLowerCase();
+  if (head.startsWith("<") || head.startsWith("<?xml") || head.startsWith("<svg")) {
+    throw new HttpError(400, "Unsupported media type. Use images or videos.", "UNSUPPORTED_MEDIA_TYPE");
+  }
+  const rawExt = sanitizePostExtension(file.fileName);
+  const ext = POST_MEDIA_EXTENSIONS.has(rawExt)
+    ? rawExt
+    : mimeType.startsWith("video/") ? "mp4" : "jpg";
+  return { mimeType, ext };
+}
+
 async function uploadPostFile(userId, file) {
-  const ext = sanitizePostExtension(file.fileName);
+  const { mimeType, ext } = validatePostMedia(file);
   const objectPath = `${userId}/${crypto.randomUUID()}.${ext}`;
-  const mimeType = file.mimeType || "application/octet-stream";
   const { error } = await supabaseAdmin.storage
     .from(POST_MEDIA_BUCKET)
     .upload(objectPath, file.buffer, { contentType: mimeType });
@@ -5532,17 +5691,32 @@ async function uploadPostFile(userId, file) {
   };
 }
 
-route("POST", "/api/posts", async ({ req, res, user }) => {
+route("POST", "/api/posts", async (ctx) => {
+  const { req, user } = ctx;
   enforce(limiterPosts, `posts:${user.id}`);
   const declared = Number(req.headers["content-length"] || 0);
   if (declared > MAX_POST_UPLOAD_TOTAL + 2 * 1024 * 1024) {
     throw tooLargeError("Post media is too large.");
   }
+  // Les uploads lourds (ou de taille inconnue) partagent les créneaux vidéo :
+  // sans cela, quelques requêtes simultanées suffisent à saturer la mémoire.
+  const heavy = !declared || declared > 1024 * 1024;
+  if (!heavy) return createPost(ctx, declared);
+  await acquireVideoSlot();
+  try {
+    await createPost(ctx, declared);
+  } finally {
+    releaseVideoSlot();
+  }
+}, { auth: true });
+
+async function createPost({ req, res, user }) {
   let upload;
   try {
     upload = await parseMultipartAny(req, {
       maxFiles: MAX_POST_FILES,
       maxFileSize: MAX_POST_FILE_SIZE,
+      maxTotalBytes: MAX_POST_UPLOAD_TOTAL + 2 * 1024 * 1024,
     });
   } catch (error) {
     if (error?.code === "FILE_TOO_LARGE") {
@@ -5572,6 +5746,9 @@ route("POST", "/api/posts", async ({ req, res, user }) => {
   }
   const userId = user.id;
   const files = upload.files;
+  for (const f of files) {
+    if (f.fieldname === "media" || f.fieldname.startsWith("media_")) validatePostMedia(f);
+  }
   const external = Array.isArray(data.externalNetworks) ? data.externalNetworks : [];
   const networks = [...new Set([
     ...(Array.isArray(data.networks) ? data.networks : []),
@@ -5625,7 +5802,7 @@ route("POST", "/api/posts", async ({ req, res, user }) => {
     .select();
   if (error) throw dbError("scheduled_posts.insert", error);
   sendJson(res, 200, { success: true, posts: inserted });
-}, { auth: true });
+}
 
 route("GET", "/api/posts", async ({ res, url, user }) => {
   let q = supabaseAdmin
@@ -7551,80 +7728,210 @@ route(
   "POST",
   "/api/instagram/login",
   ({ res, user }) => {
+    // Priorité au parcours Facebook Login for Business configuré dans Meta.
+    // Le state reste signé et lié à l'utilisateur Stone.
+    if (instagramLegacyEnabled) {
+      const params = new URLSearchParams({
+        client_id: META_APP_ID,
+        config_id: META_IG_CONFIG_ID,
+        display: "popup",
+        override_default_response_type: "true",
+        redirect_uri: INSTAGRAM_REDIRECT_URI,
+        response_type: "code",
+        state: createOAuthState("instagram", user.id),
+        prompt: "login",
+      });
+      sendJson(res, 200, {
+        success: true,
+        url: `https://www.facebook.com/dialog/oauth?${params.toString()}`,
+      });
+      return;
+    }
+
+    // Repli sur Instagram Login direct uniquement si le parcours Meta
+    // Facebook Login for Business n'est pas configuré.
     const params = new URLSearchParams({
-      client_id: META_APP_ID,
-      config_id: META_IG_CONFIG_ID,
-      response_type: "code",
-      override_default_response_type: "true",
+      client_id: INSTAGRAM_APP_ID,
       redirect_uri: INSTAGRAM_REDIRECT_URI,
+      response_type: "code",
+      scope: "instagram_business_basic,instagram_business_content_publish",
       state: createOAuthState("instagram", user.id),
     });
     sendJson(res, 200, {
       success: true,
-      url: `${INSTAGRAM_OAUTH_DIALOG}?${params.toString()}`,
+      url: `${INSTAGRAM_DIRECT_AUTHORIZE_URL}?${params.toString()}`,
     });
   },
   { auth: true }
 );
 
-route("POST", "/api/instagram/auth/callback", async ({ req, res, user }) => {
-  const body = await getJsonBody(req);
-  const code = assertValidOAuthCallback("instagram", body, user.id);
-  const account = await dedupeCallback(
-    `instagram:${user.id}:${sha256(code)}`,
-    async () => {
-      const tokens = await instagramGraphRequest("/oauth/access_token", {
-        client_id: META_APP_ID,
-        client_secret: META_APP_SECRET,
-        redirect_uri: INSTAGRAM_REDIRECT_URI,
-        code,
-      });
-      if (!tokens?.access_token) {
-        throw new HttpError(
-          502,
-          tokens?.error?.message || "Instagram returned an invalid token response",
-          "INSTAGRAM_BAD_TOKEN_RESPONSE"
-        );
-      }
+// Callback navigateur : PAS d'auth (Facebook redirige le navigateur).
+// → le userId est porté par le state signé, vérifié par extractOAuthState.
+route("GET", "/api/instagram/callback", async ({ res, url }) => {
+  const frontBase = `${APP_URL}/?section=channels`;
+  const redirectError = (msg) => {
+    const safe = String(msg || "instagram_callback_failed").slice(0, 300);
+    redirectTo(res, `${frontBase}&instagram_error=${encodeURIComponent(safe)}`);
+  };
 
-      const debug = await instagramGraphRequest("/debug_token", {
-        input_token: tokens.access_token,
-        access_token: `${META_APP_ID}|${META_APP_SECRET}`,
-      });
-      const accountId = debug?.data?.granular_scopes?.find(
-        (scope) => scope.scope === "instagram_basic"
-      )?.target_ids?.[0];
-      if (!accountId) {
-        throw new HttpError(
-          400,
-          "No Instagram account was authorized",
-          "INSTAGRAM_NO_ACCOUNT"
-        );
-      }
-
-      let profile = {};
-      try {
-        profile = await instagramGraphRequest(`/${encodeURIComponent(accountId)}`, {
-          fields: "username,name,profile_picture_url",
-          access_token: tokens.access_token,
-        });
-      } catch (error) {
-        console.warn("Instagram profile error:", error?.message || error);
-      }
-
-      await saveInstagramTokens(user.id, tokens, {
-        account_id: accountId,
-        display_name: profile.username || profile.name || null,
-        avatar_url: profile.profile_picture_url || null,
-      });
-      return {
-        display_name: profile.username || profile.name || null,
-        avatar_url: profile.profile_picture_url || null,
-      };
-    }
+  const errorCode = url.searchParams.get("error");
+  const errorDescription =
+    url.searchParams.get("error_description") || errorCode;
+  if (errorDescription) {
+    console.warn(`[instagram:callback] rejeté : ${errorDescription}`);
+    redirectError(errorDescription);
+    return;
+  }
+  const code = url.searchParams.get("code");
+  if (!code || code.length > 2048) {
+    redirectError("missing_code");
+    return;
+  }
+  const stateInfo = extractOAuthState(
+    "instagram",
+    url.searchParams.get("state")
   );
-  sendJson(res, 200, { success: true, connected: true, account });
-}, { auth: true });
+  if (stateInfo.error) {
+    console.warn(`[instagram:callback] state invalide (${stateInfo.error})`);
+    redirectError(`invalid_state_${stateInfo.error}`);
+    return;
+  }
+  const userId = stateInfo.userId;
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      userId
+    )
+  ) {
+    redirectError("invalid_user");
+    return;
+  }
+  try {
+    const result = await dedupeCallback(
+      `instagram:${userId}:${sha256(code)}`,
+      async () => {
+        if (!instagramLegacyEnabled && instagramDirectEnabled) {
+          // Instagram Login direct : échange du code contre un token court,
+          // puis échange contre un token longue durée (environ 60 jours).
+          const form = new URLSearchParams({
+            client_id: INSTAGRAM_APP_ID,
+            client_secret: INSTAGRAM_APP_SECRET,
+            grant_type: "authorization_code",
+            redirect_uri: INSTAGRAM_REDIRECT_URI,
+            code,
+          });
+          const shortResult = await fetchJson(
+            INSTAGRAM_DIRECT_TOKEN_URL,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: form,
+            },
+            20_000
+          );
+          if (!shortResult.response.ok || !shortResult.data?.access_token) {
+            throw new HttpError(
+              400,
+              shortResult.data?.error_message || shortResult.data?.error?.message || "Instagram token exchange failed",
+              "INSTAGRAM_TOKEN_EXCHANGE_FAILED"
+            );
+          }
+          const longUrl = new URL(`${INSTAGRAM_DIRECT_GRAPH_API}/access_token`);
+          longUrl.search = new URLSearchParams({
+            grant_type: "ig_exchange",
+            client_secret: INSTAGRAM_APP_SECRET,
+            access_token: shortResult.data.access_token,
+          }).toString();
+          const longResult = await fetchJson(longUrl.toString(), {}, 20_000);
+          if (!longResult.response.ok || !longResult.data?.access_token) {
+            throw new HttpError(
+              502,
+              longResult.data?.error?.message || "Instagram long-lived token exchange failed",
+              "INSTAGRAM_LONG_TOKEN_EXCHANGE_FAILED"
+            );
+          }
+          const token = longResult.data.access_token;
+          const profileUrl = new URL(`${INSTAGRAM_DIRECT_GRAPH_API}/me`);
+          profileUrl.search = new URLSearchParams({
+            fields: "user_id,username,account_type",
+            access_token: token,
+          }).toString();
+          const profileResult = await fetchJson(profileUrl.toString(), {}, 20_000);
+          if (!profileResult.response.ok || !profileResult.data?.username) {
+            throw new HttpError(
+              502,
+              profileResult.data?.error?.message || "Unable to read Instagram profile",
+              "INSTAGRAM_ACCOUNT_FETCH_FAILED"
+            );
+          }
+          const profile = profileResult.data;
+          await saveInstagramTokens(userId, {
+            access_token: token,
+            expires_in: longResult.data.expires_in || 5184000,
+          }, {
+            account_id: String(profile.user_id || shortResult.data.user_id),
+            display_name: profile.username,
+            avatar_url: null,
+            auth_type: "instagram_login",
+          });
+          return { igId: profile.user_id || shortResult.data.user_id };
+        }
+
+        // Legacy Facebook Login for Business flow.
+        const tok = await instagramGraphRequest("/oauth/access_token", {
+          client_id: META_APP_ID,
+          client_secret: META_APP_SECRET,
+          redirect_uri: INSTAGRAM_REDIRECT_URI,
+          code,
+        });
+        if (!tok?.access_token) {
+          throw new HttpError(
+            400,
+            tok?.error?.message || "Token exchange failed",
+            "INSTAGRAM_TOKEN_EXCHANGE_FAILED"
+          );
+        }
+        // 2. Retrouver le compte Instagram choisi
+        const dbg = await instagramGraphRequest("/debug_token", {
+          input_token: tok.access_token,
+          access_token: `${META_APP_ID}|${META_APP_SECRET}`,
+        });
+        const igId = dbg?.data?.granular_scopes?.find(
+          (s) => s.scope === "instagram_basic"
+        )?.target_ids?.[0];
+        if (!igId) {
+          throw new HttpError(
+            400,
+            "Aucun compte Instagram autorisé",
+            "INSTAGRAM_NO_ACCOUNT"
+          );
+        }
+        // 3. Infos du compte
+        const me = await instagramGraphRequest(`/${encodeURIComponent(igId)}`, {
+          fields: "username,name,profile_picture_url",
+          access_token: tok.access_token,
+        });
+        if (!me?.id) {
+          throw new HttpError(
+            502,
+            me?.error?.message || "Failed to fetch Instagram account",
+            "INSTAGRAM_ACCOUNT_FETCH_FAILED"
+          );
+        }
+        await saveInstagramTokens(userId, tok, {
+          account_id: igId,
+          display_name: me.username || me.name || null,
+          avatar_url: me.profile_picture_url || null,
+        });
+        return { igId };
+      }
+    );
+    console.log(`[instagram:callback] compte ${result.igId} lié`);
+    redirectTo(res, `${frontBase}&instagram=1`);
+  } catch (error) {
+    console.error("[instagram:callback]", error?.message || error);
+    redirectError(error?.message || "instagram_callback_failed");
+  }
+});
 
 route(
   "GET",
@@ -7692,13 +7999,25 @@ const providerGuards = [
   ["/api/instagram/", instagramEnabled, "Instagram"],
 ];
 
+// Routes authentifiées accessibles AVANT d'avoir passé le défi MFA.
+const MFA_GATE_EXEMPT = new Set([
+  "GET /api/user",
+  "GET /api/user/profile",
+  "GET /api/auth/mfa/status",
+  "GET /api/mfa/factors",
+  "POST /api/mfa/verify",
+  "POST /api/mfa/recovery-codes/verify",
+  "POST /api/mfa/passkeys/authenticate/options",
+  "POST /api/mfa/passkeys/authenticate/verify",
+]);
+
 const server = createServer(async (req, res) => {
   const requestId = newRequestId();
   console.log(
-    `[${requestId}] → ${req.method} ${req.url} origin=${req.headers.origin || "-"} host=${req.headers.host || "-"}`
+    `[${requestId}] → ${req.method} ${String(req.url || "").split("?")[0]} origin=${req.headers.origin || "-"} host=${req.headers.host || "-"}`
   );
   res.on("finish", () => {
-    console.log(`[${requestId}] ← ${res.statusCode} ${req.method} ${req.url}`);
+    console.log(`[${requestId}] ← ${res.statusCode} ${req.method} ${String(req.url || "").split("?")[0]}`);
   });
   setSecurityHeaders(res);
   try {
@@ -7713,7 +8032,7 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  let routeLabel = `${req.method} ${req.url}`;
+  let routeLabel = `${req.method} ${String(req.url || "").split("?")[0]}`;
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || `localhost:${PORT}`}`);
     const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
@@ -7784,6 +8103,16 @@ const server = createServer(async (req, res) => {
       }
       ctx.user = user;
       ctx.token = token;
+
+      // Porte MFA : tant que le défi n'est pas passé, seules les routes qui
+      // servent à le passer (ou à lire l'état de la session) sont accessibles.
+      if (!MFA_GATE_EXEMPT.has(`${req.method} ${pathname}`) && (await mfaGatePending(user, token))) {
+        throw new HttpError(
+          403,
+          "Two-factor verification required. Complete the MFA challenge, then try again.",
+          "MFA_REQUIRED"
+        );
+      }
     }
 
     await entry.handler(ctx);
@@ -7817,6 +8146,9 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  NODE_ENV        : ${env("NODE_ENV") || "(non défini)"}`);
   console.log(`  TRUST_PROXY     : ${TRUST_PROXY ? `1 (${TRUST_PROXY_HOPS} hop)` : "0"}`);
   console.log(`  Token encryption: ${TOKEN_ENCRYPTION_KEY ? "on" : "off"}`);
+  if (!TOKEN_ENCRYPTION_KEY && (env("NODE_ENV") === "production" || env("RENDER"))) {
+    console.warn("  ⚠ TOKEN_ENCRYPTION_KEY is not set: OAuth tokens are stored in clear text.");
+  }
   console.log(`  MFA             : proxy /api/mfa/* → Supabase /auth/v1/factors*`);
   console.log(`  MFA policy      : AAL2 requis pour profil, avatar, mot de passe et gestion MFA`);
   console.log(`  Video uploads   : max ${MAX_VIDEO_UPLOADS} concurrent(s)`);
