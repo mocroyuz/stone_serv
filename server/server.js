@@ -7624,31 +7624,38 @@ route(
   "POST",
   "/api/instagram/login",
   ({ res, user }) => {
-    if (instagramDirectEnabled) {
+    // Priorité au parcours Facebook Login for Business configuré dans Meta.
+    // Le state reste signé et lié à l'utilisateur Stone.
+    if (instagramLegacyEnabled) {
       const params = new URLSearchParams({
-        client_id: INSTAGRAM_APP_ID,
+        client_id: META_APP_ID,
+        config_id: META_IG_CONFIG_ID,
+        display: "popup",
+        override_default_response_type: "true",
         redirect_uri: INSTAGRAM_REDIRECT_URI,
         response_type: "code",
-        scope: "instagram_business_basic,instagram_business_content_publish",
         state: createOAuthState("instagram", user.id),
+        prompt: "login",
       });
       sendJson(res, 200, {
         success: true,
-        url: `${INSTAGRAM_DIRECT_AUTHORIZE_URL}?${params.toString()}`,
+        url: `https://www.facebook.com/dialog/oauth?${params.toString()}`,
       });
       return;
     }
+
+    // Repli sur Instagram Login direct uniquement si le parcours Meta
+    // Facebook Login for Business n'est pas configuré.
     const params = new URLSearchParams({
-      client_id: META_APP_ID,
-      config_id: META_IG_CONFIG_ID,
-      response_type: "code",
-      override_default_response_type: "true",
+      client_id: INSTAGRAM_APP_ID,
       redirect_uri: INSTAGRAM_REDIRECT_URI,
+      response_type: "code",
+      scope: "instagram_business_basic,instagram_business_content_publish",
       state: createOAuthState("instagram", user.id),
     });
     sendJson(res, 200, {
       success: true,
-      url: `https://www.facebook.com/v21.0/dialog/oauth?${params.toString()}`,
+      url: `${INSTAGRAM_DIRECT_AUTHORIZE_URL}?${params.toString()}`,
     });
   },
   { auth: true }
@@ -7698,7 +7705,7 @@ route("GET", "/api/instagram/callback", async ({ res, url }) => {
     const result = await dedupeCallback(
       `instagram:${userId}:${sha256(code)}`,
       async () => {
-        if (instagramDirectEnabled) {
+        if (!instagramLegacyEnabled && instagramDirectEnabled) {
           // Instagram Login direct : échange du code contre un token court,
           // puis échange contre un token longue durée (environ 60 jours).
           const form = new URLSearchParams({
