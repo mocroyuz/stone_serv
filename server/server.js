@@ -28,8 +28,7 @@
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
 //   Instagram    : META_APP_ID, META_APP_SECRET, META_IG_CONFIG_ID
-//                  INSTAGRAM_REDIRECT_URI (défaut :
-//                    ${PUBLIC_API_URL}/api/instagram/callback)
+//                  INSTAGRAM_REDIRECT_URI (défaut : ${APP_URL}/instagram/callback)
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
 //   MFA (2FA)    : TOUT passe par le backend :
 //                    - RECOVERY_CODE_PEPPER (32+ caractères aléatoires)
@@ -617,7 +616,7 @@ const INSTAGRAM_GRAPH_API = "https://graph.facebook.com/v21.0";
 const INSTAGRAM_OAUTH_DIALOG = "https://www.facebook.com/v21.0/dialog/oauth";
 const INSTAGRAM_REDIRECT_URI =
   env("INSTAGRAM_REDIRECT_URI") ||
-  (PUBLIC_API_URL ? `${PUBLIC_API_URL}/api/instagram/callback` : null);
+  (APP_URL ? `${APP_URL}/instagram/callback` : null);
 const instagramEnabled = Boolean(
   META_APP_ID && META_APP_SECRET && META_IG_CONFIG_ID && INSTAGRAM_REDIRECT_URI
 );
@@ -4542,10 +4541,13 @@ route("POST", "/api/auth/refresh", async ({ req, res }) => {
   const body = await getJsonBody(req);
   const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
   if (!refreshToken || refreshToken.length > 4096) throw new HttpError(400, "Missing refresh token");
-  const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+  const { data, error } = await withLock(`auth-refresh:${sha256(refreshToken)}`, () =>
+    supabase.auth.refreshSession({ refresh_token: refreshToken })
+  );
   if (error || !data.session) {
     throw new HttpError(401, "Invalid or expired refresh token", "INVALID_REFRESH_TOKEN");
   }
+  if (data.user) authCacheSet(data.session.access_token, data.user);
   sendJson(res, 200, {
     success: true,
     session: sessionPayload(data.session),
@@ -7565,106 +7567,64 @@ route(
   { auth: true }
 );
 
-// Callback navigateur : PAS d'auth (Facebook redirige le navigateur).
-// → le userId est porté par le state signé, vérifié par extractOAuthState.
-route("GET", "/api/instagram/callback", async ({ res, url }) => {
-  const frontBase = `${APP_URL}/?section=channels`;
-  const redirectError = (msg) => {
-    const safe = String(msg || "instagram_callback_failed").slice(0, 300);
-    redirectTo(res, `${frontBase}&instagram_error=${encodeURIComponent(safe)}`);
-  };
-
-  const errorCode = url.searchParams.get("error");
-  const errorDescription =
-    url.searchParams.get("error_description") || errorCode;
-  if (errorDescription) {
-    console.warn(`[instagram:callback] rejeté : ${errorDescription}`);
-    redirectError(errorDescription);
-    return;
-  }
-  const code = url.searchParams.get("code");
-  if (!code || code.length > 2048) {
-    redirectError("missing_code");
-    return;
-  }
-  const stateInfo = extractOAuthState(
-    "instagram",
-    url.searchParams.get("state")
-  );
-  if (stateInfo.error) {
-    console.warn(`[instagram:callback] state invalide (${stateInfo.error})`);
-    redirectError(`invalid_state_${stateInfo.error}`);
-    return;
-  }
-  const userId = stateInfo.userId;
-  if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-      userId
-    )
-  ) {
-    redirectError("invalid_user");
-    return;
-  }
-  try {
-    const result = await dedupeCallback(
-      `instagram:${userId}:${sha256(code)}`,
-      async () => {
-        // 1. code -> token (SUAT, n'expire pas)
-        const tok = await instagramGraphRequest("/oauth/access_token", {
-          client_id: META_APP_ID,
-          client_secret: META_APP_SECRET,
-          redirect_uri: INSTAGRAM_REDIRECT_URI,
-          code,
-        });
-        if (!tok?.access_token) {
-          throw new HttpError(
-            400,
-            tok?.error?.message || "Token exchange failed",
-            "INSTAGRAM_TOKEN_EXCHANGE_FAILED"
-          );
-        }
-        // 2. Retrouver le compte Instagram choisi
-        const dbg = await instagramGraphRequest("/debug_token", {
-          input_token: tok.access_token,
-          access_token: `${META_APP_ID}|${META_APP_SECRET}`,
-        });
-        const igId = dbg?.data?.granular_scopes?.find(
-          (s) => s.scope === "instagram_basic"
-        )?.target_ids?.[0];
-        if (!igId) {
-          throw new HttpError(
-            400,
-            "Aucun compte Instagram autorisé",
-            "INSTAGRAM_NO_ACCOUNT"
-          );
-        }
-        // 3. Infos du compte
-        const me = await instagramGraphRequest(`/${encodeURIComponent(igId)}`, {
-          fields: "username,name,profile_picture_url",
-          access_token: tok.access_token,
-        });
-        if (!me?.id) {
-          throw new HttpError(
-            502,
-            me?.error?.message || "Failed to fetch Instagram account",
-            "INSTAGRAM_ACCOUNT_FETCH_FAILED"
-          );
-        }
-        await saveInstagramTokens(userId, tok, {
-          account_id: igId,
-          display_name: me.username || me.name || null,
-          avatar_url: me.profile_picture_url || null,
-        });
-        return { igId };
+route("POST", "/api/instagram/auth/callback", async ({ req, res, user }) => {
+  const body = await getJsonBody(req);
+  const code = assertValidOAuthCallback("instagram", body, user.id);
+  const account = await dedupeCallback(
+    `instagram:${user.id}:${sha256(code)}`,
+    async () => {
+      const tokens = await instagramGraphRequest("/oauth/access_token", {
+        client_id: META_APP_ID,
+        client_secret: META_APP_SECRET,
+        redirect_uri: INSTAGRAM_REDIRECT_URI,
+        code,
+      });
+      if (!tokens?.access_token) {
+        throw new HttpError(
+          502,
+          tokens?.error?.message || "Instagram returned an invalid token response",
+          "INSTAGRAM_BAD_TOKEN_RESPONSE"
+        );
       }
-    );
-    console.log(`[instagram:callback] compte ${result.igId} lié`);
-    redirectTo(res, `${frontBase}&instagram=1`);
-  } catch (error) {
-    console.error("[instagram:callback]", error?.message || error);
-    redirectError(error?.message || "instagram_callback_failed");
-  }
-});
+
+      const debug = await instagramGraphRequest("/debug_token", {
+        input_token: tokens.access_token,
+        access_token: `${META_APP_ID}|${META_APP_SECRET}`,
+      });
+      const accountId = debug?.data?.granular_scopes?.find(
+        (scope) => scope.scope === "instagram_basic"
+      )?.target_ids?.[0];
+      if (!accountId) {
+        throw new HttpError(
+          400,
+          "No Instagram account was authorized",
+          "INSTAGRAM_NO_ACCOUNT"
+        );
+      }
+
+      let profile = {};
+      try {
+        profile = await instagramGraphRequest(`/${encodeURIComponent(accountId)}`, {
+          fields: "username,name,profile_picture_url",
+          access_token: tokens.access_token,
+        });
+      } catch (error) {
+        console.warn("Instagram profile error:", error?.message || error);
+      }
+
+      await saveInstagramTokens(user.id, tokens, {
+        account_id: accountId,
+        display_name: profile.username || profile.name || null,
+        avatar_url: profile.profile_picture_url || null,
+      });
+      return {
+        display_name: profile.username || profile.name || null,
+        avatar_url: profile.profile_picture_url || null,
+      };
+    }
+  );
+  sendJson(res, 200, { success: true, connected: true, account });
+}, { auth: true });
 
 route(
   "GET",
@@ -7688,7 +7648,7 @@ route(
 );
 
 route(
-  "POST",
+  "DELETE",
   "/api/instagram/disconnect",
   async ({ res, user }) => {
     const account = await getInstagramAccount(user.id);
