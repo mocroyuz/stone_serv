@@ -4479,7 +4479,8 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   sendJson(res, 200, {
     success: true,
     verified: Boolean(data.user?.email_confirmed_at),
-    session: sessionPayload(data.session),
+    // Cette route vérifie l'adresse email ; elle ne doit pas ouvrir une session persistante.
+    session: data.session ? { access_token: data.session.access_token } : null,
     mfa_enabled: hasVerifiedMfa,
     mfa_required: hasVerifiedMfa && sessionAal === "aal1",
     aal: sessionAal,
