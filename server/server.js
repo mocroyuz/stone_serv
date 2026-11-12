@@ -1147,16 +1147,59 @@ function newRequestId() {
   return crypto.randomUUID().slice(0, 8);
 }
 
+const REFRESH_COOKIE_NAME = "__Host-stone_refresh";
+const REFRESH_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
+
+function refreshCookieHeader(refreshToken) {
+  return `${REFRESH_COOKIE_NAME}=${encodeURIComponent(refreshToken)}; Path=/; Max-Age=${REFRESH_COOKIE_MAX_AGE_SECONDS}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function clearRefreshCookieHeader() {
+  return `${REFRESH_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function readRequestCookie(req, name) {
+  const header = typeof req.headers.cookie === "string" ? req.headers.cookie : "";
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+    const value = part.slice(separator + 1).trim();
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  }
+  return null;
+}
+
 function sendJson(res, statusCode, data, extraHeaders) {
   if (res.headersSent) {
     res.end();
     return;
   }
-  const payload = JSON.stringify(data);
+
+  let responseData = data;
+  const refreshToken =
+    data && typeof data === "object" && data.session &&
+    typeof data.session.refresh_token === "string"
+      ? data.session.refresh_token
+      : null;
+  const headers = { ...(extraHeaders || {}) };
+
+  // Le refresh token reste dans un cookie HttpOnly et n'est jamais exposé au JS.
+  if (refreshToken && refreshToken.length <= 4096) {
+    headers["Set-Cookie"] = refreshCookieHeader(refreshToken);
+    responseData = { ...data, session: { ...data.session } };
+    delete responseData.session.refresh_token;
+  }
+
+  const payload = JSON.stringify(responseData);
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(payload),
-    ...(extraHeaders || {}),
+    ...headers,
   });
   res.end(payload);
 }
@@ -4436,7 +4479,8 @@ route("POST", "/api/auth/check-verification", async ({ req, res }) => {
   sendJson(res, 200, {
     success: true,
     verified: Boolean(data.user?.email_confirmed_at),
-    session: sessionPayload(data.session),
+    // Cette route vérifie l'adresse email ; elle ne doit pas ouvrir une session persistante.
+    session: data.session ? { access_token: data.session.access_token } : null,
     mfa_enabled: hasVerifiedMfa,
     mfa_required: hasVerifiedMfa && sessionAal === "aal1",
     aal: sessionAal,
@@ -4537,7 +4581,9 @@ route("POST", "/api/auth/logout", async ({ req, res }) => {
     }
     if (cachedUser) authCacheInvalidateUser(cachedUser.id);
   }
-  sendJson(res, 200, { success: true });
+  sendJson(res, 200, { success: true }, {
+    "Set-Cookie": clearRefreshCookieHeader(),
+  });
 });
 
 route("POST", "/api/auth/sessions/revoke-others", async ({ res, user, token }) => {
@@ -4549,12 +4595,32 @@ route("POST", "/api/auth/sessions/revoke-others", async ({ res, user, token }) =
 
 route("POST", "/api/auth/refresh", async ({ req, res }) => {
   const body = await getJsonBody(req);
-  const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
-  if (!refreshToken || refreshToken.length > 4096) throw new HttpError(400, "Missing refresh token");
+  // Accepte encore un refresh token dans le body pour migrer les anciennes sessions.
+  // Les nouvelles sessions utilisent exclusivement le cookie HttpOnly.
+  const refreshToken = String(
+    body.refreshToken || body.refresh_token ||
+    readRequestCookie(req, REFRESH_COOKIE_NAME) || ""
+  );
+
+  if (!refreshToken || refreshToken.length > 4096) {
+    sendJson(res, 401, {
+      success: false,
+      error: "No active session",
+      code: "NO_REFRESH_TOKEN",
+    }, { "Set-Cookie": clearRefreshCookieHeader() });
+    return;
+  }
+
   const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
   if (error || !data.session) {
-    throw new HttpError(401, "Invalid or expired refresh token", "INVALID_REFRESH_TOKEN");
+    sendJson(res, 401, {
+      success: false,
+      error: "Invalid or expired refresh token",
+      code: "INVALID_REFRESH_TOKEN",
+    }, { "Set-Cookie": clearRefreshCookieHeader() });
+    return;
   }
+
   sendJson(res, 200, {
     success: true,
     session: sessionPayload(data.session),
