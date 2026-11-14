@@ -7778,7 +7778,7 @@ route(
 // Callback navigateur : PAS d'auth (Facebook redirige le navigateur).
 // → le userId est porté par le state signé, vérifié par extractOAuthState.
 route("GET", "/api/instagram/callback", async ({ res, url }) => {
-  const frontBase = `${APP_URL}/?section=channels`;
+  const frontBase = `${APP_URL}/settings?section=channels`;
   const redirectError = (msg) => {
     const safe = String(msg || "instagram_callback_failed").slice(0, 300);
     redirectTo(res, `${frontBase}&instagram_error=${encodeURIComponent(safe)}`);
