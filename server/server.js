@@ -8220,6 +8220,7 @@ const providerGuards = [
   ["/api/canva/", canvaEnabled, "Canva"],
   ["/api/dropbox/", dropboxEnabled, "Dropbox"],
   ["/api/instagram/", instagramEnabled, "Instagram"],
+  ["/api/threads/", threadsEnabled, "Threads"],
 ];
 
 // Routes authentifiées accessibles AVANT d'avoir passé le défi MFA.
