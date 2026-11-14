@@ -652,7 +652,7 @@ const THREADS_APP_SECRET = env("THREADS_APP_SECRET");
 const THREADS_REDIRECT_URI = env("THREADS_REDIRECT_URI") || `${APP_URL}/auth/threads/callback`;
 const THREADS_SCOPES = (env("THREADS_SCOPES") || "threads_basic,threads_content_publish")
   .split(/[\s,]+/).filter(Boolean).join(",");
-const THREADS_API = String(env("THREADS_API_BASE") || "https://graph.threads.com").replace(/\/+$/, "");
+const THREADS_API = String(env("THREADS_API_BASE") || "https://graph.threads.net").replace(/\/+$/, "");
 const threadsEnabled = Boolean(THREADS_APP_ID && THREADS_APP_SECRET && THREADS_REDIRECT_URI);
 
 
@@ -7927,7 +7927,7 @@ route("POST", "/api/threads/auth/url", ({ res, user }) => {
     client_id: THREADS_APP_ID, redirect_uri: THREADS_REDIRECT_URI,
     scope: THREADS_SCOPES, response_type: "code", state: createOAuthState("threads", user.id),
   });
-  sendJson(res, 200, { success: true, url: "https://www.threads.com/oauth/authorize?" + params.toString() });
+  sendJson(res, 200, { success: true, url: "https://www.threads.net/oauth/authorize?" + params.toString() });
 }, { auth: true });
 
 route("GET", "/auth/threads/callback", async ({ res, url }) => {
@@ -8001,19 +8001,12 @@ route("GET", "/api/threads/status", async ({ res, user }) => {
 }, { auth: true });
 
 route("DELETE", "/api/threads/disconnect", async ({ res, user }) => {
-  const account = await selectTokenRow("threads_accounts", user.id);
-  let revoked = false;
-  if (account?.access_token) {
-    try {
-      await threadsApiRequest("/me/permissions", { method: "DELETE", token: account.access_token });
-      revoked = true;
-    } catch (error) {
-      console.warn("[threads:disconnect] revoke failed:", error?.message || error);
-    }
-  }
+  // Threads Login does not document a token-revocation endpoint in its API
+  // collection. Remove the local encrypted credential; the user can also
+  // revoke the app from Threads account permissions.
   const { error } = await supabaseAdmin.from("threads_accounts").delete().eq("user_id", user.id);
   if (error) throw dbError("threads_accounts.delete", error);
-  sendJson(res, 200, { success: true, revoked });
+  sendJson(res, 200, { success: true, revoked: false });
 }, { auth: true });
 
 route(
