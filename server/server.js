@@ -652,7 +652,7 @@ const THREADS_APP_SECRET = env("THREADS_APP_SECRET");
 const THREADS_REDIRECT_URI = env("THREADS_REDIRECT_URI") || `${APP_URL}/auth/threads/callback`;
 const THREADS_SCOPES = (env("THREADS_SCOPES") || "threads_basic,threads_content_publish")
   .split(/[\s,]+/).filter(Boolean).join(",");
-const THREADS_API = "https://graph.threads.net";
+const THREADS_API = String(env("THREADS_API_BASE") || "https://graph.threads.com").replace(/\/+$/, "");
 const threadsEnabled = Boolean(THREADS_APP_ID && THREADS_APP_SECRET && THREADS_REDIRECT_URI);
 
 
@@ -5821,6 +5821,9 @@ async function createPost({ req, res, user }) {
     .insert(rows)
     .select();
   if (error) throw dbError("scheduled_posts.insert", error);
+  if (data.scheduleMode === "now") {
+    for (const post of (inserted || []).filter((item) => item.network === "threads" && item.status === "external")) await publishThreadsScheduledPost(post);
+  }
   sendJson(res, 200, { success: true, posts: inserted });
 }
 
@@ -5854,14 +5857,18 @@ route("DELETE", "/api/posts", async ({ res, url, user }) => {
 
 async function publishDueScheduledPosts() {
   const nowIso = new Date().toISOString();
-  const { error } = await supabaseAdmin
-    .from("scheduled_posts")
-    .update({ status: "published" })
-    .in("status", ["scheduled", "external"])
-    .lte("scheduled_at", nowIso);
-  if (error) {
-    console.warn("[posts] status refresh failed:", error.message);
+  const { data: dueThreads, error: threadsError } = await supabaseAdmin
+    .from("scheduled_posts").select("*").eq("network", "threads")
+    .eq("status", "external").lte("scheduled_at", nowIso).order("scheduled_at").limit(20);
+  if (threadsError) console.warn("[threads] scheduled query failed:", threadsError.message);
+  else for (const post of dueThreads || []) {
+    try { await publishThreadsScheduledPost(post); }
+    catch (error) { console.warn("[threads] scheduled publication failed:", post.id, error?.message || error); }
   }
+  const { error } = await supabaseAdmin.from("scheduled_posts")
+    .update({ status: "published", published_at: nowIso })
+    .in("status", ["scheduled", "external"]).neq("network", "threads").lte("scheduled_at", nowIso);
+  if (error) console.warn("[posts] status refresh failed:", error.message);
 }
 
 // ============================================================
@@ -7744,61 +7751,222 @@ route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
 // ============================================================
 // INSTAGRAM ROUTES (Unified Login / Facebook Login for Business)
 // ============================================================
+async function getThreadsAccount(userId, { refresh = true } = {}) {
+  let account = await selectTokenRow("threads_accounts", userId);
+  if (!account?.access_token) return null;
+  const expiresAt = new Date(account.access_expires_at || 0).getTime();
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now() + 60_000) {
+    throw reconnectError("Threads", "THREADS_TOKEN_EXPIRED");
+  }
+  if (!refresh || expiresAt > Date.now() + 7 * 86400000) return account;
+  const issuedAt = new Date(account.access_issued_at || expiresAt - 60 * 86400000).getTime();
+  if (!Number.isFinite(issuedAt) || Date.now() - issuedAt < 86400000) return account;
+
+  return withLock("threads-token-refresh:" + userId, async () => {
+    const latest = await selectTokenRow("threads_accounts", userId);
+    if (!latest?.access_token) return null;
+    const expiry = new Date(latest.access_expires_at || 0).getTime();
+    if (expiry > Date.now() + 7 * 86400000) return latest;
+    if (expiry <= Date.now() + 60000) throw reconnectError("Threads", "THREADS_TOKEN_EXPIRED");
+    const issued = new Date(latest.access_issued_at || expiry - 60 * 86400000).getTime();
+    if (Date.now() - issued < 86400000) return latest;
+
+    const refreshUrl = new URL(THREADS_API + "/refresh_access_token");
+    refreshUrl.search = new URLSearchParams({
+      grant_type: "th_refresh_token",
+      access_token: latest.access_token,
+    }).toString();
+    const result = await fetchJson(refreshUrl.toString(), {}, 20000);
+    if (!result.response.ok || !result.data?.access_token || !Number(result.data?.expires_in)) {
+      const message = result.data?.error?.message || result.data?.error_message || "Threads token refresh failed";
+      await supabaseAdmin.from("threads_accounts").update({ last_error: String(message).slice(0, 500) }).eq("user_id", userId);
+      if (expiry <= Date.now() + 86400000) throw reconnectError("Threads", "THREADS_TOKEN_REFRESH_FAILED");
+      console.warn("[threads:refresh]", message);
+      return latest;
+    }
+    const now = new Date().toISOString();
+    const row = {
+      access_token: encryptSecret(result.data.access_token),
+      access_expires_at: iso(Date.now() + Number(result.data.expires_in) * 1000),
+      access_issued_at: now,
+      access_refreshed_at: now,
+      last_error: null,
+      updated_at: now,
+    };
+    const { error } = await supabaseAdmin.from("threads_accounts").update(row).eq("user_id", userId);
+    if (error) throw dbError("threads_accounts refresh", error);
+    return { ...latest, ...row, access_token: result.data.access_token };
+  });
+}
+
+async function threadsApiRequest(path, { method = "GET", params = {}, token } = {}) {
+  const url = new URL(THREADS_API + path);
+  if (method === "GET") {
+    const query = new URLSearchParams({ ...Object.fromEntries(Object.entries(params).map(([k,v]) => [k, String(v)])), access_token: token });
+    url.search = query.toString();
+    const result = await fetchJson(url.toString(), {}, 30000);
+    if (!result.response.ok || result.data?.error) {
+      throw new HttpError(upstreamStatus(result.response.status), result.data?.error?.message || result.data?.error_message || "Threads API request failed", "THREADS_API_ERROR");
+    }
+    return result.data;
+  }
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) body.set(key, Array.isArray(value) ? value.join(",") : String(value));
+  }
+  body.set("access_token", token);
+  const result = await fetchJson(url.toString(), {
+    method,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  }, 45000);
+  if (!result.response.ok || result.data?.error) {
+    throw new HttpError(upstreamStatus(result.response.status), result.data?.error?.message || result.data?.error_message || "Threads API request failed", "THREADS_API_ERROR");
+  }
+  return result.data;
+}
+
+async function waitForThreadsContainer(id, token) {
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    const result = await threadsApiRequest("/" + encodeURIComponent(id), { token, params: { fields: "status,error_message" } });
+    const status = String(result.status || "").toUpperCase();
+    if (status === "FINISHED" || status === "PUBLISHED") return;
+    if (status === "ERROR" || status === "EXPIRED") {
+      throw new HttpError(502, result.error_message || "Threads media processing failed", "THREADS_MEDIA_PROCESSING_FAILED");
+    }
+    await new Promise(resolve => setTimeout(resolve, 4000));
+  }
+  throw new HttpError(504, "Threads media processing timed out", "THREADS_MEDIA_TIMEOUT");
+}
+
+async function createThreadsContainer(account, text, item, token, carouselItem = false) {
+  const params = { media_type: item ? (item.kind === "video" ? "VIDEO" : "IMAGE") : "TEXT", text: text || undefined };
+  if (item) {
+    const parsed = new URL(item.url);
+    if (parsed.protocol !== "https:") throw new HttpError(400, "Threads media URLs must use HTTPS.", "THREADS_MEDIA_URL_INVALID");
+    const ext = parsed.pathname.toLowerCase().split(".").pop();
+    if (item.kind === "video") {
+      if (!["mp4", "mov"].includes(ext)) throw new HttpError(400, "Threads videos must be MP4 or MOV.", "THREADS_VIDEO_FORMAT");
+      params.video_url = item.url;
+    } else {
+      if (!["jpg", "jpeg", "png"].includes(ext)) throw new HttpError(400, "Threads images must be JPEG or PNG.", "THREADS_IMAGE_FORMAT");
+      params.image_url = item.url;
+    }
+  }
+  if (carouselItem) params.is_carousel_item = true;
+  const result = await threadsApiRequest("/" + encodeURIComponent(account.account_id) + "/threads", { method: "POST", token, params });
+  if (!result?.id) throw new HttpError(502, "Threads did not return a media container", "THREADS_CONTAINER_FAILED");
+  if (item?.kind === "video") await waitForThreadsContainer(result.id, token);
+  return String(result.id);
+}
+
+async function publishThreadsPost(post) {
+  const text = String(post.content || "");
+  if (Array.from(text).length > 500) throw new HttpError(400, "Threads posts are limited to 500 characters.", "THREADS_TEXT_TOO_LONG");
+  const media = Array.isArray(post.media) ? post.media.filter(item => item?.url) : [];
+  if (media.length > 20) throw new HttpError(400, "Threads supports up to 20 carousel items.", "THREADS_MEDIA_LIMIT");
+  const account = await getThreadsAccount(post.user_id);
+  if (!account?.account_id) throw reconnectError("Threads", "THREADS_ACCOUNT_MISSING");
+  let creationId;
+  if (media.length <= 1) {
+    creationId = await createThreadsContainer(account, text, media[0] || null, account.access_token);
+  } else {
+    const children = [];
+    for (const item of media) children.push(await createThreadsContainer(account, "", item, account.access_token, true));
+    const carousel = await threadsApiRequest("/" + encodeURIComponent(account.account_id) + "/threads", {
+      method: "POST", token: account.access_token,
+      params: { media_type: "CAROUSEL", children, text: text || undefined },
+    });
+    if (!carousel?.id) throw new HttpError(502, "Threads did not return a carousel container", "THREADS_CAROUSEL_FAILED");
+    creationId = String(carousel.id);
+  }
+  const published = await threadsApiRequest("/" + encodeURIComponent(account.account_id) + "/threads_publish", {
+    method: "POST", token: account.access_token, params: { creation_id: creationId },
+  });
+  if (!published?.id) throw new HttpError(502, "Threads did not confirm publication", "THREADS_PUBLISH_FAILED");
+  return String(published.id);
+}
+
+async function publishThreadsScheduledPost(post) {
+  return withLock("threads-post:" + post.id, async () => {
+    const { data: claimed, error: claimError } = await supabaseAdmin.from("scheduled_posts")
+      .update({ status: "publishing", last_error: null })
+      .eq("id", post.id).eq("status", "external").select("*").maybeSingle();
+    if (claimError) throw dbError("scheduled_posts claim Threads", claimError);
+    if (!claimed) return null;
+    try {
+      const externalId = await publishThreadsPost(claimed);
+      const { error } = await supabaseAdmin.from("scheduled_posts").update({
+        status: "published", external_id: externalId, published_at: new Date().toISOString(), last_error: null,
+      }).eq("id", claimed.id);
+      if (error) throw dbError("scheduled_posts mark Threads published", error);
+      return externalId;
+    } catch (error) {
+      await supabaseAdmin.from("scheduled_posts").update({
+        status: "failed", last_error: String(error?.message || "Threads publication failed").slice(0, 1000),
+      }).eq("id", claimed.id);
+      throw error;
+    }
+  });
+}
+
 route("POST", "/api/threads/auth/url", ({ res, user }) => {
   if (!threadsEnabled) throw new HttpError(503, "Threads OAuth is not configured", "THREADS_NOT_CONFIGURED");
+  if (!TOKEN_ENCRYPTION_KEY) throw new HttpError(503, "TOKEN_ENCRYPTION_KEY must be configured before connecting Threads.", "THREADS_ENCRYPTION_NOT_CONFIGURED");
   const params = new URLSearchParams({
-    client_id: THREADS_APP_ID,
-    redirect_uri: THREADS_REDIRECT_URI,
-    scope: THREADS_SCOPES,
-    response_type: "code",
-    state: createOAuthState("threads", user.id),
+    client_id: THREADS_APP_ID, redirect_uri: THREADS_REDIRECT_URI,
+    scope: THREADS_SCOPES, response_type: "code", state: createOAuthState("threads", user.id),
   });
-  sendJson(res, 200, { success: true, url: `https://threads.net/oauth/authorize?${params.toString()}` });
+  sendJson(res, 200, { success: true, url: "https://www.threads.com/oauth/authorize?" + params.toString() });
 }, { auth: true });
 
 route("GET", "/auth/threads/callback", async ({ res, url }) => {
-  const frontBase = `${APP_URL}/settings?section=channels`;
-  const redirectError = (message) => redirectTo(res, `${frontBase}&threads_error=${encodeURIComponent(String(message || "threads_callback_failed").slice(0, 300))}`);
+  const frontBase = APP_URL + "/settings?section=channels";
+  const redirectError = message => redirectTo(res, frontBase + "&threads_error=" + encodeURIComponent(String(message || "threads_callback_failed").slice(0, 300)));
   const oauthError = url.searchParams.get("error_description") || url.searchParams.get("error");
   if (oauthError) return redirectError(oauthError);
   const code = url.searchParams.get("code");
   if (!code || code.length > 2048) return redirectError("missing_code");
   const stateInfo = extractOAuthState("threads", url.searchParams.get("state"));
-  if (stateInfo.error) return redirectError(`invalid_state_${stateInfo.error}`);
+  if (stateInfo.error) return redirectError("invalid_state_" + stateInfo.error);
   const userId = stateInfo.userId;
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userId || "")) return redirectError("invalid_user");
   try {
-    await dedupeCallback(`threads:${userId}:${sha256(code)}`, async () => {
-      const tokenResponse = await fetchJson(`${THREADS_API}/oauth/access_token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ client_id: THREADS_APP_ID, client_secret: THREADS_APP_SECRET, grant_type: "authorization_code", redirect_uri: THREADS_REDIRECT_URI, code }),
+    await dedupeCallback("threads:" + userId + ":" + sha256(code), async () => {
+      const tokenResponse = await fetchJson(THREADS_API + "/oauth/access_token", {
+        method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          client_id: THREADS_APP_ID, client_secret: THREADS_APP_SECRET,
+          grant_type: "authorization_code", redirect_uri: THREADS_REDIRECT_URI, code,
+        }),
       }, 20000);
       if (!tokenResponse.response.ok || !tokenResponse.data?.access_token) {
         throw new HttpError(400, tokenResponse.data?.error_message || tokenResponse.data?.error?.message || "Threads token exchange failed", "THREADS_TOKEN_EXCHANGE_FAILED");
       }
-      const shortToken = tokenResponse.data.access_token;
-      const longUrl = new URL(`${THREADS_API}/access_token`);
-      longUrl.search = new URLSearchParams({ grant_type: "th_exchange_token", client_secret: THREADS_APP_SECRET, access_token: shortToken }).toString();
-      const longResponse = await fetchJson(longUrl.toString(), {}, 20000);
-      const token = longResponse.response.ok && longResponse.data?.access_token ? longResponse.data.access_token : shortToken;
-      const expiresIn = longResponse.data?.expires_in || tokenResponse.data?.expires_in || 3600;
-      const profileUrl = new URL(`${THREADS_API}/me`);
-      profileUrl.search = new URLSearchParams({ fields: "id,username,threads_profile_picture_url", access_token: token }).toString();
-      const profileResponse = await fetchJson(profileUrl.toString(), {}, 20000);
-      if (!profileResponse.response.ok || !profileResponse.data?.id) {
-        throw new HttpError(502, profileResponse.data?.error?.message || "Unable to read Threads profile", "THREADS_PROFILE_FAILED");
+      const longUrl = new URL(THREADS_API + "/access_token");
+      longUrl.search = new URLSearchParams({
+        grant_type: "th_exchange_token", client_secret: THREADS_APP_SECRET,
+        access_token: tokenResponse.data.access_token,
+      }).toString();
+      const longResult = await fetchJson(longUrl.toString(), {}, 20000);
+      if (!longResult.response.ok || !longResult.data?.access_token || !Number(longResult.data?.expires_in)) {
+        throw new HttpError(502, longResult.data?.error?.message || longResult.data?.error_message || "Threads long-lived token exchange failed. Please reconnect.", "THREADS_LONG_TOKEN_EXCHANGE_FAILED");
       }
-      const profile = profileResponse.data;
+      const token = longResult.data.access_token;
+      const profile = await threadsApiRequest("/me", { token, params: { fields: "id,username,threads_profile_picture_url" } });
+      if (!profile?.id) throw new HttpError(502, "Unable to read Threads profile", "THREADS_PROFILE_FAILED");
+      const now = new Date().toISOString();
       const { error } = await supabaseAdmin.from("threads_accounts").upsert({
         user_id: userId, access_token: encryptSecret(token),
-        access_expires_at: iso(Date.now() + Number(expiresIn) * 1000),
+        access_expires_at: iso(Date.now() + Number(longResult.data.expires_in) * 1000),
+        access_issued_at: now, access_refreshed_at: null, last_error: null,
         account_id: String(profile.id), display_name: profile.username || null,
-        avatar_url: profile.threads_profile_picture_url || null, updated_at: new Date().toISOString(),
+        avatar_url: profile.threads_profile_picture_url || null, updated_at: now,
       }, { onConflict: "user_id" });
       if (error) throw dbError("threads_accounts upsert", error);
     });
-    redirectTo(res, `${frontBase}&threads=1`);
+    redirectTo(res, frontBase + "&threads=1");
   } catch (error) {
     console.error("[threads:callback]", error?.message || error);
     redirectError(error?.message || "threads_callback_failed");
@@ -7806,17 +7974,37 @@ route("GET", "/auth/threads/callback", async ({ res, url }) => {
 });
 
 route("GET", "/api/threads/status", async ({ res, user }) => {
-  const account = await selectTokenRow("threads_accounts", user.id);
-  const connected = Boolean(account?.access_token);
-  sendJson(res, 200, { success: true, connected, account: connected ? {
-    display_name: account.display_name || null, avatar_url: account.avatar_url || null, account_id: account.account_id || null,
-  } : null });
+  try {
+    const account = await getThreadsAccount(user.id);
+    const connected = Boolean(account?.access_token && account?.account_id);
+    sendJson(res, 200, {
+      success: true, connected, expires_at: connected ? account.access_expires_at : null,
+      reconnect_required: false,
+      account: connected ? { display_name: account.display_name || null, avatar_url: account.avatar_url || null, account_id: account.account_id || null } : null,
+    });
+  } catch (error) {
+    if (error?.code === "THREADS_TOKEN_EXPIRED" || error?.code === "THREADS_TOKEN_REFRESH_FAILED") {
+      sendJson(res, 200, { success: true, connected: false, reconnect_required: true, account: null });
+      return;
+    }
+    throw error;
+  }
 }, { auth: true });
 
 route("DELETE", "/api/threads/disconnect", async ({ res, user }) => {
+  const account = await selectTokenRow("threads_accounts", user.id);
+  let revoked = false;
+  if (account?.access_token) {
+    try {
+      await threadsApiRequest("/me/permissions", { method: "DELETE", token: account.access_token });
+      revoked = true;
+    } catch (error) {
+      console.warn("[threads:disconnect] revoke failed:", error?.message || error);
+    }
+  }
   const { error } = await supabaseAdmin.from("threads_accounts").delete().eq("user_id", user.id);
   if (error) throw dbError("threads_accounts.delete", error);
-  sendJson(res, 200, { success: true });
+  sendJson(res, 200, { success: true, revoked });
 }, { auth: true });
 
 route(
