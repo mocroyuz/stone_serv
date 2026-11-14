@@ -5822,7 +5822,14 @@ async function createPost({ req, res, user }) {
     .select();
   if (error) throw dbError("scheduled_posts.insert", error);
   if (data.scheduleMode === "now") {
-    for (const post of (inserted || []).filter((item) => item.network === "threads" && item.status === "external")) await publishThreadsScheduledPost(post);
+    for (const post of (inserted || []).filter((item) => item.network === "threads" && item.status === "external")) {
+      const externalId = await publishThreadsScheduledPost(post);
+      if (externalId) {
+        post.status = "published";
+        post.external_id = externalId;
+        post.published_at = new Date().toISOString();
+      }
+    }
   }
   sendJson(res, 200, { success: true, posts: inserted });
 }
@@ -8000,7 +8007,8 @@ route("GET", "/api/threads/status", async ({ res, user }) => {
       account: connected ? { display_name: account.display_name || null, avatar_url: account.avatar_url || null, account_id: account.account_id || null } : null,
     });
   } catch (error) {
-    if (error?.code === "THREADS_TOKEN_EXPIRED" || error?.code === "THREADS_TOKEN_REFRESH_FAILED") {
+    if (error?.code === "THREADS_TOKEN_EXPIRED" || error?.code === "THREADS_TOKEN_REFRESH_FAILED" ||
+        (error?.code === "THREADS_API_ERROR" && (error.status === 400 || error.status === 401))) {
       sendJson(res, 200, { success: true, connected: false, reconnect_required: true, account: null });
       return;
     }
