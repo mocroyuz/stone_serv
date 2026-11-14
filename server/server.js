@@ -650,7 +650,7 @@ const THREADS_APP_ID = env("THREADS_APP_ID");
 const THREADS_APP_SECRET = env("THREADS_APP_SECRET");
 const THREADS_REDIRECT_URI = env("THREADS_REDIRECT_URI") || `${APP_URL}/api/threads/callback`;
 const THREADS_SCOPES = (env("THREADS_SCOPES") || "threads_basic,threads_content_publish")
-  .split(/[\\s,]+/).filter(Boolean).join(",");
+  .split(/[\s,]+/).filter(Boolean).join(",");
 const THREADS_API = "https://graph.threads.net";
 const threadsEnabled = Boolean(THREADS_APP_ID && THREADS_APP_SECRET && THREADS_REDIRECT_URI);
 
