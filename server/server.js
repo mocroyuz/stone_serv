@@ -27,6 +27,7 @@
 //                  (défaut : ${APP_URL}/googlephotos/callback).
 //   Canva        : CANVA_CLIENT_ID, CANVA_CLIENT_SECRET.
 //   Dropbox      : DROPBOX_APP_KEY, DROPBOX_APP_SECRET.
+//   Threads      : THREADS_APP_ID, THREADS_APP_SECRET, THREADS_REDIRECT_URI, THREADS_SCOPES.
 //   Instagram    : META_APP_ID, META_APP_SECRET, META_IG_CONFIG_ID
 //                  INSTAGRAM_REDIRECT_URI (défaut : ${PUBLIC_API_URL}/api/instagram/callback)
 //   Stripe       : STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_*
@@ -692,7 +693,8 @@ let OAUTH_STATE_SECRET =
   PINTEREST_APP_SECRET ||
   YOUTUBE_CLIENT_SECRET ||
   CANVA_CLIENT_SECRET ||
-  DROPBOX_APP_SECRET;
+  DROPBOX_APP_SECRET ||
+  THREADS_APP_SECRET;
 if (!OAUTH_STATE_SECRET && !IS_PRODUCTION) {
   OAUTH_STATE_SECRET = crypto.randomBytes(32).toString("hex");
 }
