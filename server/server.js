@@ -646,6 +646,14 @@ const instagramUnifiedLoginEnabled = Boolean(
   META_APP_ID && META_APP_SECRET && META_IG_CONFIG_ID && INSTAGRAM_REDIRECT_URI
 );
 const instagramEnabled = instagramDirectEnabled || instagramUnifiedLoginEnabled;
+const THREADS_APP_ID = env("THREADS_APP_ID");
+const THREADS_APP_SECRET = env("THREADS_APP_SECRET");
+const THREADS_REDIRECT_URI = env("THREADS_REDIRECT_URI") || `${APP_URL}/api/threads/callback`;
+const THREADS_SCOPES = (env("THREADS_SCOPES") || "threads_basic,threads_content_publish")
+  .split(/[\\s,]+/).filter(Boolean).join(",");
+const THREADS_API = "https://graph.threads.net";
+const threadsEnabled = Boolean(THREADS_APP_ID && THREADS_APP_SECRET && THREADS_REDIRECT_URI);
+
 
 // ============================================================
 // CONFIGURATION TAGS
@@ -4455,6 +4463,7 @@ route("GET", "/api/health", ({ res }) => {
     canva: canvaEnabled,
     dropbox: dropboxEnabled,
     instagram: instagramEnabled,
+    threads: threadsEnabled,
     tags: true,
     groups: true,
     saved_replies: true,
@@ -7733,6 +7742,81 @@ route("POST", "/api/dropbox/upload", async ({ req, res, user }) => {
 // ============================================================
 // INSTAGRAM ROUTES (Unified Login / Facebook Login for Business)
 // ============================================================
+route("POST", "/api/threads/auth/url", ({ res, user }) => {
+  if (!threadsEnabled) throw new HttpError(503, "Threads OAuth is not configured", "THREADS_NOT_CONFIGURED");
+  const params = new URLSearchParams({
+    client_id: THREADS_APP_ID,
+    redirect_uri: THREADS_REDIRECT_URI,
+    scope: THREADS_SCOPES,
+    response_type: "code",
+    state: createOAuthState("threads", user.id),
+  });
+  sendJson(res, 200, { success: true, url: `https://threads.net/oauth/authorize?${params.toString()}` });
+}, { auth: true });
+
+route("GET", "/api/threads/callback", async ({ res, url }) => {
+  const frontBase = `${APP_URL}/settings?section=channels`;
+  const redirectError = (message) => redirectTo(res, `${frontBase}&threads_error=${encodeURIComponent(String(message || "threads_callback_failed").slice(0, 300))}`);
+  const oauthError = url.searchParams.get("error_description") || url.searchParams.get("error");
+  if (oauthError) return redirectError(oauthError);
+  const code = url.searchParams.get("code");
+  if (!code || code.length > 2048) return redirectError("missing_code");
+  const stateInfo = extractOAuthState("threads", url.searchParams.get("state"));
+  if (stateInfo.error) return redirectError(`invalid_state_${stateInfo.error}`);
+  const userId = stateInfo.userId;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userId || "")) return redirectError("invalid_user");
+  try {
+    await dedupeCallback(`threads:${userId}:${sha256(code)}`, async () => {
+      const tokenResponse = await fetchJson(`${THREADS_API}/oauth/access_token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ client_id: THREADS_APP_ID, client_secret: THREADS_APP_SECRET, grant_type: "authorization_code", redirect_uri: THREADS_REDIRECT_URI, code }),
+      }, 20000);
+      if (!tokenResponse.response.ok || !tokenResponse.data?.access_token) {
+        throw new HttpError(400, tokenResponse.data?.error_message || tokenResponse.data?.error?.message || "Threads token exchange failed", "THREADS_TOKEN_EXCHANGE_FAILED");
+      }
+      const shortToken = tokenResponse.data.access_token;
+      const longUrl = new URL(`${THREADS_API}/access_token`);
+      longUrl.search = new URLSearchParams({ grant_type: "th_exchange_token", client_secret: THREADS_APP_SECRET, access_token: shortToken }).toString();
+      const longResponse = await fetchJson(longUrl.toString(), {}, 20000);
+      const token = longResponse.response.ok && longResponse.data?.access_token ? longResponse.data.access_token : shortToken;
+      const expiresIn = longResponse.data?.expires_in || tokenResponse.data?.expires_in || 3600;
+      const profileUrl = new URL(`${THREADS_API}/me`);
+      profileUrl.search = new URLSearchParams({ fields: "id,username,threads_profile_picture_url", access_token: token }).toString();
+      const profileResponse = await fetchJson(profileUrl.toString(), {}, 20000);
+      if (!profileResponse.response.ok || !profileResponse.data?.id) {
+        throw new HttpError(502, profileResponse.data?.error?.message || "Unable to read Threads profile", "THREADS_PROFILE_FAILED");
+      }
+      const profile = profileResponse.data;
+      const { error } = await supabaseAdmin.from("threads_accounts").upsert({
+        user_id: userId, access_token: encryptSecret(token),
+        access_expires_at: iso(Date.now() + Number(expiresIn) * 1000),
+        account_id: String(profile.id), display_name: profile.username || null,
+        avatar_url: profile.threads_profile_picture_url || null, updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id" });
+      if (error) throw dbError("threads_accounts upsert", error);
+    });
+    redirectTo(res, `${frontBase}&threads=1`);
+  } catch (error) {
+    console.error("[threads:callback]", error?.message || error);
+    redirectError(error?.message || "threads_callback_failed");
+  }
+});
+
+route("GET", "/api/threads/status", async ({ res, user }) => {
+  const account = await selectTokenRow("threads_accounts", user.id);
+  const connected = Boolean(account?.access_token);
+  sendJson(res, 200, { success: true, connected, account: connected ? {
+    display_name: account.display_name || null, avatar_url: account.avatar_url || null, account_id: account.account_id || null,
+  } : null });
+}, { auth: true });
+
+route("DELETE", "/api/threads/disconnect", async ({ res, user }) => {
+  const { error } = await supabaseAdmin.from("threads_accounts").delete().eq("user_id", user.id);
+  if (error) throw dbError("threads_accounts.delete", error);
+  sendJson(res, 200, { success: true });
+}, { auth: true });
+
 route(
   "POST",
   "/api/instagram/login",
@@ -8302,6 +8386,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`  Canva           : ${canvaEnabled ? "activé" : "désactivé"}`);
   console.log(`  Dropbox         : ${dropboxEnabled ? "activé" : "désactivé"}`);
   console.log(`  Instagram       : ${instagramEnabled ? "activé" : "désactivé"}`);
+  console.log(`  Threads         : ${threadsEnabled ? "activé" : "désactivé"}`);
   console.log(`  Tags            : activé (max ${MAX_TAGS_PER_USER} par utilisateur)`);
   console.log(`  Groups          : activé (max ${MAX_GROUPS_PER_USER} par utilisateur)`);
   console.log(`  Saved replies   : activé (max ${MAX_SAVED_REPLIES_PER_USER} par utilisateur)`);
