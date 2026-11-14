@@ -5857,6 +5857,15 @@ route("DELETE", "/api/posts", async ({ res, url, user }) => {
 
 async function publishDueScheduledPosts() {
   const nowIso = new Date().toISOString();
+  const refreshBefore = iso(Date.now() + 7 * 86400000);
+  const { data: expiringAccounts, error: expiryError } = await supabaseAdmin
+    .from("threads_accounts").select("user_id")
+    .lte("access_expires_at", refreshBefore).gt("access_expires_at", nowIso).limit(100);
+  if (expiryError) console.warn("[threads] token refresh scan failed:", expiryError.message);
+  else for (const row of expiringAccounts || []) {
+    try { await getThreadsAccount(row.user_id); }
+    catch (error) { console.warn("[threads] background token refresh failed:", row.user_id, error?.message || error); }
+  }
   const { data: dueThreads, error: threadsError } = await supabaseAdmin
     .from("scheduled_posts").select("*").eq("network", "threads")
     .eq("status", "external").lte("scheduled_at", nowIso).order("scheduled_at").limit(20);
@@ -7801,10 +7810,10 @@ async function getThreadsAccount(userId, { refresh = true } = {}) {
 
 async function threadsApiRequest(path, { method = "GET", params = {}, token } = {}) {
   const url = new URL(THREADS_API + path);
-  if (method === "GET") {
+  if (method === "GET" || method === "DELETE") {
     const query = new URLSearchParams({ ...Object.fromEntries(Object.entries(params).map(([k,v]) => [k, String(v)])), access_token: token });
     url.search = query.toString();
-    const result = await fetchJson(url.toString(), {}, 30000);
+    const result = await fetchJson(url.toString(), method === "DELETE" ? { method: "DELETE" } : {}, 30000);
     if (!result.response.ok || result.data?.error) {
       throw new HttpError(upstreamStatus(result.response.status), result.data?.error?.message || result.data?.error_message || "Threads API request failed", "THREADS_API_ERROR");
     }
