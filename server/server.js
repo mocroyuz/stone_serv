@@ -7754,7 +7754,7 @@ route("POST", "/api/threads/auth/url", ({ res, user }) => {
   sendJson(res, 200, { success: true, url: `https://threads.net/oauth/authorize?${params.toString()}` });
 }, { auth: true });
 
-route("GET", "/api/threads/callback", async ({ res, url }) => {
+route("GET", "/auth/threads/callback", async ({ res, url }) => {
   const frontBase = `${APP_URL}/settings?section=channels`;
   const redirectError = (message) => redirectTo(res, `${frontBase}&threads_error=${encodeURIComponent(String(message || "threads_callback_failed").slice(0, 300))}`);
   const oauthError = url.searchParams.get("error_description") || url.searchParams.get("error");
