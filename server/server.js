@@ -7889,6 +7889,7 @@ async function publishThreadsPost(post) {
     });
     if (!carousel?.id) throw new HttpError(502, "Threads did not return a carousel container", "THREADS_CAROUSEL_FAILED");
     creationId = String(carousel.id);
+    await waitForThreadsContainer(creationId, account.access_token);
   }
   const published = await threadsApiRequest("/" + encodeURIComponent(account.account_id) + "/threads_publish", {
     method: "POST", token: account.access_token, params: { creation_id: creationId },
@@ -7985,10 +7986,17 @@ route("GET", "/auth/threads/callback", async ({ res, url }) => {
 route("GET", "/api/threads/status", async ({ res, user }) => {
   try {
     const account = await getThreadsAccount(user.id);
-    const connected = Boolean(account?.access_token && account?.account_id);
+    let connected = Boolean(account?.access_token && account?.account_id);
+    if (connected) {
+      const profile = await threadsApiRequest("/me", {
+        token: account.access_token,
+        params: { fields: "id" },
+      });
+      connected = String(profile?.id || "") === String(account.account_id);
+    }
     sendJson(res, 200, {
       success: true, connected, expires_at: connected ? account.access_expires_at : null,
-      reconnect_required: false,
+      reconnect_required: !connected && Boolean(account),
       account: connected ? { display_name: account.display_name || null, avatar_url: account.avatar_url || null, account_id: account.account_id || null } : null,
     });
   } catch (error) {
