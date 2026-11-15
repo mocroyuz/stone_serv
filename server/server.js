@@ -2474,6 +2474,17 @@ async function retrieveSubscription(subscriptionId, fallback) {
 const idOf = (value) =>
   typeof value === "string" ? value : value?.id || null;
 
+// Stripe API versions from 2025-03-31 (Basil) moved the subscription
+// reference on Invoice from invoice.subscription to invoice.parent.
+// Keep the legacy fallback so older webhook destinations still work.
+function subscriptionIdFromInvoice(invoice) {
+  const parentSubscription =
+    invoice?.parent?.type === "subscription_details"
+      ? invoice.parent.subscription_details?.subscription
+      : invoice?.parent?.subscription_details?.subscription;
+  return idOf(parentSubscription) || idOf(invoice?.subscription);
+}
+
 async function processStripeEvent(event) {
   const eventCreated = Number(event.created) || 0;
   try {
@@ -2504,7 +2515,7 @@ async function processStripeEvent(event) {
       }
       case "invoice.payment_failed": {
         const invoice = event.data.object;
-        const subscriptionId = idOf(invoice.subscription);
+        const subscriptionId = subscriptionIdFromInvoice(invoice);
         if (!subscriptionId) break;
         const userId = await resolveUserIdFromCustomer(invoice.customer);
         if (!userId) break;
@@ -2526,7 +2537,7 @@ async function processStripeEvent(event) {
       case "invoice.paid":
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
-        const subscriptionId = idOf(invoice.subscription);
+        const subscriptionId = subscriptionIdFromInvoice(invoice);
         if (!subscriptionId) break;
         const userId = await resolveUserIdFromCustomer(invoice.customer);
         if (!userId) break;
