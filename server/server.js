@@ -2453,7 +2453,9 @@ async function assertChannelConnectionAllowed(user, provider) {
       ).plan
     : null;
   const maxChannels =
-    planKey === "pro" || planKey === "enterprise" ? 6 : 3;
+    planKey === "pro" || planKey === "enterprise"
+      ? Object.keys(CHANNEL_ACCOUNT_TABLES).length
+      : 3;
 
   const results = await Promise.all(
     Object.entries(CHANNEL_ACCOUNT_TABLES).map(async ([key, table]) => {
