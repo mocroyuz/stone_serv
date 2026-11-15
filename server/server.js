@@ -2428,6 +2428,58 @@ function subscriptionSnapshot(subscription) {
   };
 }
 
+// Connection entitlements are checked on the server as well as in the UI.
+// Existing accounts may always reconnect; only adding a new account consumes a slot.
+const CHANNEL_ACCOUNT_TABLES = {
+  tiktok: "tiktok_accounts",
+  pinterest: "pinterest_accounts",
+  youtube: "youtube_accounts",
+  instagram: "instagram_accounts",
+  threads: "threads_accounts",
+};
+
+async function assertChannelConnectionAllowed(user, provider) {
+  const targetTable = CHANNEL_ACCOUNT_TABLES[provider];
+  if (!targetTable) return;
+
+  // Read trusted app_metadata from Auth instead of relying on a potentially stale JWT.
+  const metadata = await getAppMetadata(user.id);
+  const subscription = metadata.subscription || {};
+  const isActive = ["active", "trialing"].includes(String(subscription.status || ""));
+  const planKey = isActive
+    ? planDetails(
+        subscription.price_id,
+        subscription.plan_key || subscription.plan
+      ).plan
+    : null;
+  const maxChannels =
+    planKey === "pro" || planKey === "enterprise" ? 6 : 3;
+
+  const results = await Promise.all(
+    Object.entries(CHANNEL_ACCOUNT_TABLES).map(async ([key, table]) => {
+      const { count, error } = await supabaseAdmin
+        .from(table)
+        .select("user_id", { count: "exact", head: true })
+        .eq("user_id", user.id);
+      if (error) throw dbError(`${table} channel entitlement check`, error);
+      return { key, count: Number(count || 0) };
+    })
+  );
+
+  const currentCount = results.reduce((total, item) => total + item.count, 0);
+  const targetCount = results.find((item) => item.key === provider)?.count || 0;
+  if (targetCount > 0) return;
+
+  if (currentCount >= maxChannels) {
+    const planName = planKey ? PLAN_NAMES[planKey] : "Free";
+    throw new HttpError(
+      403,
+      `Your ${planName} plan allows up to ${maxChannels} connected channels. Upgrade your plan to connect more.`,
+      "CHANNEL_LIMIT_REACHED"
+    );
+  }
+}
+
 const TERMINAL_SUBSCRIPTION_STATUSES = new Set([
   "canceled",
   "incomplete_expired",
@@ -6199,7 +6251,8 @@ route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
 // ============================================================
 // ROUTES — TIKTOK
 // ============================================================
-route("POST", "/api/tiktok/auth/url", ({ res, user }) => {
+route("POST", "/api/tiktok/auth/url", async ({ res, user }) => {
+  await assertChannelConnectionAllowed(user, "tiktok");
   const params = new URLSearchParams({
     client_key: TIKTOK_CLIENT_KEY,
     scope: TIKTOK_SCOPES,
@@ -6546,7 +6599,8 @@ route("POST", "/api/tiktok/webhook", async ({ req, res, requestId }) => {
 // ============================================================
 // PINTEREST ROUTES
 // ============================================================
-route("POST", "/api/pinterest/auth/url", ({ res, user }) => {
+route("POST", "/api/pinterest/auth/url", async ({ res, user }) => {
+  await assertChannelConnectionAllowed(user, "pinterest");
   const params = new URLSearchParams({
     client_id: PINTEREST_APP_ID,
     redirect_uri: PINTEREST_REDIRECT_URI,
@@ -6591,6 +6645,7 @@ route("POST", "/api/pinterest/auth/callback", async ({ req, res, user }) => {
 }, { auth: true });
 
 route("POST", "/api/pinterest/auth/token", async ({ req, res, user }) => {
+  await assertChannelConnectionAllowed(user, "pinterest");
   if (env("PINTEREST_ALLOW_MANUAL_TOKEN") !== "1") {
     throw new HttpError(403, "Manual token connection is disabled");
   }
@@ -6646,7 +6701,8 @@ route("DELETE", "/api/pinterest/disconnect", async ({ res, user }) => {
 // ============================================================
 // YOUTUBE ROUTES
 // ============================================================
-route("POST", "/api/youtube/auth/url", ({ res, user }) => {
+route("POST", "/api/youtube/auth/url", async ({ res, user }) => {
+  await assertChannelConnectionAllowed(user, "youtube");
   const params = new URLSearchParams({
     client_id: YOUTUBE_CLIENT_ID,
     redirect_uri: YOUTUBE_REDIRECT_URI,
@@ -8003,7 +8059,8 @@ async function publishThreadsScheduledPost(post) {
   });
 }
 
-route("POST", "/api/threads/auth/url", ({ res, user }) => {
+route("POST", "/api/threads/auth/url", async ({ res, user }) => {
+  await assertChannelConnectionAllowed(user, "threads");
   if (!threadsEnabled) throw new HttpError(503, "Threads OAuth is not configured", "THREADS_NOT_CONFIGURED");
   if (!TOKEN_ENCRYPTION_KEY) throw new HttpError(503, "TOKEN_ENCRYPTION_KEY must be configured before connecting Threads.", "THREADS_ENCRYPTION_NOT_CONFIGURED");
   const params = new URLSearchParams({
@@ -8103,7 +8160,8 @@ route("DELETE", "/api/threads/disconnect", async ({ res, user }) => {
 route(
   "POST",
   "/api/instagram/login",
-  ({ res, user }) => {
+  async ({ res, user }) => {
+    await assertChannelConnectionAllowed(user, "instagram");
     // Priorité au parcours Unified Login / Facebook Login for Business configuré dans Meta.
     // Les permissions sont définies dans META_IG_CONFIG_ID : ne pas ajouter scope ici.
     // Le state reste signé et lié à l'utilisateur Stone.
