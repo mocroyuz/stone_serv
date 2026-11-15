@@ -2523,6 +2523,7 @@ async function processStripeEvent(event) {
         });
         break;
       }
+      case "invoice.paid":
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         const subscriptionId = idOf(invoice.subscription);
