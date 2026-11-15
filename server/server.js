@@ -6062,8 +6062,29 @@ route("GET", "/api/stripe/subscription", async ({ res, user }) => {
     sendJson(res, 200, { success: true, subscription: null });
     return;
   }
-  const list = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 1 });
+  const list = await stripe.subscriptions.list({
+    customer: customerId,
+    status: "all",
+    limit: 1,
+    expand: ["data.default_payment_method"],
+  });
   const sub = list.data[0];
+  const customer = await stripe.customers.retrieve(customerId, {
+    expand: ["invoice_settings.default_payment_method"],
+  });
+  const defaultPaymentMethod =
+    sub?.default_payment_method ||
+    (!customer.deleted ? customer.invoice_settings?.default_payment_method : null);
+  const paymentMethod =
+    defaultPaymentMethod && typeof defaultPaymentMethod !== "string"
+      ? {
+          type: defaultPaymentMethod.type || "card",
+          brand: defaultPaymentMethod.card?.brand || null,
+          last4: defaultPaymentMethod.card?.last4 || null,
+          exp_month: defaultPaymentMethod.card?.exp_month || null,
+          exp_year: defaultPaymentMethod.card?.exp_year || null,
+        }
+      : null;
   if (sub) {
     const stored = user.app_metadata?.subscription;
     const fresh = subscriptionSnapshot(sub);
@@ -6092,8 +6113,11 @@ route("GET", "/api/stripe/subscription", async ({ res, user }) => {
           status: sub.status,
           price_id: priceId,
           ...planDetails(priceId, sub.metadata?.plan),
+          current_period_start: sub.current_period_start || sub.start_date || sub.created,
+          started_at: sub.start_date || sub.created,
           current_period_end: sub.current_period_end,
           cancel_at_period_end: sub.cancel_at_period_end,
+          payment_method: paymentMethod,
         }
       : null,
   });
