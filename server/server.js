@@ -6123,6 +6123,45 @@ route("GET", "/api/stripe/subscription", async ({ res, user }) => {
   });
 }, { auth: true });
 
+/**
+ * Liste uniquement les factures du client Stripe associé à l'utilisateur
+ * authentifié. Le clientId n'est jamais accepté depuis le frontend.
+ */
+route("GET", "/api/stripe/invoices", async ({ res, user }) => {
+  requireStripe();
+  const customerId = await getStripeCustomerId(user);
+  if (!customerId) {
+    sendJson(res, 200, { success: true, invoices: [] });
+    return;
+  }
+
+  const result = await stripe.invoices.list({
+    customer: customerId,
+    limit: 24,
+  });
+
+  const invoices = result.data.map((invoice) => ({
+    id: invoice.id,
+    number: invoice.number || invoice.id,
+    status: invoice.status || "draft",
+    currency: invoice.currency,
+    total: invoice.total ?? 0,
+    amount_paid: invoice.amount_paid ?? 0,
+    amount_due: invoice.amount_due ?? 0,
+    created: invoice.created,
+    period_start: invoice.period_start ?? null,
+    period_end: invoice.period_end ?? null,
+    description:
+      invoice.description ||
+      invoice.lines?.data?.[0]?.description ||
+      "Abonnement Stone",
+    hosted_invoice_url: invoice.hosted_invoice_url || null,
+    invoice_pdf: invoice.invoice_pdf || null,
+  }));
+
+  sendJson(res, 200, { success: true, invoices });
+}, { auth: true });
+
 const processedStripeEvents = createSeenCache(10_000, 24 * 60 * 60 * 1000);
 route("POST", "/api/stripe/webhook", async ({ req, res, requestId }) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) throw new HttpError(500, "Stripe webhook not configured");
