@@ -3063,23 +3063,60 @@ async function ensurePostMediaBucket() {
   }
 }
 
+async function listStorageEntriesRecursively(bucket, prefix, depth = 0) {
+  if (depth > 8) throw new Error(`Storage folder depth exceeded for ${bucket}`);
+  const entries = [];
+  let offset = 0;
+  const pageSize = 100;
+  while (true) {
+    const { data, error } = await supabaseAdmin.storage
+      .from(bucket)
+      .list(prefix, { limit: pageSize, offset });
+    if (error) throw dbError(`storage.${bucket}.list`, error);
+    const page = Array.isArray(data) ? data : [];
+    for (const item of page) {
+      if (!item?.name) continue;
+      const path = prefix ? `${prefix}/${item.name}` : item.name;
+      if (item.id) {
+        entries.push({ path, created_at: item.created_at ?? null });
+      } else {
+        entries.push(...await listStorageEntriesRecursively(bucket, path, depth + 1));
+      }
+    }
+    if (page.length < pageSize) break;
+    offset += pageSize;
+  }
+  return entries;
+}
+
+async function removeUserStoragePrefix(bucket, userId) {
+  const entries = await listStorageEntriesRecursively(bucket, userId);
+  const paths = entries.map((entry) => entry.path);
+  for (let offset = 0; offset < paths.length; offset += 100) {
+    const { error } = await supabaseAdmin.storage
+      .from(bucket)
+      .remove(paths.slice(offset, offset + 100));
+    if (error) throw dbError(`storage.${bucket}.remove`, error);
+  }
+  return paths.length;
+}
+
 async function sweepTikTokMedia() {
   try {
-    const { data, error } = await supabaseAdmin.storage
-      .from(TIKTOK_MEDIA_BUCKET)
-      .list("", { limit: 1000 });
-    if (error || !data) return;
+    const entries = await listStorageEntriesRecursively(TIKTOK_MEDIA_BUCKET, "");
     const cutoff = Date.now() - TIKTOK_MEDIA_TTL_MS;
-    const stale = data
-      .filter(
-        (file) =>
-          /^[a-f0-9]{32}\.(jpg|webp)$/.test(file.name || "") &&
-          file.created_at &&
-          new Date(file.created_at).getTime() < cutoff
+    const stale = entries
+      .filter((entry) =>
+        /(?:^|\/)[a-f0-9]{32}\.(?:jpg|webp)$/.test(entry.path) &&
+        entry.created_at &&
+        new Date(entry.created_at).getTime() < cutoff
       )
-      .map((file) => file.name);
-    if (stale.length > 0) {
-      await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).remove(stale);
+      .map((entry) => entry.path);
+    for (let offset = 0; offset < stale.length; offset += 100) {
+      const { error } = await supabaseAdmin.storage
+        .from(TIKTOK_MEDIA_BUCKET)
+        .remove(stale.slice(offset, offset + 100));
+      if (error) throw error;
     }
   } catch (error) {
     console.warn("TikTok media sweep failed:", error?.message || error);
@@ -3094,10 +3131,10 @@ async function removeTikTokPhotos(names) {
   }
 }
 
-async function storeTikTokPhotos(photos) {
+async function storeTikTokPhotos(photos, userId) {
   const names = photos.map(
     (photo) =>
-      `${crypto.randomBytes(16).toString("hex")}.${
+      `${userId}/${crypto.randomBytes(16).toString("hex")}.${
         photo.type === "image/webp" ? "webp" : "jpg"
       }`
   );
@@ -3124,7 +3161,8 @@ async function storeTikTokPhotos(photos) {
   return names;
 }
 
-async function serveTikTokMedia(req, res, fileName) {
+async function serveTikTokMedia(req, res, storagePath) {
+  const fileName = storagePath.split("/").pop() || "media.jpg";
   if (req.method === "HEAD") {
     res.writeHead(200, {
       "Content-Type": fileName.endsWith(".webp") ? "image/webp" : "image/jpeg",
@@ -3135,7 +3173,7 @@ async function serveTikTokMedia(req, res, fileName) {
     res.end();
     return;
   }
-  const { data, error } = await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).download(fileName);
+  const { data, error } = await supabaseAdmin.storage.from(TIKTOK_MEDIA_BUCKET).download(storagePath);
   if (error || !data) {
     sendJson(res, 404, { success: false, error: "Not found" });
     return;
@@ -6565,7 +6603,7 @@ route("POST", "/api/tiktok/publish/photos", async ({ req, res, user }) => {
     const postInfo = buildPhotoPostInfo(mode, fields);
     const requestedCover = Number.parseInt(fields.cover_index, 10);
     const coverIndex = Math.min(Math.max((Number.isFinite(requestedCover) ? requestedCover : 1) - 1, 0), photos.length - 1);
-    storedNames = await storeTikTokPhotos(photos);
+    storedNames = await storeTikTokPhotos(photos, user.id);
     upload = null;
     const imageUrls = storedNames.map((name) => `${PUBLIC_API_URL}/api/media/tiktok/${name}`);
     await probePublicPhotos(imageUrls);
@@ -8730,7 +8768,7 @@ const server = createServer(async (req, res) => {
         res.end(req.method === "HEAD" ? undefined : TIKTOK_VERIFICATION_NAME);
         return;
       }
-      const mediaMatch = pathname.match(/^\/api\/media\/tiktok\/([a-f0-9]{32}\.(?:jpg|webp))$/);
+      const mediaMatch = pathname.match(/^\/api\/media\/tiktok\/((?:[0-9a-f-]{36}\/)?[a-f0-9]{32}\.(?:jpg|webp))$/);
       if (mediaMatch) {
         enforce(limiterMedia, getClientIp(req));
         await serveTikTokMedia(req, res, mediaMatch[1]);
