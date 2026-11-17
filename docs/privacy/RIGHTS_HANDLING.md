@@ -10,6 +10,10 @@ Ne pas publier d'adresse fictive ni utiliser `privacy@example.com`.
 
 ## Procédure
 
+- Portabilité : l'utilisateur peut télécharger un export JSON depuis Settings > Danger Zone (`GET /api/user/export`). L'export est authentifié, sans cache, exclut les secrets et signale les tables absentes. Il n'inclut pas les fichiers binaires, les données détenues directement par les plateformes externes ni les factures Stripe.
+- Effacement du compte : l'utilisateur peut lancer la suppression depuis Settings > Danger Zone (`DELETE /api/user/account`). L'endpoint exige une authentification récente, une confirmation explicite et le niveau MFA requis si le compte l'utilise. Il annule les abonnements Stripe actifs, tente la révocation des intégrations, supprime les lignes des tables utilisateur connues, les objets Storage sous le préfixe utilisateur et le compte Auth.
+- L'endpoint renvoie les révocations qui nécessitent une action manuelle. Pinterest et Threads peuvent nécessiter que l'utilisateur retire Stone depuis les paramètres de la plateforme. Les factures et données de facturation peuvent être conservées lorsque la loi l'exige.
+
 1. Enregistrer la date de réception, le droit exercé et le canal utilisé.
 2. Vérifier que la demande concerne des données traitées par Stone.
 3. Vérifier l'identité avec des moyens proportionnés. Ne pas demander systématiquement une copie de pièce d'identité si l'identité peut être confirmée autrement.
@@ -21,6 +25,8 @@ Ne pas publier d'adresse fictive ni utiliser `privacy@example.com`.
 9. Ne jamais transmettre les jetons OAuth, secrets, mots de passe, codes MFA ou données de sécurité dans un export.
 
 ## Droits à prendre en charge
+
+L'export et l'effacement du compte disposent maintenant d'un parcours technique dans l'application. Les autres droits (rectification, limitation, opposition, retrait du consentement) nécessitent encore un canal de contact privacy fonctionnel et un traitement opérationnel documenté.
 
 - Accès : fournir une copie intelligible des données et les informations requises.
 - Rectification : corriger les données inexactes.
