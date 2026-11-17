@@ -5973,14 +5973,19 @@ const USER_EXPORT_TABLES = [
   "youtube_comment_reads",
 ];
 
-function redactExportRow(row) {
-  if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+function redactExportValue(value) {
+  if (Array.isArray(value)) return value.map(redactExportValue);
+  if (!value || typeof value !== "object") return value;
   const safe = {};
-  for (const [key, value] of Object.entries(row)) {
-    if (/token|secret|password|credential|private.?key|recovery.?code|challenge|authorization|api.?key/i.test(key)) continue;
-    safe[key] = value;
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (/token|secret|password|credential|private.?key|recovery.?code|challenge|authorization|api.?key|session/i.test(key)) continue;
+    safe[key] = redactExportValue(nestedValue);
   }
   return safe;
+}
+
+function redactExportRow(row) {
+  return redactExportValue(row);
 }
 
 async function readAllOwnedRows(table, userId) {
