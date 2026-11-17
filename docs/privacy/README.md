@@ -18,6 +18,7 @@ Ce dossier accompagne les dépôts `mocroyuz/Stone_prod` et `mocroyuz/stone_serv
 - [x] Interface de consentement cookies : accepter, refuser, personnaliser et rouvrir les préférences.
 - [ ] Blocage effectif des traceurs tiers : aucun traceur non essentiel n'a été identifié dans le dépôt, mais les scripts configurés hors dépôt restent à vérifier.
 - [ ] Publication d'une notice de confidentialité finalisée.
+- [ ] Publication d'une page Mentions légales complétée à partir de `LEGAL_NOTICE_DRAFT.md`.
 - [ ] Vérification des contrats de sous-traitance, régions et transferts internationaux.
 - [ ] Validation du registre et des durées de conservation par le responsable du traitement.
 
