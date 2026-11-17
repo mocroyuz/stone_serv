@@ -6048,7 +6048,7 @@ route("GET", "/api/user/export", async ({ res, user, token }) => {
       email: user.email ?? null,
       created_at: user.created_at ?? null,
       email_confirmed_at: user.email_confirmed_at ?? null,
-      user_metadata: user.user_metadata ?? {},
+      user_metadata: redactExportValue(user.user_metadata ?? {}),
     },
     data,
     excluded_security_data: [
