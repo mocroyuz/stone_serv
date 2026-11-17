@@ -5954,6 +5954,94 @@ async function publishDueScheduledPosts() {
 }
 
 // ============================================================
+// ROUTES — DONNÉES PERSONNELLES (RGPD)
+// ============================================================
+const USER_EXPORT_TABLES = [
+  "scheduled_posts",
+  "tags",
+  "groups",
+  "saved_replies",
+  "instagram_accounts",
+  "tiktok_accounts",
+  "youtube_accounts",
+  "pinterest_accounts",
+  "threads_accounts",
+  "canva_accounts",
+  "dropbox_accounts",
+  "google_drive_accounts",
+  "google_photos_accounts",
+  "youtube_comment_reads",
+];
+
+function redactExportRow(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+  const safe = {};
+  for (const [key, value] of Object.entries(row)) {
+    if (/token|secret|password|credential|private.?key|recovery.?code|challenge|authorization|api.?key/i.test(key)) continue;
+    safe[key] = value;
+  }
+  return safe;
+}
+
+async function readAllOwnedRows(table, userId) {
+  const pageSize = 500;
+  const maxRows = 20000;
+  const rows = [];
+  for (let offset = 0; offset < maxRows; offset += pageSize) {
+    const { data, error } = await supabaseAdmin
+      .from(table)
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true, nullsFirst: true })
+      .range(offset, offset + pageSize - 1);
+    if (error) throw dbError(`user data export: ${table}`, error);
+    const page = Array.isArray(data) ? data : [];
+    rows.push(...page.map(redactExportRow));
+    if (page.length < pageSize) return rows;
+  }
+  throw new HttpError(
+    413,
+    `The export for ${table} exceeds the supported size. Please contact support for a complete export.`,
+    "EXPORT_TOO_LARGE"
+  );
+}
+
+route("GET", "/api/user/export", async ({ res, user, token }) => {
+  enforce(limiterAccount, `data-export:${user.id}`);
+  await requireAal2(user, token);
+
+  const entries = await Promise.all(
+    USER_EXPORT_TABLES.map(async (table) => [
+      table,
+      await readAllOwnedRows(table, user.id),
+    ])
+  );
+  const data = Object.fromEntries(entries);
+  sendJson(res, 200, {
+    success: true,
+    format: "stone-personal-data-export",
+    version: 1,
+    exported_at: new Date().toISOString(),
+    account: {
+      id: user.id,
+      email: user.email ?? null,
+      created_at: user.created_at ?? null,
+      email_confirmed_at: user.email_confirmed_at ?? null,
+      user_metadata: user.user_metadata ?? {},
+    },
+    data,
+    excluded_security_data: [
+      "OAuth access and refresh tokens",
+      "MFA recovery codes and verified sessions",
+      "WebAuthn private credential material",
+    ],
+  }, {
+    "Cache-Control": "no-store, private",
+    "Pragma": "no-cache",
+  });
+}, { auth: true });
+
+// ============================================================
 // ROUTES — UTILISATEUR
 // ============================================================
 route("GET", "/api/user", ({ res, user }) => {
