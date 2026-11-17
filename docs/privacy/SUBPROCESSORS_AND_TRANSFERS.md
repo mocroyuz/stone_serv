@@ -16,6 +16,10 @@
 | Dropbox | Import de fichiers | Métadonnées de fichiers et contenus sélectionnés | Selon compte Dropbox | Conditions et DPA applicables à vérifier | À examiner |
 | Canva | Import/export de créations | Identifiants, créations et métadonnées | Selon compte Canva | Conditions et DPA applicables à vérifier | À examiner |
 
+## Stockage des médias — constat technique
+
+Le projet Supabase contient les buckets `avatars` et `post-media` marqués publics, ainsi que `tiktok-media` marqué privé. Les fichiers des deux buckets publics peuvent être récupérés par toute personne disposant de leur URL. La politique de confidentialité doit l'indiquer et l'équipe doit décider si les brouillons peuvent rester dans ces buckets. Le backend supprime les fichiers des préfixes utilisateur dans ces buckets lors de l'effacement du compte.
+
 ## Vérifications réalisées le 17 novembre 2026
 
 - Projet Supabase « Stone » : statut actif, région `eu-west-1`.
