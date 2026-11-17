@@ -5992,7 +5992,6 @@ async function readAllOwnedRows(table, userId) {
       .from(table)
       .select("*")
       .eq("user_id", userId)
-      .order("created_at", { ascending: true, nullsFirst: true })
       .range(offset, offset + pageSize - 1);
     if (error) throw dbError(`user data export: ${table}`, error);
     const page = Array.isArray(data) ? data : [];
