@@ -5992,7 +5992,7 @@ async function readAllOwnedRows(table, userId) {
   const pageSize = 500;
   const maxRows = 20000;
   const rows = [];
-  for (let offset = 0; offset < maxRows; offset += pageSize) {
+  for (let offset = 0; offset <= maxRows; offset += pageSize) {
     const { data, error } = await supabaseAdmin
       .from(table)
       .select("*")
@@ -6005,6 +6005,7 @@ async function readAllOwnedRows(table, userId) {
       throw dbError(`user data export: ${table}`, error);
     }
     const page = Array.isArray(data) ? data : [];
+    if (offset === maxRows && page.length > 0) break;
     rows.push(...page.map(redactExportRow));
     if (page.length < pageSize) return { rows, available: true };
   }
