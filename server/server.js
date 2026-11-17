@@ -6068,17 +6068,26 @@ async function revokeConnectedProviderAccessForDeletion(userId) {
     }
   };
 
+  const loadAccount = async (label, loader) => {
+    try {
+      return await loader();
+    } catch (error) {
+      warnings.push(`${label}: could not verify/revoke remote authorization`);
+      console.warn(`Account deletion: ${label} account lookup failed:`, error?.message || error);
+      return null;
+    }
+  };
   const [tiktok, pinterest, youtube, drive, photos, canva, dropbox, instagram, threads] =
     await Promise.all([
-      getTikTokAccount(userId),
-      getPinterestAccount(userId),
-      getYouTubeAccount(userId),
-      getGDriveAccount(userId),
-      getGPhotosAccount(userId),
-      getCanvaAccount(userId),
-      getDropboxAccount(userId),
-      getInstagramAccount(userId),
-      getThreadsAccount(userId, { refresh: false }),
+      loadAccount("TikTok", () => getTikTokAccount(userId)),
+      loadAccount("Pinterest", () => getPinterestAccount(userId)),
+      loadAccount("YouTube", () => getYouTubeAccount(userId)),
+      loadAccount("Google Drive", () => getGDriveAccount(userId)),
+      loadAccount("Google Photos", () => getGPhotosAccount(userId)),
+      loadAccount("Canva", () => getCanvaAccount(userId)),
+      loadAccount("Dropbox", () => getDropboxAccount(userId)),
+      loadAccount("Instagram", () => getInstagramAccount(userId)),
+      loadAccount("Threads", () => getThreadsAccount(userId, { refresh: false })),
     ]);
 
   if (tiktok?.access_token) {
@@ -6172,6 +6181,13 @@ route("DELETE", "/api/user/account", async ({ req, res, user, token }) => {
   let stripeCustomerId = null;
   try {
     stripeCustomerId = await getStripeCustomerId(user);
+    const storedSubscriptionStatus = String(user.app_metadata?.subscription?.status || "");
+    if (
+      !stripeCustomerId &&
+      ["active", "trialing", "past_due", "unpaid", "incomplete"].includes(storedSubscriptionStatus)
+    ) {
+      throw new Error("An active subscription is recorded but its Stripe customer could not be resolved.");
+    }
     if (stripeCustomerId) {
       if (!stripe) throw new Error("Stripe is not configured; active subscriptions cannot be checked.");
       let cursor = null;
