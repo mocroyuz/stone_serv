@@ -41,18 +41,14 @@ Selon les conditions prévues par le RGPD, les personnes peuvent exercer leurs d
 
 Contact : [EMAIL RÉEL POUR LES DEMANDES DE DONNÉES]. Une réclamation peut être adressée à l'autorité de contrôle compétente, notamment la CNIL pour les personnes concernées en France.
 
-## 7. Cookies et traceurs
-
-Décrire les cookies strictement nécessaires et chaque traceur non essentiel réellement déployé, sa finalité, son fournisseur et sa durée. Les traceurs soumis au consentement ne doivent pas être activés avant le choix de l'utilisateur. Le refus et le retrait doivent être aussi simples que l'acceptation.
-
-## 8. Transferts internationaux
+## 7. Transferts internationaux
 
 Décrire les pays et destinataires réellement concernés, ainsi que le mécanisme juridique applicable à chaque transfert hors EEE. Ne pas affirmer que tous les traitements sont localisés dans l'UE sans vérification.
 
-## 9. Sécurité
+## 8. Sécurité
 
 Décrire uniquement les mesures effectivement en place et vérifiées. Ne pas promettre un chiffrement « au repos » pour l'ensemble des systèmes sans preuve de configuration et de couverture.
 
-## 10. Modifications et contact
+## 9. Modifications et contact
 
 Date d'entrée en vigueur : [DATE APRÈS VALIDATION]. Contact général : [CONTACT RÉEL].
