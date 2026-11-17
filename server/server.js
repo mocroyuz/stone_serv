@@ -6298,6 +6298,16 @@ route("GET", "/api/user/export", async ({ res, user, token }) => {
       created_at: user.created_at ?? null,
       email_confirmed_at: user.email_confirmed_at ?? null,
       user_metadata: redactExportValue(user.user_metadata ?? {}),
+      billing_subscription: user.app_metadata?.subscription
+        ? {
+            status: user.app_metadata.subscription.status ?? null,
+            plan_key: user.app_metadata.subscription.plan_key ?? null,
+            price_id: user.app_metadata.subscription.price_id ?? null,
+            current_period_start: user.app_metadata.subscription.current_period_start ?? null,
+            current_period_end: user.app_metadata.subscription.current_period_end ?? null,
+            cancel_at_period_end: user.app_metadata.subscription.cancel_at_period_end ?? null,
+          }
+        : null,
     },
     data,
     excluded_security_data: [
