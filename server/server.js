@@ -5999,6 +5999,9 @@ const USER_EXPORT_TABLES = [
   "tags",
   "groups",
   "saved_replies",
+  "notifications",
+  "follower_snapshots",
+  "mfa_email_settings",
   "instagram_accounts",
   "tiktok_accounts",
   "youtube_accounts",
@@ -6053,6 +6056,198 @@ async function readAllOwnedRows(table, userId) {
     "EXPORT_TOO_LARGE"
   );
 }
+
+async function revokeConnectedProviderAccessForDeletion(userId) {
+  const warnings = [];
+  const attempt = async (label, fn) => {
+    try {
+      await fn();
+    } catch (error) {
+      warnings.push(label);
+      console.warn(`Account deletion: ${label} revocation failed:`, error?.message || error);
+    }
+  };
+
+  const [tiktok, pinterest, youtube, drive, photos, canva, dropbox, instagram, threads] =
+    await Promise.all([
+      getTikTokAccount(userId),
+      getPinterestAccount(userId),
+      getYouTubeAccount(userId),
+      getGDriveAccount(userId),
+      getGPhotosAccount(userId),
+      getCanvaAccount(userId),
+      getDropboxAccount(userId),
+      getInstagramAccount(userId),
+      getThreadsAccount(userId, { refresh: false }),
+    ]);
+
+  if (tiktok?.access_token) {
+    await attempt("TikTok", () => tiktokApi("/v2/oauth/revoke/", {
+      form: {
+        client_key: TIKTOK_CLIENT_KEY,
+        client_secret: TIKTOK_CLIENT_SECRET,
+        token: tiktok.access_token,
+      },
+    }));
+  }
+  if (pinterest) warnings.push("Pinterest: revoke Stone manually in Pinterest account settings");
+  for (const [label, account] of [["YouTube", youtube], ["Google Drive", drive], ["Google Photos", photos]]) {
+    const tokenToRevoke = account?.refresh_token || account?.access_token;
+    if (tokenToRevoke) {
+      await attempt(label, () => googleRequest(GOOGLE_REVOKE_URL, {
+        method: "POST",
+        form: { token: tokenToRevoke },
+      }));
+    }
+  }
+  if (canva?.refresh_token || canva?.access_token) {
+    await attempt("Canva", () => canvaApi("/oauth/revoke", {
+      method: "POST",
+      basic: true,
+      form: { token: canva.refresh_token || canva.access_token },
+    }));
+  }
+  if (dropbox?.access_token) {
+    await attempt("Dropbox", () => dropboxRpc("/auth/token/revoke", {
+      token: dropbox.access_token,
+    }));
+  }
+  if (instagram?.access_token) {
+    await attempt("Instagram", () => fetchJson(
+      `${INSTAGRAM_GRAPH_API}/me/permissions?access_token=${encodeURIComponent(instagram.access_token)}`,
+      { method: "DELETE" },
+      10_000
+    ));
+  }
+  if (threads) warnings.push("Threads: revoke Stone manually in Threads account settings");
+  return warnings;
+}
+
+const USER_ACCOUNT_DATA_TABLES = [
+  "scheduled_posts",
+  "tags",
+  "groups",
+  "saved_replies",
+  "notifications",
+  "follower_snapshots",
+  "mfa_email_codes",
+  "mfa_email_settings",
+  "mfa_verified_sessions",
+  "webauthn_challenges",
+  "webauthn_credentials",
+  "youtube_comment_reads",
+  "instagram_accounts",
+  "tiktok_accounts",
+  "youtube_accounts",
+  "pinterest_accounts",
+  "threads_accounts",
+  "canva_accounts",
+  "dropbox_accounts",
+  "google_drive_accounts",
+  "google_photos_accounts",
+];
+
+route("DELETE", "/api/user/account", async ({ req, res, user, token }) => {
+  enforce(limiterAccount, `account-delete:${user.id}`);
+  await requireAal2(user, token);
+
+  const jwt = decodeJwtPayload(token);
+  const issuedAt = Number(jwt?.iat);
+  const ageSeconds = Date.now() / 1000 - issuedAt;
+  if (!Number.isFinite(issuedAt) || ageSeconds < -60 || ageSeconds > 15 * 60) {
+    throw new HttpError(
+      403,
+      "For account deletion, sign in again and retry within 15 minutes.",
+      "RECENT_AUTH_REQUIRED"
+    );
+  }
+
+  const body = await getJsonBody(req);
+  if (!["DELETE", "SUPPRIMER"].includes(String(body.confirmation || ""))) {
+    throw new HttpError(400, "Explicit account deletion confirmation is required.", "DELETE_CONFIRMATION_REQUIRED");
+  }
+
+  // Cancel all billable subscriptions before removing account data. Invoices
+  // and legally required billing records remain with Stripe where required.
+  let stripeCustomerId = null;
+  try {
+    stripeCustomerId = await getStripeCustomerId(user);
+    if (stripeCustomerId) {
+      if (!stripe) throw new Error("Stripe is not configured; active subscriptions cannot be checked.");
+      let cursor = null;
+      do {
+        const page = await stripe.subscriptions.list({
+          customer: stripeCustomerId,
+          status: "all",
+          limit: 100,
+          ...(cursor ? { starting_after: cursor } : {}),
+        });
+        for (const subscription of page.data || []) {
+          if (!["canceled", "incomplete_expired"].includes(subscription.status)) {
+            await stripe.subscriptions.cancel(subscription.id);
+          }
+        }
+        cursor = page.has_more && page.data?.length
+          ? page.data[page.data.length - 1].id
+          : null;
+      } while (cursor);
+    }
+  } catch (error) {
+    throw new HttpError(
+      502,
+      "Stone could not verify and cancel the billing subscription. No account data was deleted; contact the billing provider before retrying.",
+      "BILLING_CANCELLATION_FAILED"
+    );
+  }
+
+  const revocationWarnings = await revokeConnectedProviderAccessForDeletion(user.id);
+
+  // Preflight storage inventory before deleting database records.
+  const { data: buckets, error: bucketError } = await supabaseAdmin.storage.listBuckets();
+  if (bucketError) throw dbError("storage.listBuckets(account deletion)", bucketError);
+  const availableBuckets = new Set((buckets || []).flatMap((bucket) => [bucket.id, bucket.name]));
+  const storageRemoved = {};
+  for (const bucket of ["avatars", POST_MEDIA_BUCKET, TIKTOK_MEDIA_BUCKET]) {
+    if (availableBuckets.has(bucket)) {
+      storageRemoved[bucket] = await removeUserStoragePrefix(bucket, user.id);
+    }
+  }
+
+  for (const table of USER_ACCOUNT_DATA_TABLES) {
+    const { error } = await supabaseAdmin
+      .from(table)
+      .delete()
+      .eq("user_id", user.id);
+    if (error) throw dbError(`account deletion: ${table}`, error);
+  }
+
+  try {
+    await supabaseAdmin.auth.admin.signOut(token, "global");
+  } catch (error) {
+    revocationWarnings.push("Stone sessions: global session revocation could not be confirmed");
+    console.warn("Account deletion session revocation failed:", error?.message || error);
+  }
+
+  const { error: deleteUserError } = await supabaseAdmin.auth.admin.deleteUser(user.id);
+  if (deleteUserError) throw dbError("auth.admin.deleteUser(account deletion)", deleteUserError);
+
+  authCacheInvalidateUser(user.id);
+  clearTikTokProfileThrottle(user.id);
+  dropboxProfileCheckedAt.delete(user.id);
+
+  sendJson(res, 200, {
+    success: true,
+    deleted: true,
+    storage_objects_removed: storageRemoved,
+    remote_revocation_warnings: revocationWarnings,
+    billing_records_retained: Boolean(stripeCustomerId),
+    temporary_tiktok_media_note: "Legacy temporary TikTok files without an owner prefix expire through the existing two-hour cleanup process.",
+  }, {
+    "Cache-Control": "no-store, private",
+    "Pragma": "no-cache",
+    "Set-Cookie": clearRefreshCookieHeader(),
+  });
+}, { auth: true });
 
 route("GET", "/api/user/export", async ({ res, user, token }) => {
   enforce(limiterAccount, `data-export:${user.id}`);
