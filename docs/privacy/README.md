@@ -8,6 +8,8 @@ Ce dossier accompagne les dépôts `mocroyuz/Stone_prod` et `mocroyuz/stone_serv
 ## État des travaux techniques
 
 - [x] Endpoint d'export JSON authentifié : `GET /api/user/export`.
+- [x] Les tables absentes du schéma sont signalées dans le fichier au lieu de faire échouer silencieusement l'export.
+- [ ] L'export reste partiel : médias binaires, factures Stripe et données détenues directement par les plateformes ne sont pas inclus. Les tables indisponibles sont indiquées.
 - [x] Export limité aux enregistrements appartenant à l'utilisateur.
 - [x] Exclusion des jetons OAuth, secrets, mots de passe, codes de récupération et données de sécurité sensibles.
 - [x] Réponse d'export marquée `Cache-Control: no-store`.
