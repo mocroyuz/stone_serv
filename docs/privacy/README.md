@@ -22,6 +22,8 @@ Ce dossier accompagne les dépôts `mocroyuz/Stone_prod` et `mocroyuz/stone_serv
 - [ ] Publication d'une notice de confidentialité finalisée.
 - [ ] Publication d'une page Mentions légales complétée à partir de `LEGAL_NOTICE_DRAFT.md`.
 - [ ] Vérification des contrats de sous-traitance, régions et transferts internationaux.
+- [ ] Activer la protection Supabase contre les mots de passe compromis (alerte de sécurité du projet).
+- [ ] Décider si les buckets publics `avatars` et `post-media` conviennent aux médias de brouillon ; la notice indique maintenant que les URLs sont accessibles publiquement.
 - [ ] Validation du registre et des durées de conservation par le responsable du traitement.
 
 ## Informations indispensables à fournir par l'exploitant
