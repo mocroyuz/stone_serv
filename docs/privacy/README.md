@@ -13,8 +13,10 @@ Ce dossier accompagne les dépôts `mocroyuz/Stone_prod` et `mocroyuz/stone_serv
 - [x] Export limité aux enregistrements appartenant à l'utilisateur.
 - [x] Exclusion des jetons OAuth, secrets, mots de passe, codes de récupération et données de sécurité sensibles.
 - [x] Réponse d'export marquée `Cache-Control: no-store`.
-- [ ] Suppression complète du compte : non implémentée. Ne pas annoncer cette fonction comme disponible.
-- [ ] Suppression vérifiée des objets Storage, des données liées, des sauvegardes et révocation des autorisations tierces.
+- [x] Suppression de compte authentifiée avec confirmation, session récente, contrôle MFA si activé, annulation des abonnements actifs, révocation OAuth best-effort, suppression des lignes utilisateur, suppression des objets Storage préfixés et suppression du compte Auth.
+- [ ] Vérifier en production les cas réels de chaque fournisseur, les erreurs partielles et les sauvegardes ; Pinterest/Threads peuvent demander une révocation manuelle.
+- [x] Suppression des objets dans `avatars`, `post-media` et des futurs médias TikTok préfixés par utilisateur.
+- [ ] Les anciens médias TikTok sans préfixe utilisateur expirent via le nettoyage TTL (seuil 2 h, balayage périodique) ; les sauvegardes et données chez les plateformes externes restent soumises à leurs propres règles.
 - [x] Interface de consentement cookies : accepter, refuser, personnaliser et rouvrir les préférences.
 - [ ] Blocage effectif des traceurs tiers : aucun traceur non essentiel n'a été identifié dans le dépôt, mais les scripts configurés hors dépôt restent à vérifier.
 - [ ] Publication d'une notice de confidentialité finalisée.
