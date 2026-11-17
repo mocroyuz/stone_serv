@@ -6207,6 +6207,12 @@ route("DELETE", "/api/user/account", async ({ req, res, user, token }) => {
           ? page.data[page.data.length - 1].id
           : null;
       } while (cursor);
+      await stripe.customers.update(stripeCustomerId, {
+        metadata: {
+          supabase_user_id: "",
+          stone_account_deleted_at: new Date().toISOString(),
+        },
+      });
     }
   } catch (error) {
     throw new HttpError(
