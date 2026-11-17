@@ -5,14 +5,14 @@
 | Catégorie | Règle cible | Statut actuel / vérification requise |
 |---|---|---|
 | Compte actif | Conservation tant que nécessaire à la fourniture du service | Pas de politique complète identifiée |
-| Compte supprimé | Suppression ou anonymisation des données actives dans un délai documenté ; exceptions légales isolées | Suppression complète non implémentée |
-| Jetons OAuth | Suppression immédiate à la déconnexion ou à la suppression du compte, après révocation lorsque possible | Jetons chiffrés en base ; cycle de suppression à vérifier |
+| Compte supprimé | Suppression des lignes utilisateur, objets Storage préfixés et compte Auth ; exceptions légales isolées | Endpoint `DELETE /api/user/account` implémenté ; tests de suppression en production à réaliser |
+| Jetons OAuth | Révocation distante lorsque possible puis suppression locale des lignes contenant les jetons | Révocation best-effort ; Pinterest/Threads peuvent nécessiter une révocation manuelle |
 | Publications et médias | Suppression ou anonymisation selon choix de l'utilisateur et dépendances des publications | Vérifier toutes les tables, buckets et copies |
-| Avatar | Suppression de l'objet Storage et de la référence de profil | Endpoint de suppression d'avatar existant ; vérifier les objets orphelins |
-| Logs API / sécurité | Durée courte, proportionnée et documentée ; accès restreint | Inventaire et TTL à vérifier |
+| Avatar | Suppression des objets du préfixe utilisateur dans `avatars` | Pris en charge par l'endpoint de suppression du compte ; vérifier les objets orphelins historiques |
+| Logs API / sécurité | Durée courte, proportionnée et documentée ; accès restreint | Inventaire et TTL à vérifier ; les journaux Render nécessitent une vérification séparée |
 | Exports de données | Fichier temporaire, accès authentifié, expiration automatique et suppression après téléchargement/expiration | Export actuel renvoyé en réponse API, aucun fichier serveur conservé |
 | Données de facturation | Conservation selon obligations fiscales/comptables applicables | Vérifier Stripe et la juridiction de l'exploitant |
-| Sauvegardes | Expiration documentée ; données supprimées ne doivent pas être restaurées indéfiniment | Paramètres fournisseur à vérifier |
+| Sauvegardes | Expiration documentée ; données supprimées ne doivent pas être restaurées indéfiniment | Paramètres de sauvegarde Supabase/Render non vérifiés ; suppression des données actives ne prouve pas l'effacement des sauvegardes |
 | Demandes RGPD | Conservation limitée de la demande et de la preuve de réponse | Procédure et durée à définir |
 
 ## Plan d'effacement à mettre en œuvre
@@ -28,4 +28,4 @@
 9. Propager la suppression aux sous-traitants lorsque requis.
 10. Documenter les exceptions légales, les sauvegardes et la date d'effacement final.
 
-**Important :** la suppression Auth seule ne prouve pas la suppression des fichiers Storage, des données chez les réseaux sociaux, des sauvegardes ni des données conservées pour obligations légales. Le code de suppression ne doit être activé qu'après inventaire des clés étrangères, buckets, tâches asynchrones et flux OAuth.
+**Important :** l'endpoint supprime les tables utilisateur connues, les objets Storage sous le préfixe utilisateur et le compte Auth. Les autorisations Pinterest/Threads peuvent rester actives jusqu'à révocation manuelle. Les anciennes images TikTok sans préfixe expirent via le balayage TTL. Les contenus publiés sur les réseaux sociaux, les fichiers sources externes, les sauvegardes et les factures Stripe ne sont pas effacés par cet endpoint.
