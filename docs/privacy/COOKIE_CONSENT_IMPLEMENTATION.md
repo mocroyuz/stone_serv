@@ -12,11 +12,11 @@ Un contrôle navigateur en production reste nécessaire.
 
 ## État
 
-- Gestionnaire de consentement complet : **non implémenté**.
-- Blocage avant consentement : **non démontré**.
-- Refus aussi simple que l'acceptation : **non démontré**.
-- Retrait du consentement depuis les paramètres : **non implémenté**.
-- Journal de preuve et version du texte de consentement : **non implémentés**.
+- Interface de choix et de personnalisation : **implémentée dans le frontend** (`CookieConsentManager.tsx`).
+- Refus, acceptation, personnalisation et réouverture des préférences : **implémentés côté interface**.
+- Choix stocké localement avec version et horodatage ; événement `stone:cookie-consent-changed` émis.
+- Blocage effectif des traceurs tiers : **pas applicable à un traceur identifié dans le dépôt et non démontré pour les scripts configurés hors dépôt**.
+- Preuve centralisée du consentement et synchronisation multi-appareils : **non implémentées**.
 
 ## Exigences avant activation de traceurs
 
@@ -30,4 +30,4 @@ Un contrôle navigateur en production reste nécessaire.
 8. Respecter le choix sur tous les domaines et sous-domaines concernés, selon l'architecture.
 9. Tester le refus, l'acceptation, la personnalisation et le retrait dans un navigateur propre.
 
-Ne pas afficher un bandeau donnant l'impression que des traceurs sont contrôlés si les scripts correspondants ne sont pas effectivement conditionnés à ce choix.
+L'interface de consentement est en place, mais elle ne bloque pas automatiquement un script tiers ajouté ultérieurement. Chaque intégration analytics/marketing devra vérifier le choix enregistré avant de se charger et écouter l'événement `stone:cookie-consent-changed`. Tester le comportement réel dans le navigateur de production avant d'affirmer que le consentement est techniquement appliqué.
