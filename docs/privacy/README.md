@@ -17,7 +17,6 @@ Ce dossier accompagne les dépôts `mocroyuz/Stone_prod` et `mocroyuz/stone_serv
 - [ ] Vérifier en production les cas réels de chaque fournisseur, les erreurs partielles et les sauvegardes ; Pinterest/Threads peuvent demander une révocation manuelle.
 - [x] Suppression des objets dans `avatars`, `post-media` et des futurs médias TikTok préfixés par utilisateur.
 - [ ] Les anciens médias TikTok sans préfixe utilisateur expirent via le nettoyage TTL (seuil 2 h, balayage périodique) ; les sauvegardes et données chez les plateformes externes restent soumises à leurs propres règles.
-- [x] Interface de consentement cookies : accepter, refuser, personnaliser et rouvrir les préférences.
 - [ ] Blocage effectif des traceurs tiers : aucun traceur non essentiel n'a été identifié dans le dépôt, mais les scripts configurés hors dépôt restent à vérifier.
 - [ ] Publication d'une notice de confidentialité finalisée.
 - [ ] Publication d'une page Mentions légales complétée à partir de `LEGAL_NOTICE_DRAFT.md`.
