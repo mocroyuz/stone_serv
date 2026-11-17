@@ -5993,10 +5993,15 @@ async function readAllOwnedRows(table, userId) {
       .select("*")
       .eq("user_id", userId)
       .range(offset, offset + pageSize - 1);
-    if (error) throw dbError(`user data export: ${table}`, error);
+    if (error) {
+      if (isSchemaCacheMissingError(error)) {
+        return { rows: [], available: false };
+      }
+      throw dbError(`user data export: ${table}`, error);
+    }
     const page = Array.isArray(data) ? data : [];
     rows.push(...page.map(redactExportRow));
-    if (page.length < pageSize) return rows;
+    if (page.length < pageSize) return { rows, available: true };
   }
   throw new HttpError(
     413,
@@ -6015,11 +6020,22 @@ route("GET", "/api/user/export", async ({ res, user, token }) => {
       await readAllOwnedRows(table, user.id),
     ])
   );
-  const data = Object.fromEntries(entries);
+  const data = Object.fromEntries(entries.map(([table, result]) => [table, result.rows]));
+  const unavailableTables = entries
+    .filter(([, result]) => !result.available)
+    .map(([table]) => table);
   sendJson(res, 200, {
     success: true,
     format: "stone-personal-data-export",
     version: 1,
+    database_tables_complete: unavailableTables.length === 0,
+    unavailable_tables: unavailableTables,
+    omissions: [
+      "Binary media files stored in object storage",
+      "Data held directly by connected social platforms",
+      "Stripe invoices and payment-method details",
+      "Security credentials and OAuth tokens",
+    ],
     exported_at: new Date().toISOString(),
     account: {
       id: user.id,
