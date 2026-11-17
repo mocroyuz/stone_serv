@@ -4,9 +4,9 @@
 
 | Fournisseur / service | Rôle technique identifié | Données susceptibles d'être traitées | Région / localisation | DPA / contrat | Transfert hors EEE |
 |---|---|---|---|---|---|
-| Supabase | Authentification, base de données, Storage | Comptes, contenus, profils, métadonnées, médias, données de sécurité | **À vérifier dans le projet** | **À vérifier / archiver** | À déterminer selon région et support |
-| Render | Hébergement du backend | Requêtes API, données transitant par le serveur, journaux, secrets d'environnement | **À vérifier dans le service** | **À vérifier / archiver** | À déterminer |
-| Vercel | Hébergement frontend et proxy | Requêtes, métadonnées techniques, journaux de déploiement et d'exécution | **À vérifier dans le projet** | **À vérifier / archiver** | À déterminer |
+| Supabase | Authentification, base de données, Storage | Comptes, contenus, profils, métadonnées, médias, données de sécurité | **eu-west-1 (confirmé via le projet Supabase Stone)** | **DPA à vérifier / archiver** | Région du projet en EEE ; support, sous-traitants et autres flux à vérifier |
+| Render | Hébergement du backend | Requêtes API, données transitant par le serveur, journaux, secrets d'environnement | **Frankfurt (confirmé dans le service stone_serv)** | **DPA à vérifier / archiver** | Région du service en EEE ; journaux, support et sous-traitants à vérifier |
+| Vercel | Hébergement frontend et proxy | Requêtes, métadonnées techniques, journaux de déploiement et d'exécution | **Non vérifiée** (accès au projet refusé par le périmètre de l'équipe) | **DPA à vérifier / archiver** | À déterminer après vérification des régions et journaux Vercel |
 | Stripe | Paiements et abonnements | Données de facturation, identifiants clients et abonnements, factures | Selon configuration et services Stripe | **À vérifier / archiver** | À examiner dans le DPA et les flux |
 | Meta | Connexion Instagram/Facebook | Identifiants de comptes, autorisations, contenu et données d'API | Selon plateforme | Conditions et DPA applicables à vérifier | À examiner |
 | Google | YouTube, Drive, Photos et OAuth | Identifiants, jetons, métadonnées et médias autorisés | Selon plateforme | Conditions et DPA applicables à vérifier | À examiner |
@@ -15,6 +15,12 @@
 | Threads | Connexion et publication | Identifiants, autorisations et contenu | Selon plateforme | Conditions et DPA applicables à vérifier | À examiner |
 | Dropbox | Import de fichiers | Métadonnées de fichiers et contenus sélectionnés | Selon compte Dropbox | Conditions et DPA applicables à vérifier | À examiner |
 | Canva | Import/export de créations | Identifiants, créations et métadonnées | Selon compte Canva | Conditions et DPA applicables à vérifier | À examiner |
+
+## Vérifications réalisées le 17 novembre 2026
+
+- Projet Supabase « Stone » : statut actif, région `eu-west-1`.
+- Service Render `stone_serv` : région `frankfurt`, dépôt `mocroyuz/stone_serv`, branche de déploiement `main`.
+- Vercel : le contrôle de déploiement frontend est accessible via GitHub, mais l'accès aux paramètres de projet Vercel est refusé par le périmètre d'équipe ; aucune région de traitement ne peut être affirmée à partir de cette inspection.
 
 ## Actions requises
 
