@@ -2,6 +2,8 @@
 
 ## Mentions légales
 
+Le dépôt ne contient pas actuellement de page « Mentions légales » dédiée. Un canevas interne est disponible dans `LEGAL_NOTICE_DRAFT.md`, mais il ne doit pas être publié avant d'avoir été complété.
+
 Compléter et vérifier avant publication :
 - [ ] Dénomination juridique et forme juridique de l'éditeur.
 - [ ] Adresse du siège ou adresse professionnelle requise.
@@ -23,6 +25,9 @@ Compléter et vérifier avant publication :
 - [ ] Vérifier le droit applicable et les clauses consommateurs avec un professionnel.
 
 ## Points relevés dans le dépôt
+
+- Les Conditions d'utilisation ont été corrigées pour retirer l'adresse fictive `legal@example.com`, les affirmations non vérifiées sur les essais/remboursements, l'hébergement UE et la certification SOC 2. Elles restent un brouillon incomplet.
+- Les pages de confidentialité et de conditions indiquent désormais explicitement que l'identité juridique et les coordonnées de l'exploitant ne sont pas publiées. Cela évite les faux contacts mais ne remplace pas les mentions légales obligatoires.
 
 - La politique de confidentialité actuelle contient l'adresse générique `privacy@example.com` : elle doit être remplacée par une adresse réelle avant publication.
 - La politique actuelle annonce un stockage par défaut dans des centres de données de l'UE et un effacement sous 30 jours : ces affirmations ne sont pas vérifiées par le code et ne doivent pas être maintenues sans preuves opérationnelles.
