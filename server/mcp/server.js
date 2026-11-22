@@ -7,8 +7,8 @@ import { z } from "zod";
 const PORT = Number(process.env.PORT || process.env.MCP_PORT || 3001);
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const MCP_BASE_URL = (process.env.MCP_BASE_URL || "https://stone-mcp.onrender.com").replace(/\\/$/, "");
-const AUTH_ISSUER = `${SUPABASE_URL?.replace(/\\/$/, "")}/auth/v1`;
+const MCP_BASE_URL = (process.env.MCP_BASE_URL || "https://stone-mcp.onrender.com").replace(/\/$/, "");
+const AUTH_ISSUER = `${SUPABASE_URL?.replace(/\/$/, "")}/auth/v1`;
 const RESOURCE_METADATA_URL = `${MCP_BASE_URL}/.well-known/oauth-protected-resource`;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
