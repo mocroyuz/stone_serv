@@ -6,7 +6,10 @@ import { z } from "zod";
 
 const PORT = Number(process.env.PORT || process.env.MCP_PORT || 3001);
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;\nconst MCP_BASE_URL = (process.env.MCP_BASE_URL || "https://stone-mcp.onrender.com").replace(/\\/$/, "");\nconst AUTH_ISSUER = `${SUPABASE_URL?.replace(/\\/$/, "")}/auth/v1`;\nconst RESOURCE_METADATA_URL = `${MCP_BASE_URL}/.well-known/oauth-protected-resource`;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const MCP_BASE_URL = (process.env.MCP_BASE_URL || "https://stone-mcp.onrender.com").replace(/\\/$/, "");
+const AUTH_ISSUER = `${SUPABASE_URL?.replace(/\\/$/, "")}/auth/v1`;
+const RESOURCE_METADATA_URL = `${MCP_BASE_URL}/.well-known/oauth-protected-resource`;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   throw new Error("MCP requires SUPABASE_URL and SUPABASE_ANON_KEY");
@@ -69,7 +72,8 @@ function createMcp(userId, token) { const userSupabase = supabaseForToken(token)
 }
 
 const httpServer = http.createServer(async (req, res) => {
-  if (req.method === "GET" && req.url === "/health") return json(res, 200, { status: "ok", service: "stone-mcp" });\n  if (req.method === "GET" && req.url === "/.well-known/oauth-protected-resource") return json(res, 200, { resource: `${MCP_BASE_URL}/mcp`, authorization_servers: [AUTH_ISSUER], scopes_supported: ["openid", "email"], resource_documentation: "https://stone-prod.vercel.app" });
+  if (req.method === "GET" && req.url === "/health") return json(res, 200, { status: "ok", service: "stone-mcp" });
+  if (req.method === "GET" && req.url === "/.well-known/oauth-protected-resource") return json(res, 200, { resource: `${MCP_BASE_URL}/mcp`, authorization_servers: [AUTH_ISSUER], scopes_supported: ["openid", "email"], resource_documentation: "https://stone-prod.vercel.app" });
   if (req.method !== "POST" || req.url !== "/mcp") return json(res, 404, { error: "Not found" });
   const auth = await authenticate(req);
   if (!auth) { res.writeHead(401, { "content-type": "application/json", "cache-control": "no-store", "WWW-Authenticate": `Bearer resource_metadata="${RESOURCE_METADATA_URL}"` }); return res.end(JSON.stringify({ error: "Bearer token required or invalid" })); }
