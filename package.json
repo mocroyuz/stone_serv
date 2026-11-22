@@ -1,0 +1,13 @@
+{
+  "name": "stone-mcp-deployment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node mcp/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "@supabase/supabase-js": "^2.45.0",
+    "zod": "^3.25.76"
+  }
+}
