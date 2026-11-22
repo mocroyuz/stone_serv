@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test --test-timeout=30000 \"test/*.test.mjs\""
+    "test": "node --test --test-timeout=30000 \"test/*.test.mjs\"",
+    "mcp": "node mcp/server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
