@@ -12,9 +12,8 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   throw new Error("MCP requires SUPABASE_URL and SUPABASE_ANON_KEY");
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+function supabaseForToken(token) { return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false }, global: { headers: { Authorization: "Bearer " + token } } }); }
+const authClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 const allowedTables = {
   accounts: ["instagram_accounts", "tiktok_accounts", "youtube_accounts", "pinterest_accounts", "threads_accounts"],
 };
@@ -28,11 +27,13 @@ async function authenticate(req) {
   if (!header.startsWith("Bearer ") || header.length > 8192) return null;
   const token = header.slice(7).trim();
   if (!token) return null;
-  const { data, error } = await supabase.auth.getUser(token);
+  const { data, error } = await authClient.auth.getUser(token);
   if (error || !data?.user?.id) return null;
   return { user: data.user, token };
 }
-function createMcp(userId) {
+const SECRET_FIELD = /token|secret|password|credential|key|authorization|cookie|session/i;
+function sanitize(value) { if (Array.isArray(value)) return value.map(sanitize); if (!value || typeof value !== "object") return value; const out = {}; for (const [key, val] of Object.entries(value)) { if (SECRET_FIELD.test(key)) continue; out[key] = sanitize(val); } return out; }
+function createMcp(userId, token) { const userSupabase = supabaseForToken(token);
   const server = new McpServer({ name: "Stone", version: "0.1.0" });
   server.registerTool("stone_list_posts", {
     description: "List the authenticated user's Stone posts. Supports filtering by status and date range.",
@@ -41,11 +42,11 @@ function createMcp(userId) {
       limit: z.number().int().min(1).max(100).default(25),
     },
   }, async ({ status, limit }) => {
-    let q = supabase.from("scheduled_posts").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(limit);
+    let q = userSupabase.from("scheduled_posts").select("*").eq("user_id", userId).order("created_at", { ascending: false }).limit(limit);
     if (status) q = q.eq("status", status);
     const { data, error } = await q;
-    if (error) return { isError: true, content: [{ type: "text", text: "Stone could not retrieve posts. " + error.message }] };
-    return { structuredContent: { posts: data || [] }, content: [{ type: "text", text: `Retrieved ${(data || []).length} post(s).` }] };
+    if (error) return { isError: true, content: [{ type: "text", text: "Stone could not retrieve posts. " + "Please verify your permissions and try again." }] };
+    return { structuredContent: { posts: sanitize(data || []) }, content: [{ type: "text", text: `Retrieved ${(data || []).length} post(s).` }] };
   });
   server.registerTool("stone_connected_channels", {
     description: "List social channels connected to the authenticated Stone account, without exposing access tokens.",
@@ -53,7 +54,7 @@ function createMcp(userId) {
   }, async () => {
     const names = allowedTables.accounts;
     const results = await Promise.all(names.map(async table => {
-      const { data, error } = await supabase.from(table).select("*").eq("user_id", userId).limit(10);
+      const { data, error } = await userSupabase.from(table).select("*").eq("user_id", userId).limit(10);
       if (error) return { platform: table.replace("_accounts", ""), connected: false, unavailable: true };
       return (data || []).map(row => ({
         platform: table.replace("_accounts", ""),
@@ -77,7 +78,7 @@ const httpServer = http.createServer(async (req, res) => {
   req.on("end", async () => {
     try {
       const parsed = JSON.parse(body || "{}");
-      const server = createMcp(auth.user.id);
+      const server = createMcp(auth.user.id, auth.token);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       await server.connect(transport);
       await transport.handleRequest(req, res, parsed);
